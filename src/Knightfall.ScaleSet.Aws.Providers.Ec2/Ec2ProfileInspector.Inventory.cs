@@ -1,6 +1,7 @@
 using Amazon.EC2.Model;
 using Knightfall.ScaleSet.Aws.Core.Configuration;
 using Knightfall.ScaleSet.Aws.Core.Lifecycle;
+using Knightfall.ScaleSet.Aws.Core.Telemetry;
 
 namespace Knightfall.ScaleSet.Aws.Providers.Ec2;
 
@@ -18,6 +19,21 @@ public sealed partial class Ec2ProfileInspector
         Func<Instance, bool>? verifiesIntent, CancellationToken cancellationToken)
     {
         var target = GetTarget(configuration, profileId);
+        using var operation = Ec2Diagnostics.Start("inventory", TelemetryProfile.From(target.Profile), cancellationToken);
+        var result = await ReadInventoryAsync(target, additionalFilters, verifiesIntent, cancellationToken).ConfigureAwait(false);
+        operation?.Complete(result.IsComplete ? "success" : "unknown", result.Status switch
+        {
+            Ec2InventoryStatus.Complete => "inventory_complete",
+            Ec2InventoryStatus.AwsIdentityMismatch => "identity_mismatch",
+            Ec2InventoryStatus.AwsUnavailable => "aws_unavailable",
+            _ => "inventory_incomplete",
+        });
+        return result;
+    }
+
+    private async Task<Ec2InventorySnapshot> ReadInventoryAsync(InspectionTarget target, IReadOnlyList<Filter> additionalFilters,
+        Func<Instance, bool>? verifiesIntent, CancellationToken cancellationToken)
+    {
         var filters = new List<Filter>
         {
             TagFilter(RunnerOwnershipTags.Controller, RunnerOwnershipTags.ControllerValue),

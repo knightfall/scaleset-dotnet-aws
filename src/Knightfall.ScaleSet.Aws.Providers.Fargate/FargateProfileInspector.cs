@@ -7,6 +7,7 @@ using Amazon.IdentityManagement.Model;
 using Amazon.Runtime;
 using Knightfall.ScaleSet.Aws.Core.Configuration;
 using Knightfall.ScaleSet.Aws.Core.Lifecycle;
+using Knightfall.ScaleSet.Aws.Core.Telemetry;
 using RunnerNetwork = Knightfall.ScaleSet.Aws.Core.Configuration.NetworkConfiguration;
 
 namespace Knightfall.ScaleSet.Aws.Providers.Fargate;
@@ -37,6 +38,33 @@ public sealed partial class FargateProfileInspector
         RuntimeConfiguration configuration, string profileId, FargateContainerApproval approval, CancellationToken cancellationToken)
     {
         var target = GetTarget(configuration, profileId);
+        using var operation = FargateDiagnostics.Start("task_definition", TelemetryProfile.From(target.Profile), cancellationToken);
+        var result = await ResolvePreflightAsync(target, approval, cancellationToken).ConfigureAwait(false);
+        string outcome = result.Status switch
+        {
+            FargatePreflightStatus.Verified => "success",
+            FargatePreflightStatus.AwsUnavailable => "unknown",
+            _ => "rejected",
+        };
+        operation?.Complete(outcome, PreflightReason(result.Status));
+        return result;
+    }
+
+    private static string PreflightReason(FargatePreflightStatus status) => status switch
+    {
+        FargatePreflightStatus.Verified => "task_definition_verified",
+        FargatePreflightStatus.AwsUnavailable => "aws_unavailable",
+        FargatePreflightStatus.ClusterMismatch => "cluster_mismatch",
+        FargatePreflightStatus.LongTaskArnsUnverified => "long_arns_unverified",
+        FargatePreflightStatus.RoleMismatch => "role_mismatch",
+        FargatePreflightStatus.NetworkIncompatible => "network_incompatible",
+        FargatePreflightStatus.ContainerUnapproved => "container_unapproved",
+        _ => "task_definition_incompatible",
+    };
+
+    private async Task<FargatePreflightResult> ResolvePreflightAsync(InspectionTarget target, FargateContainerApproval approval,
+        CancellationToken cancellationToken)
+    {
         ArgumentNullException.ThrowIfNull(approval);
         if (!HasImageDigest(approval.Image) || approval.EntryPoint.IsDefault || approval.Command.IsDefault)
         {

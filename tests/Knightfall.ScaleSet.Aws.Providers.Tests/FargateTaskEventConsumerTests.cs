@@ -1,3 +1,6 @@
+using System.Collections.Concurrent;
+using System.Diagnostics;
+using System.Diagnostics.Metrics;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
@@ -10,6 +13,80 @@ namespace Knightfall.ScaleSet.Aws.Providers.Tests;
 
 public sealed class FargateTaskEventConsumerTests
 {
+    [Fact]
+    public async Task EventDiagnosticsAttributeOnlyAuthoritativeReadbackAndSuppressWireIdentifiers()
+    {
+        var token = TestContext.Current.CancellationToken;
+        const string meterName = "Knightfall.ScaleSet.Aws.Providers.Fargate";
+        const string receipt = "sensitive-receipt-value";
+        var task = TaskRow(FirstTask, FirstAllocation);
+        task["version"] = 8;
+        using var aws = new FargateInspectionFixture
+        {
+            ReceiveMessage = _ => Messages((receipt, Event(7, "STOPPED", eventTime: Now.AddSeconds(-20)))),
+            DescribeTasks = _ => TasksReply(task),
+        };
+        using var sqs = aws.CreateSqs();
+        using var consumer = new FargateTaskEventConsumer(sqs, aws.Inspector, await ConfigurationAsync(token), QueueUrl, new EventClock());
+        using var parent = new Activity("fargate-event-test").SetIdFormat(ActivityIdFormat.W3C).Start();
+        var stopped = new ConcurrentQueue<Activity>();
+        using var trace = new ActivityListener
+        {
+            ShouldListenTo = source => source.Name == meterName,
+            Sample = static (ref ActivityCreationOptions<ActivityContext> _) => ActivitySamplingResult.AllDataAndRecorded,
+            ActivityStopped = span =>
+            {
+                if (span.TraceId == parent.TraceId)
+                {
+                    stopped.Enqueue(span);
+                }
+            },
+        };
+        ActivitySource.AddActivityListener(trace);
+        var ages = new ConcurrentQueue<(double Seconds, string? Profile)>();
+        using var metrics = new MeterListener();
+        metrics.InstrumentPublished = (instrument, listener) =>
+        {
+            if (instrument.Meter.Name == meterName && instrument.Name == "scaleset.aws.event.age")
+            {
+                Assert.Equal("s", instrument.Unit);
+                listener.EnableMeasurementEvents(instrument);
+            }
+        };
+        metrics.SetMeasurementEventCallback<double>((_, value, tags, _) =>
+        {
+            var dimensions = tags.ToArray().ToDictionary();
+            Assert.Equal("fargate", dimensions["provider"]);
+            string? profile = dimensions.GetValueOrDefault("profile") as string;
+            Assert.Equal(profile is null ? 1 : 2, dimensions.Count);
+            ages.Enqueue((value, profile));
+        });
+        metrics.Start();
+
+        await consumer.PollAsync(static (_, _, _) => Task.FromResult(true), token);
+        await consumer.PollAsync(static (_, _, _) => throw new InvalidOperationException("Duplicate event invoked apply."), token);
+
+        var processed = stopped.Where(activity => activity.OperationName == "scaleset.aws.fargate.sqs_process").ToArray();
+        Assert.Collection(processed,
+            observed =>
+            {
+                Assert.Equal(Profile, observed.GetTagItem("profile"));
+                Assert.Equal("readback_accepted", observed.GetTagItem("reason"));
+                Assert.Equal("success", observed.GetTagItem("outcome"));
+            },
+            duplicate =>
+            {
+                Assert.Null(duplicate.GetTagItem("profile"));
+                Assert.Equal("duplicate_or_old", duplicate.GetTagItem("reason"));
+            });
+        var tagValues = stopped.SelectMany(activity => activity.Tags).Select(tag => tag.Value);
+        Assert.DoesNotContain(tagValues, value => value is receipt or FirstTask or QueueUrl);
+        Assert.Equal((20, Profile), ages.First());
+        Assert.Equal((20, (string?)null), ages.Last());
+        Assert.Equal(2, ages.Count);
+        Assert.Equal([receipt, receipt], Acknowledgments(aws));
+    }
+
     [Fact]
     public async Task OutOfOrderAndDuplicateHintsUseOneLatestVersionReadbackAndAcknowledgeTheBatch()
     {
@@ -119,16 +196,22 @@ public sealed class FargateTaskEventConsumerTests
     }
 
     private static string Event(int version, string status, string account = Account, string cluster = Cluster,
-        string definition = DefinitionArn) => JsonSerializer.Serialize(new Dictionary<string, object>
+        string definition = DefinitionArn, DateTimeOffset? eventTime = null) => JsonSerializer.Serialize(new Dictionary<string, object?>
     {
         ["version"] = "0",
         ["detail-type"] = "ECS Task State Change",
         ["source"] = "aws.ecs",
         ["account"] = account,
         ["region"] = Region,
+        ["time"] = eventTime,
         ["resources"] = new[] { FirstTask },
         ["detail"] = new { clusterArn = cluster, taskArn = FirstTask, taskDefinitionArn = definition, version, lastStatus = status },
     });
+
+    private sealed class EventClock : TimeProvider
+    {
+        public override DateTimeOffset GetUtcNow() => Now;
+    }
 
     private static string Messages(params (string Receipt, string Event)[] messages) => JsonSerializer.Serialize(new
     {

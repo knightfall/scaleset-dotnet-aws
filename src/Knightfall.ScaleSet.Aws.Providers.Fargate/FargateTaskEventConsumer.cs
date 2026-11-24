@@ -3,6 +3,7 @@ using Amazon.SQS;
 using Amazon.SQS.Model;
 using Knightfall.ScaleSet.Aws.Core.Configuration;
 using Knightfall.ScaleSet.Aws.Core.Lifecycle;
+using Knightfall.ScaleSet.Aws.Core.Telemetry;
 
 namespace Knightfall.ScaleSet.Aws.Providers.Fargate;
 
@@ -14,16 +15,24 @@ public sealed class FargateTaskEventConsumer : IDisposable
     private readonly FargateProfileInspector _inspector;
     private readonly RuntimeConfiguration _configuration;
     private readonly string _queueUrl;
+    private readonly TimeProvider _clock;
     private readonly Dictionary<string, long> _versions = new(StringComparer.Ordinal);
     private readonly Queue<string> _versionOrder = new();
     private readonly SemaphoreSlim _poll = new(1, 1);
 
     public FargateTaskEventConsumer(IAmazonSQS sqs, FargateProfileInspector inspector, RuntimeConfiguration configuration, string queueUrl)
+        : this(sqs, inspector, configuration, queueUrl, TimeProvider.System)
+    {
+    }
+
+    public FargateTaskEventConsumer(IAmazonSQS sqs, FargateProfileInspector inspector, RuntimeConfiguration configuration, string queueUrl,
+        TimeProvider clock)
     {
         ArgumentNullException.ThrowIfNull(sqs);
         ArgumentNullException.ThrowIfNull(inspector);
         ArgumentNullException.ThrowIfNull(configuration);
         ArgumentException.ThrowIfNullOrWhiteSpace(queueUrl);
+        ArgumentNullException.ThrowIfNull(clock);
         if (configuration.Mode != ControllerMode.Active || !configuration.Profiles.Any(profile =>
             profile.State != RunnerProfileState.Disabled && profile.Provisioner is FargateProvisionerConfiguration))
         {
@@ -34,6 +43,7 @@ public sealed class FargateTaskEventConsumer : IDisposable
         _inspector = inspector;
         _configuration = configuration;
         _queueUrl = queueUrl;
+        _clock = clock;
     }
 
     public void Dispose() => _poll.Dispose();
@@ -57,12 +67,17 @@ public sealed class FargateTaskEventConsumer : IDisposable
     private async Task PollBatchAsync(Func<ExecutorBinding, ExecutorResourceObservation, CancellationToken, Task<bool>> apply,
         CancellationToken cancellationToken)
     {
-        var result = await _sqs.ReceiveMessageAsync(new ReceiveMessageRequest
+        ReceiveMessageResponse result;
+        using (var receive = FargateDiagnostics.Start("sqs_receive", null, cancellationToken))
         {
-            QueueUrl = _queueUrl,
-            MaxNumberOfMessages = 10,
-            WaitTimeSeconds = 10,
-        }, cancellationToken).ConfigureAwait(false);
+            result = await _sqs.ReceiveMessageAsync(new ReceiveMessageRequest
+            {
+                QueueUrl = _queueUrl,
+                MaxNumberOfMessages = 10,
+                WaitTimeSeconds = 10,
+            }, cancellationToken).ConfigureAwait(false);
+            receive?.Complete("success", result.Messages is { Count: > 0 } ? "batch_received" : "queue_empty");
+        }
 
         var valid = new List<(Message Message, FargateTaskEvent Hint)>();
         foreach (var message in result.Messages ?? [])
@@ -77,41 +92,70 @@ public sealed class FargateTaskEventConsumer : IDisposable
             }
             else
             {
+                using var invalid = FargateDiagnostics.Start("sqs_process", null, cancellationToken);
+                invalid?.Complete("rejected", "invalid_event");
                 await AcknowledgeAsync(message, cancellationToken).ConfigureAwait(false);
             }
         }
 
         foreach (var group in valid.GroupBy(item => (item.Hint.TaskArn, item.Hint.ClusterArn, item.Hint.TaskDefinitionArn)))
         {
+            using var process = FargateDiagnostics.Start("sqs_process", null, cancellationToken);
+            TelemetryProfile? identity = null;
             var newest = group.MaxBy(item => item.Hint.Version).Hint;
             if (!_versions.TryGetValue(newest.TaskArn, out long version) || version < newest.Version)
             {
                 var observation = await _inspector.ReadEventAsync(_configuration, newest, cancellationToken).ConfigureAwait(false);
                 if (observation is null)
                 {
+                    FargateDiagnostics.RecordEventAge(null, newest.EventTime, _clock.GetUtcNow());
+                    process?.Complete("unknown", "no_exact_task");
                     continue;
                 }
                 if (observation is { Binding: { } binding, Resource: { } resource, Version: long readVersion })
                 {
+                    if (_configuration.Profiles.FirstOrDefault(profile => profile.Id == binding.Profile.ProfileId) is { } configured)
+                    {
+                        identity = TelemetryProfile.From(configured);
+                    }
+                    if (identity is not null)
+                    {
+                        process?.SetProfile(identity);
+                    }
+                    using var profileScope = TelemetryProfileScope.Enter(identity);
                     if (!await apply(binding, resource, cancellationToken).ConfigureAwait(false))
                     {
+                        FargateDiagnostics.RecordEventAge(identity, newest.EventTime, _clock.GetUtcNow());
+                        process?.Complete("deferred", "readback_not_accepted");
                         continue;
                     }
                     Remember(newest.TaskArn, readVersion);
+                    process?.Complete("success", "readback_accepted");
+                }
+                else
+                {
+                    process?.Complete("deferred", "unowned_event");
                 }
             }
-
-            foreach (var (message, _) in group)
+            else
             {
-                await AcknowledgeAsync(message, cancellationToken).ConfigureAwait(false);
+                process?.Complete("deferred", "duplicate_or_old");
+            }
+
+            foreach (var (message, hint) in group)
+            {
+                FargateDiagnostics.RecordEventAge(identity, hint.EventTime, _clock.GetUtcNow());
+                await AcknowledgeAsync(message, cancellationToken, identity).ConfigureAwait(false);
             }
         }
     }
 
-    private async Task AcknowledgeAsync(Message message, CancellationToken cancellationToken)
+    private async Task AcknowledgeAsync(Message message, CancellationToken cancellationToken, TelemetryProfile? identity = null)
     {
+        using var operation = FargateDiagnostics.Start("sqs_delete", identity, cancellationToken);
         _ = await _sqs.DeleteMessageAsync(new DeleteMessageRequest { QueueUrl = _queueUrl, ReceiptHandle = message.ReceiptHandle },
             cancellationToken).ConfigureAwait(false);
+        operation?.Complete("success", "acknowledged");
     }
 
     private void Remember(string taskArn, long version)
@@ -128,7 +172,7 @@ public sealed class FargateTaskEventConsumer : IDisposable
     }
 }
 
-internal sealed record FargateTaskEvent(string ClusterArn, string TaskArn, string TaskDefinitionArn, long Version)
+internal sealed record FargateTaskEvent(string ClusterArn, string TaskArn, string TaskDefinitionArn, long Version, DateTimeOffset? EventTime)
 {
     private const int MaximumEventLength = 256 * 1024;
 
@@ -157,7 +201,9 @@ internal sealed record FargateTaskEvent(string ClusterArn, string TaskArn, strin
                 return null;
             }
 
-            return new FargateTaskEvent(cluster, task, definition, parsed);
+            DateTimeOffset? eventTime = root.TryGetProperty("time", out var time) && time.ValueKind == JsonValueKind.String &&
+                time.TryGetDateTimeOffset(out var timestamp) ? timestamp : null;
+            return new FargateTaskEvent(cluster, task, definition, parsed, eventTime);
         }
         catch (JsonException)
         {

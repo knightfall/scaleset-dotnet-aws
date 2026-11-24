@@ -20,6 +20,7 @@ public sealed partial class Ec2EffectProvider
     private async Task<EffectEvidence?> ObserveLaunchAsync(
         EffectEnvelope envelope, Ec2LaunchEffectRequest request, string? expectedInstanceId, CancellationToken cancellationToken)
     {
+        using var operation = Ec2Diagnostics.Start("launch_readback", _telemetryProfile, cancellationToken);
         string allocation = request.AllocationId.ToString("D");
         string token = request.ClientToken.ToString("D");
         var result = await _inspector.ReadInventoryAsync(_configuration, _profile.ProfileId,
@@ -39,7 +40,9 @@ public sealed partial class Ec2EffectProvider
 
         var binding = new ExecutorBinding(_profile, allocation, entry.ResourceArn, incarnation,
             new Ec2ExecutorIdentity(launched, request.LaunchTemplateId, request.LaunchTemplateVersion));
-        return Applied(envelope, binding, entry.State, launched);
+        var evidence = Applied(envelope, binding, entry.State, launched);
+        Ec2Diagnostics.RecordEffect(operation, evidence);
+        return evidence;
     }
 
     private async Task<Ec2InventoryEntry?> ReadTerminationTargetAsync(
@@ -61,6 +64,7 @@ public sealed partial class Ec2EffectProvider
     private async Task<EffectEvidence?> SendTerminationAsync(
         EffectEnvelope envelope, Ec2TerminateEffectRequest request, string instanceId, CancellationToken cancellationToken)
     {
+        using var operation = Ec2Diagnostics.Start("terminate_instances", _telemetryProfile, cancellationToken);
         // The dispatcher rechecks durable cleanup authority immediately before calling this method.
         try
         {
@@ -71,14 +75,19 @@ public sealed partial class Ec2EffectProvider
         {
             return null;
         }
-        return await ObserveTerminationAsync(envelope, request, instanceId, cancellationToken).ConfigureAwait(false);
+        var evidence = await ObserveTerminationAsync(envelope, request, instanceId, cancellationToken).ConfigureAwait(false);
+        Ec2Diagnostics.RecordEffect(operation, evidence);
+        return evidence;
     }
 
     private async Task<EffectEvidence?> ObserveTerminationAsync(
         EffectEnvelope envelope, Ec2TerminateEffectRequest request, string instanceId, CancellationToken cancellationToken)
     {
+        using var operation = Ec2Diagnostics.Start("termination_readback", _telemetryProfile, cancellationToken);
         var target = await ReadTerminationTargetAsync(request, instanceId, cancellationToken).ConfigureAwait(false);
-        return IsTerminal(target) ? TerminalEvidence(envelope, request, instanceId) : null;
+        var evidence = IsTerminal(target) ? TerminalEvidence(envelope, request, instanceId) : null;
+        Ec2Diagnostics.RecordEffect(operation, evidence);
+        return evidence;
     }
 
     private EffectEvidence TerminalEvidence(EffectEnvelope envelope, Ec2TerminateEffectRequest request, string instanceId)

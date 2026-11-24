@@ -10,6 +10,7 @@ using Amazon.SecurityToken;
 using Amazon.SecurityToken.Model;
 using Knightfall.ScaleSet.Aws.Core.Configuration;
 using Knightfall.ScaleSet.Aws.Core.Lifecycle;
+using Knightfall.ScaleSet.Aws.Core.Telemetry;
 
 namespace Knightfall.ScaleSet.Aws.Providers.Ec2;
 
@@ -48,6 +49,37 @@ public sealed partial class Ec2ProfileInspector : IDisposable
         RuntimeConfiguration configuration, string profileId, CancellationToken cancellationToken)
     {
         var target = GetTarget(configuration, profileId);
+        var profile = TelemetryProfile.From(target.Profile);
+        using var operation = Ec2Diagnostics.Start("launch_template", profile, cancellationToken);
+        var result = await ResolvePreflightAsync(target, cancellationToken).ConfigureAwait(false);
+        string outcome = result.Status switch
+        {
+            Ec2PreflightStatus.Verified => "success",
+            Ec2PreflightStatus.AwsUnavailable or Ec2PreflightStatus.TemplateUnavailable => "unknown",
+            _ => "rejected",
+        };
+        operation?.Complete(outcome, PreflightReason(result.Status));
+        if (target.Provisioner.LaunchTemplateVersion is AliasLaunchTemplateVersion && result.ObservedVersionNumber.HasValue &&
+            result.Status is not (Ec2PreflightStatus.Verified or Ec2PreflightStatus.AwsUnavailable))
+        {
+            Ec2Diagnostics.RecordTemplateDrift(profile, "template_incompatible");
+        }
+        return result;
+    }
+
+    private static string PreflightReason(Ec2PreflightStatus status) => status switch
+    {
+        Ec2PreflightStatus.Verified => "template_verified",
+        Ec2PreflightStatus.AwsUnavailable => "aws_unavailable",
+        Ec2PreflightStatus.TemplateUnavailable => "template_unavailable",
+        Ec2PreflightStatus.TemplateIdentityMismatch or Ec2PreflightStatus.AwsIdentityMismatch => "identity_mismatch",
+        Ec2PreflightStatus.InstanceProfileMismatch or Ec2PreflightStatus.BootstrapRoleMismatch => "role_mismatch",
+        Ec2PreflightStatus.NetworkIncompatible or Ec2PreflightStatus.PlacementIncompatible => "network_incompatible",
+        _ => "template_incompatible",
+    };
+
+    private async Task<Ec2PreflightResult> ResolvePreflightAsync(InspectionTarget target, CancellationToken cancellationToken)
+    {
         cancellationToken.ThrowIfCancellationRequested();
         var provisioner = target.Provisioner;
         if (!GetSelector(provisioner.LaunchTemplateVersion, out string selector, out long? pinnedVersion))

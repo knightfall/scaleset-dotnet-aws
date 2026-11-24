@@ -5,6 +5,7 @@ using Amazon.ECS;
 using Amazon.ECS.Model;
 using Knightfall.ScaleSet.Aws.Core.Configuration;
 using Knightfall.ScaleSet.Aws.Core.Lifecycle;
+using Knightfall.ScaleSet.Aws.Core.Telemetry;
 using EcsTask = Amazon.ECS.Model.Task;
 
 namespace Knightfall.ScaleSet.Aws.Providers.Fargate;
@@ -13,11 +14,26 @@ public sealed partial class FargateProfileInspector
 {
     public Task<FargateInventorySnapshot> ReadInventoryAsync(
         RuntimeConfiguration configuration, string profileId, CancellationToken cancellationToken) =>
-        ReadInventoryAsync(GetTarget(configuration, profileId).Inventory, null, cancellationToken);
+        ReadInventoryAsync(GetTarget(configuration, profileId), null, cancellationToken);
 
     public Task<FargateInventorySnapshot> ReadAllocationAsync(
         RuntimeConfiguration configuration, string profileId, Guid allocationId, CancellationToken cancellationToken) =>
-        ReadInventoryAsync(GetTarget(configuration, profileId).Inventory, allocationId, cancellationToken);
+        ReadInventoryAsync(GetTarget(configuration, profileId), allocationId, cancellationToken);
+
+    private async Task<FargateInventorySnapshot> ReadInventoryAsync(InspectionTarget target, Guid? allocationId,
+        CancellationToken cancellationToken)
+    {
+        using var operation = FargateDiagnostics.Start(allocationId.HasValue ? "allocation_inventory" : "inventory",
+            TelemetryProfile.From(target.Profile), cancellationToken);
+        var result = await ReadInventoryAsync(target.Inventory, allocationId, cancellationToken).ConfigureAwait(false);
+        operation?.Complete(result.IsComplete ? "success" : "unknown", result.Status switch
+        {
+            FargateInventoryStatus.Complete => "inventory_complete",
+            FargateInventoryStatus.AwsUnavailable => "aws_unavailable",
+            _ => "inventory_incomplete",
+        });
+        return result;
+    }
 
     public static string StartedBy(Guid allocationId)
     {
