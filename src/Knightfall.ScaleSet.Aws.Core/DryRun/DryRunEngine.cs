@@ -26,7 +26,8 @@ public static class DryRunEngine
                 SeedInventory(configuration, verifiedInventory, observations);
             }
             var clock = new ReportClock((timeProvider ?? TimeProvider.System).GetUtcNow());
-            return Report(configuration, "none", PlanProfiles(configuration, observations, clock), []);
+            return Report(configuration, "none", PlanProfiles(configuration, observations, clock), [],
+                inspected: verifiedInventory is not null);
         }
 
         if (verifiedInventory is not null)
@@ -128,9 +129,11 @@ public static class DryRunEngine
         RuntimeConfiguration configuration,
         string demandSource,
         ImmutableArray<DryRunProfileReport> profiles,
-        ImmutableArray<DryRunReplayFrame> frames) =>
+        ImmutableArray<DryRunReplayFrame> frames,
+        bool inspected = false) =>
         new(configuration.EnvironmentName, configuration.Sha256, demandSource,
-            new DryRunInspection(configuration.DryRun.InspectAws, false, configuration.DryRun.InspectAws ? "offline" : null),
+            new DryRunInspection(configuration.DryRun.InspectAws, inspected,
+                configuration.DryRun.InspectAws && !inspected ? "offline" : null),
             profiles, frames);
 
     private readonly record struct ProfileObservations(DemandSample? Demand, InventorySample? Inventory);

@@ -16,5 +16,6 @@
     <None Include="../../testdata/config/runtime/*.json" Link="ConfigFixtures/runtime/%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" />
     <None Include="../../testdata/config/rejections.json" Link="ConfigFixtures/rejections.json" CopyToOutputDirectory="PreserveNewest" />
     <None Include="../../testdata/dryrun/replay.json" Link="Fixtures/DryRun/replay.json" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="../../cdk/config/schema/*.json" Link="ConfigFixtures/schema/%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 </Project>
