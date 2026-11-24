@@ -527,4 +527,30 @@ public sealed class FargateInventoryTests
         Assert.Equal(held, aws.Inspector.EstimateHeadroom(approved, inventory, quota,
             [reservation with { Scope = outside }], [peer with { Scope = outside }]));
     }
+
+    [Fact]
+    public async Task PlannedLaunchGetsOnlyItsOwnReservationBackAndHoldsKnownZeroOrExpiredQuota()
+    {
+        var token = TestContext.Current.CancellationToken;
+        using var aws = new FargateInspectionFixture { Ip1 = 1, Ip2 = 1 };
+        var configuration = await ConfigurationAsync(token);
+        var inventory = await aws.Inspector.ReadInventoryAsync(configuration, Profile, token);
+        var task = Assert.IsType<FargateResolvedTask>((await aws.Inspector.ResolvePreflightAsync(configuration, Profile, Approval, token)).Task);
+        var request = FargateProfileInspector.CreateLaunchRequest(task, FirstAllocation, [Subnet1]);
+        var own = new FargateLaunchReservation(FirstAllocation, task.CpuUnits, [Subnet1]) { Scope = task.Scope };
+        var peer = own with { AllocationId = OtherAllocation, Scope = task.Scope with { ProfileId = "other" } };
+        var quota = new FargateQuotaEvidence(Account, Region, Now, Now.AddMinutes(30), task.CpuUnits, 0);
+
+        Assert.Equal(0, aws.Inspector.EstimateHeadroom(task, inventory, quota, [own]).LaunchSlots);
+        Assert.Equal(1, Reserved(quota, [own]));
+        Assert.Equal(0, Reserved(quota with { RemainingCpuUnits = 0 }, [own]));
+        Assert.Equal(0, Reserved(quota, [own, peer]));
+        Assert.Null(Reserved(quota with { ObservedAt = Now.AddMinutes(-11) }, [own]));
+        Assert.Null(Reserved(quota, [own with { Scope = peer.Scope }]));
+        Assert.Equal(Now.AddMinutes(10), quota.ValidUntil);
+        Assert.Equal(Now.AddMinutes(1), (quota with { ExpiresAt = Now.AddMinutes(1) }).ValidUntil);
+
+        int? Reserved(FargateQuotaEvidence sample, IReadOnlyCollection<FargateLaunchReservation> reservations) =>
+            aws.Inspector.EstimateReservedLaunchHeadroom(task, inventory, sample, reservations, [], request).LaunchSlots;
+    }
 }

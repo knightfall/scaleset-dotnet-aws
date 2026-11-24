@@ -27,6 +27,71 @@ public sealed class FargateEffectJournalTests
     private static readonly EffectDispatcherTiming Timing = new(TimeSpan.FromSeconds(25), Reserve, TimeSpan.FromMinutes(5), TimeSpan.FromSeconds(5));
 
     [Fact]
+    public async Task QuotaExpiryAfterGuardedBeginRestoresTheUnsentPlanAndFreshQuotaPermitsIt()
+    {
+        var token = TestContext.Current.CancellationToken;
+        using var table = await MiniStackTable.CreateAsync(token);
+        var fixture = await CreateFixtureAsync(table, token);
+        var launch = Launch(fixture.Profile);
+        var provider = new FixtureProvider(fixture.Clock);
+        await PlanAsync(fixture, launch, token);
+
+        var deadline = Now.AddSeconds(5);
+        Assert.Equal(EffectDispatchStatus.Ineligible, await fixture.Dispatcher.DispatchPlannedAsync(fixture.Lease, Proof(fixture.Clock),
+            fixture.Profile, launch.IntentId, provider, CancellationToken.None, token));
+        var pause = table.Wire.PauseAfterNextSuccessfulTransactionWrite(LifecycleKey.Operation(fixture.Profile, launch.IntentId));
+        var dispatch = DispatchBeforeAsync(deadline);
+        try
+        {
+            await pause.Captured.WaitAsync(TimeSpan.FromSeconds(10), token);
+            Assert.Equal(EffectState.Executing, (await ReadAsync(fixture, launch, token)).Entry.State);
+            fixture.Clock.Now = deadline.AddSeconds(-1); // The conservative upper clock equals expiry.
+        }
+        finally
+        {
+            pause.Resume();
+        }
+        Assert.Equal(EffectDispatchStatus.AwaitingEvidence, await dispatch);
+        Assert.Empty(provider.Sends);
+        var held = await ReadAsync(fixture, launch, token);
+        Assert.Equal(EffectState.Planned, held.Entry.State);
+        Assert.Null(held.Entry.Attempt);
+        Assert.True(held.Entry.Envelope.Matches(launch));
+        Assert.Single((await ReservationsAsync(fixture, token)).Reservations);
+        Assert.Equal(EffectDispatchStatus.NotPlanned, await ReplayAsync(fixture, fixture.Lease, launch, provider, token));
+
+        Assert.Equal(EffectDispatchStatus.Ineligible, await DispatchBeforeAsync(deadline));
+        Assert.Empty(provider.Sends);
+        Assert.Equal(held.TransitionId, (await ReadAsync(fixture, launch, token)).TransitionId);
+        var freshDeadline = fixture.Clock.Now.AddSeconds(10);
+        Assert.Equal(EffectDispatchStatus.AwaitingEvidence, await DispatchBeforeAsync(freshDeadline));
+        var dispatched = Assert.Single(provider.Sends);
+        Assert.True(dispatched.Envelope.Matches(launch));
+        Assert.Equal(freshDeadline, dispatched.Attempt.Deadline);
+
+        Task<EffectDispatchStatus> DispatchBeforeAsync(DateTimeOffset quotaDeadline) => fixture.Dispatcher.DispatchPlannedAsync(
+            fixture.Lease, Proof(fixture.Clock), fixture.Profile, launch.IntentId, provider, quotaDeadline, CancellationToken.None, token);
+    }
+
+    [Fact]
+    public async Task PlannedLaunchPastItsImmutableCutoffReleasesOnlyItsOwnReservation()
+    {
+        var token = TestContext.Current.CancellationToken;
+        using var table = await MiniStackTable.CreateAsync(token);
+        var fixture = await CreateFixtureAsync(table, token);
+        var expired = Launch(fixture.Profile);
+        var provider = new FixtureProvider(fixture.Clock);
+        await PlanAsync(fixture, expired, token);
+        fixture.Clock.Now = expired.ProviderReplayDeadline!.Value.AddSeconds(1);
+
+        Assert.Equal(EffectDispatchStatus.Settled, await fixture.Dispatcher.DispatchPlannedAsync(fixture.Lease, Proof(fixture.Clock),
+            fixture.Profile, expired.IntentId, provider, fixture.Clock.Now.AddMinutes(1), CancellationToken.None, token));
+        Assert.Empty(provider.Sends);
+        Assert.Equal(EffectResolutionKind.CanceledBeforeSend, (await ReadAsync(fixture, expired, token)).Entry.Resolution?.Kind);
+        Assert.Empty((await ReservationsAsync(fixture, token)).Reservations);
+    }
+
+    [Fact]
     public async Task LostRunResponseSettlesFromExactStoppedReadbackBeforeRunnerExists()
     {
         var token = TestContext.Current.CancellationToken;
@@ -571,7 +636,8 @@ public sealed class FargateEffectJournalTests
 
     private static Task<EffectDispatchStatus> DispatchAsync(Fixture fixture, EffectEnvelope envelope, FixtureProvider provider,
         CancellationToken cancellationToken) => fixture.Dispatcher.DispatchPlannedAsync(fixture.Lease, Proof(fixture.Clock), envelope.Profile,
-            envelope.IntentId, provider, CancellationToken.None, cancellationToken);
+            envelope.IntentId, provider, envelope.Request is FargateLaunchEffectRequest ? fixture.Clock.Now.AddMinutes(1) : null,
+            CancellationToken.None, cancellationToken);
 
     private static Task<EffectDispatchStatus> ReplayAsync(Fixture fixture, ControllerLease lease, EffectEnvelope envelope, FixtureProvider provider,
         CancellationToken cancellationToken) => fixture.Dispatcher.ReplayFargateLaunchAsync(lease, Proof(fixture.Clock), envelope.Profile,

@@ -42,12 +42,24 @@ public sealed partial class DynamoDbEffectDispatcher
         _journal = new DynamoDbEffectJournal(store, clock);
     }
 
+    public Task<EffectDispatchStatus> DispatchPlannedAsync(
+        ControllerLease expected,
+        ControllerClockEvidence clockEvidence,
+        LifecycleProfile profile,
+        string intentId,
+        IReconciliationEffectProvider provider,
+        CancellationToken ownershipLost,
+        CancellationToken cancellationToken) =>
+        DispatchPlannedAsync(expected, clockEvidence, profile, intentId, provider, firstSendDeadline: null,
+            ownershipLost, cancellationToken);
+
     public async Task<EffectDispatchStatus> DispatchPlannedAsync(
         ControllerLease expected,
         ControllerClockEvidence clockEvidence,
         LifecycleProfile profile,
         string intentId,
         IReconciliationEffectProvider provider,
+        DateTimeOffset? firstSendDeadline,
         CancellationToken ownershipLost,
         CancellationToken cancellationToken)
     {
@@ -104,7 +116,7 @@ public sealed partial class DynamoDbEffectDispatcher
             return EffectDispatchStatus.Ineligible;
         }
         if (envelope.Request is FargateLaunchEffectRequest { OwnershipTags: not null } fargateLaunch &&
-            !DynamoDbLifecycleStore.MatchesFargateLaunchCatalog(catalog, envelope, fargateLaunch))
+            (firstSendDeadline is null || !DynamoDbLifecycleStore.MatchesFargateLaunchCatalog(catalog, envelope, fargateLaunch)))
         {
             return EffectDispatchStatus.Ineligible;
         }
@@ -123,6 +135,17 @@ public sealed partial class DynamoDbEffectDispatcher
         bool knownTerminalStop = IsKnownTerminalFargateStop(envelope.Request, allocation);
         if ((!AllocationAllows(envelope.Request, allocation, observedAfter) && !knownTerminalStop) ||
             Window(lease, clockEvidence) is not { } checkWindow)
+        {
+            return EffectDispatchStatus.Ineligible;
+        }
+        if (envelope.Request is FargateLaunchEffectRequest { OwnershipTags: not null } &&
+            envelope.ProviderReplayDeadline - checkWindow.UpperUtcNow <= _timing.WriteReserve)
+        {
+            // An expired immutable envelope still in Planned has never authorized a send.
+            var canceled = await CancelPlannedAsync(lease, effect, token).ConfigureAwait(false);
+            return canceled == LifecycleWriteOutcome.Committed ? EffectDispatchStatus.Settled : EffectDispatchStatus.AwaitingEvidence;
+        }
+        if (checkWindow.UpperUtcNow >= firstSendDeadline)
         {
             return EffectDispatchStatus.Ineligible;
         }
@@ -176,6 +199,10 @@ public sealed partial class DynamoDbEffectDispatcher
         if (envelope.Request is FargateLaunchEffectRequest { OwnershipTags: not null } && envelope.ProviderReplayDeadline is { } cutoff)
         {
             usable = Min(usable, cutoff - sendWindow.UpperUtcNow - _timing.WriteReserve);
+        }
+        if (firstSendDeadline is { } validUntil)
+        {
+            usable = Min(usable, validUntil - sendWindow.UpperUtcNow);
         }
         if (usable <= TimeSpan.Zero)
         {
@@ -233,7 +260,8 @@ public sealed partial class DynamoDbEffectDispatcher
             return await SendAsync(lease, clockEvidence, guard, permission, provider, token, observation.AlreadyApplied, observedAfter)
                 .ConfigureAwait(false);
         }
-        catch when (!permission.HasStartedSending && (trackedEc2Launch || envelope.Request is FargateStopEffectRequest { Incarnation: not null }))
+        catch when (!permission.HasStartedSending && (trackedEc2Launch || permission.RestoresUnsentFargateLaunch ||
+            envelope.Request is FargateStopEffectRequest { Incarnation: not null }))
         {
             _ = await AbandonNoSendAsync(lease, permission).ConfigureAwait(false);
             throw;
@@ -288,7 +316,8 @@ public sealed partial class DynamoDbEffectDispatcher
                 .ConfigureAwait(false);
             return settled == LifecycleWriteOutcome.Committed ? EffectDispatchStatus.Settled : EffectDispatchStatus.AwaitingEvidence;
         }
-        if (!permission.TryConsume(out var remaining))
+        if ((permission.RestoresUnsentFargateLaunch && window.UpperUtcNow >= permission.Attempt.Deadline) ||
+            !permission.TryConsume(out var remaining))
         {
             return await AbandonNoSendAsync(lease, permission).ConfigureAwait(false);
         }
@@ -309,7 +338,8 @@ public sealed partial class DynamoDbEffectDispatcher
     private async Task<EffectDispatchStatus> AbandonNoSendAsync(ControllerLease lease, EffectSendAuthorization permission)
     {
         var request = permission.Envelope.Request;
-        if (request is Ec2LaunchEffectRequest { OwnershipTags: not null } or FargateStopEffectRequest { Incarnation: not null } &&
+        if ((permission.RestoresUnsentFargateLaunch ||
+                request is Ec2LaunchEffectRequest { OwnershipTags: not null } or FargateStopEffectRequest { Incarnation: not null }) &&
             await _journal.FinalizeInterruptedEffectAsync(lease, permission, _timing.WriteReserve).ConfigureAwait(false) ==
                 LifecycleWriteOutcome.Committed)
         {

@@ -33,7 +33,8 @@ public sealed class EffectSendAuthorization
         DeploymentLeaseFence lease,
         TimeProvider clock,
         long beganAt,
-        DateTimeOffset upperUtcNow)
+        DateTimeOffset upperUtcNow,
+        bool restoresUnsentFargateLaunch)
     {
         Envelope = envelope;
         Attempt = attempt;
@@ -43,6 +44,7 @@ public sealed class EffectSendAuthorization
         _clock = clock;
         _beganAt = beganAt;
         _upperUtcNow = upperUtcNow;
+        RestoresUnsentFargateLaunch = restoresUnsentFargateLaunch;
     }
 
     public EffectEnvelope Envelope { get; }
@@ -51,6 +53,7 @@ public sealed class EffectSendAuthorization
     public bool HasStartedSending => ReferenceEquals(Volatile.Read(ref _disposition), Consumed);
     internal Guid BeginTransitionId { get; }
     internal DeploymentLeaseFence Lease { get; }
+    internal bool RestoresUnsentFargateLaunch { get; }
 
     public bool TryConsume(out TimeSpan remaining)
     {
@@ -220,8 +223,10 @@ public sealed partial class DynamoDbEffectJournal
             ? current.Entry.BeginFargateReplay(attemptId, lease.Epoch, lower, now, requestedDeadline, leaseDeadline)
             : current.Entry.Begin(attemptId, lease.Epoch, now, requestedDeadline, leaseDeadline);
         var attempt = entry.Attempt!;
+        bool restoresUnsentFargateLaunch = replayLowerBound is null &&
+            entry.Envelope.Request is FargateLaunchEffectRequest { OwnershipTags: not null };
         var permission = new EffectSendAuthorization(entry.Envelope, attempt, checked(current.Revision + 1), transitionId, lease.Fence,
-            _timeProvider, beganAt, upperUtcNow);
+            _timeProvider, beganAt, upperUtcNow, restoresUnsentFargateLaunch);
         LifecycleWriteOutcome outcome;
         try
         {
@@ -232,7 +237,8 @@ public sealed partial class DynamoDbEffectJournal
                     guard, attempt.Deadline, cancellationToken, replayLowerBound is null ? null : current).ConfigureAwait(false);
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested &&
-            entry.Envelope.Request is Ec2LaunchEffectRequest { OwnershipTags: not null } or FargateStopEffectRequest { Incarnation: not null })
+            (restoresUnsentFargateLaunch ||
+                entry.Envelope.Request is Ec2LaunchEffectRequest { OwnershipTags: not null } or FargateStopEffectRequest { Incarnation: not null }))
         {
             // An exact committed Begin can be discarded because no authorization reached the caller.
             _ = await FinalizeInterruptedEffectAsync(lease, permission, leaseReserve).ConfigureAwait(false);
@@ -240,13 +246,17 @@ public sealed partial class DynamoDbEffectJournal
         }
         if (outcome != LifecycleWriteOutcome.Committed)
         {
+            if (restoresUnsentFargateLaunch && outcome == LifecycleWriteOutcome.Indeterminate)
+            {
+                _ = await FinalizeInterruptedEffectAsync(lease, permission, leaseReserve).ConfigureAwait(false);
+            }
             return new EffectBeginOutcome(outcome, null);
         }
         if (!cancellationToken.IsCancellationRequested && permission.EstimateUtcNow() < attempt.Deadline)
         {
             return new EffectBeginOutcome(outcome, permission);
         }
-        if (EffectJournalEntry.AllowsAbandonmentBeforeSend(entry.Envelope))
+        if (restoresUnsentFargateLaunch || EffectJournalEntry.AllowsAbandonmentBeforeSend(entry.Envelope))
         {
             // The known commit completed too late, before any caller could use the send authorization.
             var abandoned = await FinalizeInterruptedEffectAsync(lease, permission, leaseReserve).ConfigureAwait(false);

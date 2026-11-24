@@ -42,10 +42,7 @@ internal sealed class FargateRunnerBackend(
                 var headroom = inspector.EstimateHeadroom(approved, inventory, sample, reservations,
                     deploymentInventory.Values.ToArray());
                 launchHeadroom = headroom.LaunchSlots;
-                if (launchHeadroom > 0)
-                {
-                    _launchTask = approved;
-                }
+                _launchTask = approved;
             }
         }
 
@@ -85,8 +82,7 @@ internal sealed class FargateRunnerBackend(
 
                 if (effect.Entry.State == EffectState.Planned)
                 {
-                    _ = await dispatcher.DispatchPlannedAsync(authority.Lease, authority.Clock, key, intentId,
-                        Effects, ownershipLost, cancellationToken).ConfigureAwait(false);
+                    await DispatchFirstLaunchAsync(authority, effect.Entry.Envelope, ownershipLost, cancellationToken).ConfigureAwait(false);
                 }
                 else
                 {
@@ -115,9 +111,27 @@ internal sealed class FargateRunnerBackend(
             earliest, earliest.AddMinutes(50));
         if (await journal.PlanAsync(authority.Lease, envelope, Guid.NewGuid(), cancellationToken).ConfigureAwait(false) == LifecycleWriteOutcome.Committed)
         {
-            _ = await dispatcher.DispatchPlannedAsync(authority.Lease, authority.Clock, key, envelope.IntentId,
-                Effects, ownershipLost, cancellationToken).ConfigureAwait(false);
+            await DispatchFirstLaunchAsync(authority, envelope, ownershipLost, cancellationToken).ConfigureAwait(false);
         }
+    }
+
+    private async Task DispatchFirstLaunchAsync(ActiveControllerAuthority authority, EffectEnvelope envelope,
+        CancellationToken ownershipLost, CancellationToken cancellationToken)
+    {
+        if (envelope.Request is not FargateLaunchEffectRequest launch || _launchTask is not { } task ||
+            !deploymentInventory.TryGetValue(profile.Id, out var inventory))
+        {
+            return;
+        }
+        var reservations = await ReadReservationsAsync(authority.Lease.Fence, cancellationToken).ConfigureAwait(false);
+        var sample = await quota.ReadAsync(cancellationToken).ConfigureAwait(false);
+        if (sample is null || inspector.EstimateReservedLaunchHeadroom(task, inventory, sample, reservations,
+                deploymentInventory.Values.ToArray(), launch).LaunchSlots is not > 0)
+        {
+            return;
+        }
+        _ = await dispatcher.DispatchPlannedAsync(authority.Lease, authority.Clock, key, envelope.IntentId,
+            Effects, sample.ValidUntil, ownershipLost, cancellationToken).ConfigureAwait(false);
     }
 
     public async Task CleanupAsync(ActiveControllerAuthority authority, CatalogProfile catalog, ExecutorSnapshot executor,

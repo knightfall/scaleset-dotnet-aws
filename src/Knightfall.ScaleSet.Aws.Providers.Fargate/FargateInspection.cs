@@ -120,9 +120,14 @@ public sealed record FargateQuotaEvidence(
     string Account, string Region, DateTimeOffset ObservedAt, DateTimeOffset ExpiresAt,
     [property: JsonRequired] long RemainingCpuUnits, [property: JsonRequired] long ReservedCpuUnits)
 {
+    private static readonly TimeSpan MaximumAge = TimeSpan.FromMinutes(10);
+
+    [JsonIgnore]
+    public DateTimeOffset ValidUntil => ExpiresAt - ObservedAt < MaximumAge ? ExpiresAt : ObservedAt + MaximumAge;
+
     public bool IsCurrentFor(string account, string region, DateTimeOffset now) =>
         Account == account && Region == region && ObservedAt != default && ObservedAt <= now &&
-        now - ObservedAt <= TimeSpan.FromMinutes(10) && ExpiresAt > now &&
+        now - ObservedAt <= MaximumAge && ExpiresAt > now &&
         RemainingCpuUnits >= 0 && ReservedCpuUnits >= 0;
 }
 
