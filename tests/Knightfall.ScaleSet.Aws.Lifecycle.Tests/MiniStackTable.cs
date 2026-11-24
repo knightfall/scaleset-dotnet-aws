@@ -188,7 +188,8 @@ internal sealed class MiniStackWire : DelegatingHandler
     private int _dropTransactionBeforeSend;
     private int _dropSuccessfulTransaction;
     private TransactionBarrier? _transactionBarrier;
-    private PausedRead? _pausedRead;
+    private PausedRequest? _pausedRead;
+    private PausedRequest? _pausedWrite;
     private StorageFailure? _failedGetItem;
     private StorageFailure? _failedTransactWrite;
 
@@ -215,10 +216,17 @@ internal sealed class MiniStackWire : DelegatingHandler
     internal void FailNextTransactWrite(LifecycleKey key, string errorCode) =>
         Interlocked.Exchange(ref _failedTransactWrite, new StorageFailure(key, HttpStatusCode.BadRequest, errorCode));
 
-    internal PausedRead PauseNextRead(LifecycleKey key)
+    internal PausedRequest PauseNextRead(LifecycleKey key)
     {
-        var pause = new PausedRead(key);
+        var pause = new PausedRequest(key);
         _pausedRead = pause;
+        return pause;
+    }
+
+    internal PausedRequest PauseNextTransactionWrite(LifecycleKey key)
+    {
+        var pause = new PausedRequest(key);
+        _pausedWrite = pause;
         return pause;
     }
 
@@ -255,6 +263,13 @@ internal sealed class MiniStackWire : DelegatingHandler
         if (operation == "TransactWriteItems" && _transactionBarrier is { } barrier)
         {
             await barrier.WaitAsync(cancellationToken);
+        }
+        if (operation == "TransactWriteItems" && _pausedWrite is { } writePause &&
+            call.Request.GetProperty("TransactItems").EnumerateArray().Any(action =>
+                action.TryGetProperty("Put", out var put) && writePause.Matches(put.GetProperty("Item"))) &&
+            Interlocked.CompareExchange(ref _pausedWrite, null, writePause) == writePause)
+        {
+            await writePause.AwaitResumeAsync(cancellationToken);
         }
         var actual = await base.SendAsync(request, cancellationToken);
         if (operation == "GetItem" && _pausedRead is { } pause &&
@@ -306,7 +321,7 @@ internal sealed class MiniStackWire : DelegatingHandler
 
     private sealed record StorageFailure(LifecycleKey Key, HttpStatusCode? Status, string? ErrorCode);
 
-    internal sealed class PausedRead(LifecycleKey key)
+    internal sealed class PausedRequest(LifecycleKey key)
     {
         private readonly TaskCompletionSource _captured = new(TaskCreationOptions.RunContinuationsAsynchronously);
         private readonly TaskCompletionSource _resume = new(TaskCreationOptions.RunContinuationsAsynchronously);

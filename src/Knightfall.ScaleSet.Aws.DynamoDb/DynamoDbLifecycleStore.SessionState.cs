@@ -1,4 +1,5 @@
 using Amazon.DynamoDBv2.Model;
+using Knightfall.ScaleSet.Aws.Core.Catalog;
 using Knightfall.ScaleSet.Aws.Core.Lifecycle;
 
 namespace Knightfall.ScaleSet.Aws.DynamoDb;
@@ -28,12 +29,21 @@ public sealed partial class DynamoDbLifecycleStore
 
     /// <summary>Commits profile records under the exact current active session and index fences.</summary>
     /// <remarks>A logical transition can be read back or retried after uncertainty using its unchanged revision and payload.</remarks>
-    public async Task<LifecycleWriteOutcome> WriteSessionRecordsAsync(
+    public Task<LifecycleWriteOutcome> WriteSessionRecordsAsync(
         OwnedSessionFence fence,
         Guid transitionId,
         IReadOnlyList<LifecycleRecordWrite> writes,
         CancellationToken cancellationToken,
-        IReadOnlyList<LifecycleRecordCondition>? readGuards = null)
+        IReadOnlyList<LifecycleRecordCondition>? readGuards = null) =>
+        WriteSessionRecordsCoreAsync(fence, transitionId, writes, readGuards, null, cancellationToken);
+
+    private async Task<LifecycleWriteOutcome> WriteSessionRecordsCoreAsync(
+        OwnedSessionFence fence,
+        Guid transitionId,
+        IReadOnlyList<LifecycleRecordWrite> writes,
+        IReadOnlyList<LifecycleRecordCondition>? readGuards,
+        IReadOnlyList<TransactionAction>? executorActions,
+        CancellationToken cancellationToken)
     {
         RequireSessionFence(fence);
         ArgumentNullException.ThrowIfNull(writes);
@@ -48,9 +58,10 @@ public sealed partial class DynamoDbLifecycleStore
 
         LifecycleRecordCondition? indexGuard = null;
         var profile = fence.Identity.Profile;
+        var ownership = LeaseCondition(fence.Lease);
         var actions = new List<TransactionAction>
         {
-            LeaseCondition(fence.Lease),
+            ownership,
             ActiveSessionCondition(fence),
         };
 
@@ -81,7 +92,26 @@ public sealed partial class DynamoDbLifecycleStore
             RequireSessionRecordKey(fence, write.Key, readOnly: false);
             actions.Add(BuildRecordWrite(fence.Lease.Deployment, transitionId, write));
         }
+        if (writes.Any(write => write is { Key.Kind: LifecycleItemKind.Acquisition, ExpectedRevision: null }))
+        {
+            var catalog = await ReadCatalogProfileAsync(profile, cancellationToken).ConfigureAwait(false);
+            if (catalog is not null && (catalog.State != CatalogProfileState.Active ||
+                catalog.Binding.ScopeIdentity != fence.Identity.ScopeIdentity || catalog.Binding.ScaleSetId != fence.Identity.ScaleSetId))
+            {
+                return LifecycleWriteOutcome.Conflict;
+            }
+            RequireCatalogSessionOpen(ownership, catalog);
+            actions.Add(CatalogAllowsSessionOpenCondition(profile, catalog));
+        }
+        if (executorActions is not null)
+        {
+            actions.AddRange(executorActions);
+        }
 
+        if (actions.Count > MaximumTransactionItems)
+        {
+            return LifecycleWriteOutcome.Conflict;
+        }
         var outcome = await WriteAsync(actions, Guid.NewGuid(), cancellationToken).ConfigureAwait(false);
         if (outcome == LifecycleWriteOutcome.RebuildRequired && indexGuard is not null)
         {
@@ -245,7 +275,7 @@ public sealed partial class DynamoDbLifecycleStore
             LifecycleItemKind.Checkpoint => key == LifecycleKey.Checkpoint(identity.Profile, identity.SessionId),
             LifecycleItemKind.Message => key.SortKey.StartsWith($"MSG#{identity.SessionId:D}#", StringComparison.Ordinal),
             LifecycleItemKind.Demand or LifecycleItemKind.Admission or LifecycleItemKind.Job or LifecycleItemKind.Acquisition => true,
-            LifecycleItemKind.Effects or LifecycleItemKind.Runner or LifecycleItemKind.RunnerIdentity => readOnly,
+            LifecycleItemKind.Effects or LifecycleItemKind.Runner or LifecycleItemKind.RunnerIdentity or LifecycleItemKind.RunnerInventory => readOnly,
             _ => false,
         };
         if (!valid)

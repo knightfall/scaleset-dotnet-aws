@@ -36,6 +36,9 @@ public sealed class LifecycleStorageTests
             (LifecycleKey.Hello("AROA:session"), "HELLO#AROA:session", "BOOTSTRAP"),
             (LifecycleKey.Offer("AROA:session"), "OFFER#AROA:session", "BOOTSTRAP"),
             (LifecycleKey.Status("AROA:session"), "STATUS#AROA:session", "BOOTSTRAP"),
+            (LifecycleKey.RunnerInventory(profile), "PROFILE#d#p", "RUNNER-INVENTORY"),
+            (LifecycleKey.ActiveRunner(profile, "allocation-1"), "PROFILE#d#p", "ACTIVE-RUNNER#allocation-1"),
+            (LifecycleKey.Drain(profile), "PROFILE#d#p", "DRAIN"),
         ];
 
         Assert.Equal(Enum.GetValues<LifecycleItemKind>(), expected.Select(row => row.Key.Kind));

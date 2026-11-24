@@ -10,7 +10,8 @@ namespace Knightfall.ScaleSet.Aws.GitHub;
 
 internal sealed class ListenerDeliveryLedger(DynamoDbLifecycleStore store, OwnedSessionFence fence)
 {
-    internal const int MaximumJobsPerTransaction = 45;
+    /// <summary>Bounds each transaction even when jobs touch two executors and their mappings.</summary>
+    internal const int MaximumJobsPerTransaction = 11;
     private const int MaximumTransactionActions = 100;
     private static readonly JsonSerializerOptions Json = new(JsonSerializerDefaults.Web)
     {
@@ -33,9 +34,9 @@ internal sealed class ListenerDeliveryLedger(DynamoDbLifecycleStore store, Owned
         }
     }
 
-    internal async Task<Entry<SessionDemand>?> ReadDemandAsync(CancellationToken cancellationToken)
+    internal async Task<Entry<SessionDemandObservation>?> ReadDemandAsync(CancellationToken cancellationToken)
     {
-        var entry = await ReadAsync<SessionDemand>(LifecycleKey.Demand(fence.Identity.Profile), cancellationToken).ConfigureAwait(false);
+        var entry = await ReadAsync<SessionDemandObservation>(LifecycleKey.Demand(fence.Identity.Profile), cancellationToken).ConfigureAwait(false);
         if (entry?.Value is { } demand && (demand.SessionId == Guid.Empty || demand.ObservedAt == default ||
             demand.MessageId < 0 || demand.TotalAssignedJobs < 0))
         {
@@ -44,10 +45,12 @@ internal sealed class ListenerDeliveryLedger(DynamoDbLifecycleStore store, Owned
         return entry;
     }
 
-    internal async Task<Entry<MessageReceipt>?> ReadReceiptAsync(long messageId, string digest, CancellationToken cancellationToken)
+    internal async Task<Entry<MessageReceipt>?> ReadReceiptAsync(
+        long messageId, string digest, CancellationToken cancellationToken, string? priorDigest = null)
     {
         var entry = await ReadAsync<MessageReceipt>(MessageKey(messageId), cancellationToken).ConfigureAwait(false);
-        if (entry is not null && (entry.Value.Digest != digest || entry.Value.ObservedAt == default || entry.Value.JobOffset < 0 ||
+        if (entry is not null && ((entry.Value.Digest != digest && (priorDigest is null || entry.Value.Digest != priorDigest)) ||
+            entry.Value.ObservedAt == default || entry.Value.JobOffset < 0 ||
             (entry.Value.Admission is { } attempt && !MatchesEnvelope(attempt, messageId))))
         {
             throw InvalidEvidence();
@@ -61,7 +64,7 @@ internal sealed class ListenerDeliveryLedger(DynamoDbLifecycleStore store, Owned
         List<LifecycleRecordWrite> writes =
             [NewWrite(MessageKey(messageId), new MessageReceipt(digest, observedAt, 0, null))];
         if (assigned is int totalAssigned &&
-            await DemandWriteAsync(new SessionDemand(fence.Identity.SessionId, observedAt, messageId, totalAssigned),
+            await DemandWriteAsync(new SessionDemandObservation(fence.Identity.SessionId, observedAt, messageId, totalAssigned),
                 cancellationToken).ConfigureAwait(false) is { } demand)
         {
             writes.Add(demand);
@@ -72,7 +75,7 @@ internal sealed class ListenerDeliveryLedger(DynamoDbLifecycleStore store, Owned
     internal async Task<bool> PersistInitialStatisticsAsync(
         DateTimeOffset observedAt, int assigned, CancellationToken cancellationToken)
     {
-        var write = await DemandWriteAsync(new SessionDemand(fence.Identity.SessionId, observedAt, null, assigned), cancellationToken)
+        var write = await DemandWriteAsync(new SessionDemandObservation(fence.Identity.SessionId, observedAt, null, assigned), cancellationToken)
             .ConfigureAwait(false);
         return write is null ||
             await WriteAsync([write], cancellationToken).ConfigureAwait(false) == LifecycleWriteOutcome.Committed;
@@ -89,6 +92,7 @@ internal sealed class ListenerDeliveryLedger(DynamoDbLifecycleStore store, Owned
 
         List<LifecycleRecordWrite> writes = [];
         List<LifecycleRecordCondition> guards = [];
+        List<ExecutorJobObservation> executorJobs = [];
         int released = 0;
         foreach (var job in jobs)
         {
@@ -99,12 +103,37 @@ internal sealed class ListenerDeliveryLedger(DynamoDbLifecycleStore store, Owned
             {
                 throw InvalidEvidence();
             }
-            if (previous is null || job.Phase > previous.Value.Observation.Phase)
+            var current = previous?.Value;
+            long? knownRunner = current?.Observation.RunnerId;
+            long? observedRunner = job.RunnerId ?? job.RelatedRunnerId ?? knownRunner;
+            long? otherRunner = job.RunnerId is not null ? job.RelatedRunnerId : null;
+            otherRunner ??= knownRunner != observedRunner ? knownRunner : null;
+            if (current?.Observation.RunnerId is long prior && prior != observedRunner && prior != otherRunner)
             {
-                writes.Add(Write(key, previous, new StoredJob(job, fence.Identity.SessionId, messageId, receipt.Value.ObservedAt)));
+                throw InvalidEvidence();
+            }
+            bool conflict = current?.HasConflict == true || otherRunner is not null;
+            var candidate = new StoredJob(job with { RunnerId = observedRunner, RelatedRunnerId = otherRunner }, fence.Identity.SessionId,
+                messageId, receipt.Value.ObservedAt, conflict);
+            var next = current is null || job.Phase > current.Observation.Phase ||
+                (job.Phase == current.Observation.Phase && receipt.Value.ObservedAt >= current.ObservedAt)
+                ? candidate : current with { HasConflict = conflict };
+            if (next != current)
+            {
+                writes.Add(Write(key, previous, next));
+            }
+            if (job.Phase is ExecutorJobPhase.Started or ExecutorJobPhase.Completed && observedRunner is long runnerId)
+            {
+                executorJobs.Add(new ExecutorJobObservation(job.RequestId, runnerId, job.Phase, fence.Identity.SessionId,
+                    messageId, receipt.Value.ObservedAt, conflict));
+                if (otherRunner is long rival)
+                {
+                    executorJobs.Add(new ExecutorJobObservation(job.RequestId, rival, job.Phase, fence.Identity.SessionId,
+                        messageId, receipt.Value.ObservedAt, HasConflict: true));
+                }
             }
 
-            if (job.Phase == JobPhase.Completed || releaseOnAssignment)
+            if (!conflict && (job.Phase == ExecutorJobPhase.Completed || releaseOnAssignment))
             {
                 var acquisition = await ReadAcquisitionAsync(job.RequestId, cancellationToken).ConfigureAwait(false);
                 if (acquisition is null)
@@ -113,7 +142,7 @@ internal sealed class ListenerDeliveryLedger(DynamoDbLifecycleStore store, Owned
                 }
                 else if (acquisition.Value.IsHeld)
                 {
-                    var reason = job.Phase == JobPhase.Completed
+                    var reason = job.Phase == ExecutorJobPhase.Completed
                         ? AdmissionEvidenceKind.Completed : AdmissionEvidenceKind.Assignment;
                     writes.Add(Release(acquisition, new AdmissionEvidence(reason, receipt.Record.Key.SortKey)));
                     released++;
@@ -126,7 +155,8 @@ internal sealed class ListenerDeliveryLedger(DynamoDbLifecycleStore store, Owned
             writes.Add(DecrementBalance(balance, released));
         }
         writes.Add(Replace(receipt, receipt.Value with { JobOffset = checked(receipt.Value.JobOffset + jobs.Count) }));
-        return await store.WriteSessionRecordsAsync(fence, Guid.NewGuid(), writes, cancellationToken, guards).ConfigureAwait(false);
+        return await store.WriteSessionDeliveryRecordsAsync(fence, Guid.NewGuid(), writes, executorJobs, cancellationToken, guards)
+            .ConfigureAwait(false);
     }
 
     internal async Task<AdmissionAttempt?> ReserveAsync(
@@ -169,7 +199,8 @@ internal sealed class ListenerDeliveryLedger(DynamoDbLifecycleStore store, Owned
             var acquisitionKey = LifecycleKey.Acquisition(profile, requestId);
             bool hasJobGuard = guards.TryGetValue(jobKey, out long? jobRevision);
             bool hasAcquisitionGuard = guards.TryGetValue(acquisitionKey, out long? acquisitionRevision);
-            int additionalActions = (chosen.Count == 0 && !hasBalanceGuard ? 1 : 0) +
+            // A nonempty reservation also fences the applied profile catalog.
+            int additionalActions = (chosen.Count == 0 ? 1 + (hasBalanceGuard ? 0 : 1) : 0) +
                 (hasJobGuard ? 0 : 1) + (hasAcquisitionGuard ? 0 : 1);
             if (actions + additionalActions > MaximumTransactionActions)
             {
@@ -267,7 +298,7 @@ internal sealed class ListenerDeliveryLedger(DynamoDbLifecycleStore store, Owned
             .ConfigureAwait(false) == LifecycleWriteOutcome.Committed;
     }
 
-    private async Task<LifecycleRecordWrite?> DemandWriteAsync(SessionDemand observation, CancellationToken cancellationToken)
+    private async Task<LifecycleRecordWrite?> DemandWriteAsync(SessionDemandObservation observation, CancellationToken cancellationToken)
     {
         if (observation.ObservedAt == default || observation.TotalAssignedJobs < 0)
         {
@@ -376,20 +407,14 @@ internal sealed class ListenerDeliveryLedger(DynamoDbLifecycleStore store, Owned
     private static InvalidDataException InvalidEvidence() => new("Listener delivery state does not match its recorded identity or evidence.");
 
     internal sealed record Entry<T>(LifecycleRecord Record, T Value);
-    internal sealed record SessionDemand(Guid SessionId, DateTimeOffset ObservedAt, long? MessageId, int TotalAssignedJobs);
     internal sealed record MessageReceipt(string Digest, DateTimeOffset ObservedAt, int JobOffset, AdmissionAttempt? Admission);
     internal sealed record AdmissionAttempt(Guid Id, AcquisitionRequest Request, string Sha256, bool OutcomeRecorded);
     internal sealed record AcquisitionRequest(string ScopeIdentity, long ScaleSetId, Guid SessionId, long MessageId,
         ImmutableArray<long> RequestIds);
-    internal sealed record JobObservation(long RequestId, JobPhase Phase, long? RunnerId);
-    private sealed record StoredJob(JobObservation Observation, Guid SessionId, long MessageId, DateTimeOffset ObservedAt);
-
-    internal enum JobPhase
-    {
-        Assigned = 0,
-        Started = 1,
-        Completed = 2,
-    }
+    internal sealed record JobObservation(long RequestId, ExecutorJobPhase Phase, long? RunnerId,
+        [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] long? RelatedRunnerId = null);
+    private sealed record StoredJob(JobObservation Observation, Guid SessionId, long MessageId, DateTimeOffset ObservedAt,
+        bool HasConflict = false);
 
     private sealed record AdmissionBalance(int HeldCount);
 

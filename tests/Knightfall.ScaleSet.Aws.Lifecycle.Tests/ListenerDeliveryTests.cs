@@ -194,7 +194,7 @@ public sealed class ListenerDeliveryTests
         var owned = await OpenAsync(store, table.Lease, profile, Guid.NewGuid(), token);
         var session = new TestSession(owned.Identity.SessionId);
         var capacity = new ListenerCapacity(10, 2);
-        var runnerKey = LifecycleKey.Runner(profile, "allocation-1");
+        var runnerKey = LifecycleKey.Job(profile, "capacity-basis");
         Assert.Equal(LifecycleWriteOutcome.Committed,
             await store.WriteRecordsAsync(table.Lease, Guid.NewGuid(), [new LifecycleRecordWrite(runnerKey, null, "{}")], token));
         bool replaceCapacityBasis = false;
@@ -255,7 +255,7 @@ public sealed class ListenerDeliveryTests
         {
             ReadGuards =
             [
-                .. runners.Take(92), runners[0],
+                .. runners.Take(91), runners[0],
                 new(receiptKey, receipt.Revision),
                 new(LifecycleKey.Admission(profile), null),
                 new(LifecycleKey.Acquisition(profile, FirstRequest), null),
@@ -270,7 +270,7 @@ public sealed class ListenerDeliveryTests
         Assert.Equal(1, await HeldCountAsync(store, profile, token));
     }
 
-    private static async Task<OwnedSessionFence> OpenAsync(
+    internal static async Task<OwnedSessionFence> OpenAsync(
         DynamoDbLifecycleStore store, DeploymentLeaseFence lease, LifecycleProfile profile, Guid sessionId, CancellationToken token,
         SessionRecord? previous = null)
     {
@@ -304,7 +304,7 @@ public sealed class ListenerDeliveryTests
         IMessageSessionClient session, TimeProvider clock, int maximum) =>
         new(store, owned, session, _ => Task.FromResult(new ListenerCapacity(maximum, 0)), clock);
 
-    private static async Task InitializeAsync(GitHubListenerDeliveryHandler handler, OwnedSessionFence owned,
+    internal static async Task InitializeAsync(GitHubListenerDeliveryHandler handler, OwnedSessionFence owned,
         DateTimeOffset observedAt, int assigned, CancellationToken token)
     {
         var statistics = new RunnerScaleSetStatistic { TotalAssignedJobs = assigned };
@@ -315,7 +315,7 @@ public sealed class ListenerDeliveryTests
     private static ScaleSetListenerSessionKey Key(OwnedSessionFence owned) =>
         new(owned.Identity.ScopeIdentity, owned.Identity.ScaleSetId, owned.Identity.SessionId);
 
-    private static ScaleSetListenerDelivery Delivery(OwnedSessionFence owned, DateTimeOffset at, RunnerScaleSetMessage message) =>
+    internal static ScaleSetListenerDelivery Delivery(OwnedSessionFence owned, DateTimeOffset at, RunnerScaleSetMessage message) =>
         new(Key(owned), ScaleSetListenerDeliveryKind.Message, at, message);
 
     private static ScaleSetListenerDelivery Offer(OwnedSessionFence owned, DateTimeOffset at, long messageId, params long[] requests) =>
@@ -346,7 +346,7 @@ public sealed class ListenerDeliveryTests
         return document.RootElement.Clone();
     }
 
-    private sealed class TestSession(Guid sessionId, IReadOnlyList<long>? accepted = null) : IMessageSessionClient
+    internal sealed class TestSession(Guid sessionId, IReadOnlyList<long>? accepted = null) : IMessageSessionClient
     {
         public RunnerScaleSetSession Session { get; } = new() { SessionId = sessionId };
         internal List<long[]> Acquisitions { get; } = [];

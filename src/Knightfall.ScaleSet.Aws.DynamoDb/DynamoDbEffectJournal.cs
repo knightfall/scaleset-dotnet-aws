@@ -1,3 +1,4 @@
+using Knightfall.ScaleSet.Aws.Core.Catalog;
 using Knightfall.ScaleSet.Aws.Core.Lifecycle;
 
 namespace Knightfall.ScaleSet.Aws.DynamoDb;
@@ -5,6 +6,8 @@ namespace Knightfall.ScaleSet.Aws.DynamoDb;
 public sealed record EffectJournalSnapshot(long Revision, Guid TransitionId, EffectJournalEntry Entry);
 
 public sealed record EffectBeginOutcome(LifecycleWriteOutcome Outcome, EffectSendAuthorization? Permission);
+
+internal sealed record EffectDispatchGuard(CatalogProfile Catalog, EffectIndexHead Index, string AllocationId, long? AllocationRevision);
 
 /// <summary>Evidence that an attempt was durably begun under its recorded lease epoch.</summary>
 /// <remarks>A caller must retain current ownership and respect the attempt deadline when sending.</remarks>
@@ -87,7 +90,7 @@ public sealed class DynamoDbEffectJournal
             .ConfigureAwait(false);
     }
 
-    public async Task<EffectBeginOutcome> BeginAsync(
+    public Task<EffectBeginOutcome> BeginAsync(
         ControllerLease lease,
         EffectJournalSnapshot expected,
         Guid transitionId,
@@ -95,6 +98,28 @@ public sealed class DynamoDbEffectJournal
         DateTimeOffset upperUtcNow,
         DateTimeOffset requestedDeadline,
         TimeSpan leaseReserve,
+        CancellationToken cancellationToken) =>
+        BeginCoreAsync(lease, expected, transitionId, attemptId, upperUtcNow, requestedDeadline, leaseReserve, null, cancellationToken);
+
+    internal Task<EffectBeginOutcome> BeginGuardedAsync(
+        ControllerLease lease,
+        EffectJournalSnapshot expected,
+        DateTimeOffset upperUtcNow,
+        DateTimeOffset requestedDeadline,
+        TimeSpan leaseReserve,
+        EffectDispatchGuard guard,
+        CancellationToken cancellationToken) =>
+        BeginCoreAsync(lease, expected, Guid.NewGuid(), Guid.NewGuid(), upperUtcNow, requestedDeadline, leaseReserve, guard, cancellationToken);
+
+    private async Task<EffectBeginOutcome> BeginCoreAsync(
+        ControllerLease lease,
+        EffectJournalSnapshot expected,
+        Guid transitionId,
+        Guid attemptId,
+        DateTimeOffset upperUtcNow,
+        DateTimeOffset requestedDeadline,
+        TimeSpan leaseReserve,
+        EffectDispatchGuard? guard,
         CancellationToken cancellationToken)
     {
         long beganAt = _timeProvider.GetTimestamp();
@@ -105,9 +130,19 @@ public sealed class DynamoDbEffectJournal
         }
 
         var now = UpperNow(upperUtcNow, beganAt);
+        if (guard is not null && (current.Entry.State != EffectState.Planned || now >= requestedDeadline ||
+            lease.ValidUntil - now <= leaseReserve || now >= current.Entry.Envelope.ProviderReplayDeadline ||
+            now < current.Entry.Envelope.EarliestPossibleFirstSend))
+        {
+            return new EffectBeginOutcome(LifecycleWriteOutcome.Conflict, null);
+        }
         var entry = current.Entry.Begin(attemptId, lease.Fence.Epoch, now, requestedDeadline, LeaseDeadline(lease, now, leaseReserve));
-        var outcome = await WriteAsync(lease, entry, current.Revision, transitionId, cancellationToken).ConfigureAwait(false);
         var attempt = entry.Attempt!;
+        var outcome = guard is null
+            ? await WriteAsync(lease, entry, current.Revision, transitionId, cancellationToken).ConfigureAwait(false)
+            : await _store.WriteDispatchedEffectAsync(entry.Envelope.Profile, lease.Fence, transitionId,
+                new EffectWrite(entry.Envelope.IntentId, current.Revision, entry.State, entry.WritePayload()),
+                guard, attempt.Deadline, cancellationToken).ConfigureAwait(false);
         // A write can commit at the end of the window. The durable attempt remains unresolved.
         var permission = outcome == LifecycleWriteOutcome.Committed && !cancellationToken.IsCancellationRequested &&
             UpperNow(upperUtcNow, beganAt) < attempt.Deadline

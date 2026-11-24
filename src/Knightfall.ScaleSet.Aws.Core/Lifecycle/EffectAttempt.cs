@@ -171,8 +171,9 @@ public sealed class EffectJournalEntry
         return deadline.ToUniversalTime();
     }
 
-    private bool CanResolve(EffectEvidence evidence)
+    public bool CanResolve(EffectEvidence evidence)
     {
+        ArgumentNullException.ThrowIfNull(evidence);
         if (State == EffectState.Settled || evidence.EnvelopeSha256 != Envelope.Sha256 || evidence.Target != Envelope.Target ||
             evidence.ObservedAt == default || evidence.EarliestObservedAt > evidence.ObservedAt)
         {
