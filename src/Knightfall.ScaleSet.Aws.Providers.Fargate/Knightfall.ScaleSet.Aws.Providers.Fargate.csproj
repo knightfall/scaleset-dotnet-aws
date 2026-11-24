@@ -3,7 +3,9 @@
     <TargetFramework>net10.0</TargetFramework>
   </PropertyGroup>
   <ItemGroup>
+    <ProjectReference Include="../Knightfall.ScaleSet.Aws.Core/Knightfall.ScaleSet.Aws.Core.csproj" />
     <PackageReference Include="AWSSDK.Core" />
+    <PackageReference Include="AWSSDK.EC2" />
     <PackageReference Include="AWSSDK.ECS" />
     <PackageReference Include="AWSSDK.IdentityManagement" />
   </ItemGroup>

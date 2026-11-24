@@ -8,8 +8,10 @@
   </PropertyGroup>
   <ItemGroup>
     <ProjectReference Include="../../src/Knightfall.ScaleSet.Aws.Providers.Ec2/Knightfall.ScaleSet.Aws.Providers.Ec2.csproj" />
+    <ProjectReference Include="../../src/Knightfall.ScaleSet.Aws.Providers.Fargate/Knightfall.ScaleSet.Aws.Providers.Fargate.csproj" />
     <Compile Include="../Knightfall.ScaleSet.Aws.SdkContract.Tests/Aws/AwsWireTransport.cs" Link="AwsWireTransport.cs" />
     <None Include="../../testdata/config/runtime/ec2-only-latest.json" Link="ec2-only-latest.json" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="../../testdata/config/runtime/fargate-only.json" Link="fargate-only.json" CopyToOutputDirectory="PreserveNewest" />
     <PackageReference Include="xunit.v3" />
   </ItemGroup>
 </Project>
