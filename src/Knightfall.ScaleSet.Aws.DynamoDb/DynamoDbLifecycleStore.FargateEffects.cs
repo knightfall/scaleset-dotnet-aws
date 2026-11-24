@@ -100,7 +100,7 @@ public sealed partial class DynamoDbLifecycleStore
         var access = lease.Mode == ControllerLeaseMode.RecoveryOnly ? LeaseAccess.Recovery : LeaseAccess.Active;
         var outcome = await WriteEffectAsync(profile, lease.Fence, transition,
             new EffectWrite(settled.Envelope.IntentId, previous.Revision, settled.State, settled.WritePayload()), access, cancellationToken,
-            accompanying: actions, exactPrevious: previous).ConfigureAwait(false);
+            exactPrevious: previous, accompanying: actions).ConfigureAwait(false);
         if (outcome == LifecycleWriteOutcome.Indeterminate)
         {
             var receipt = await ReadEffectAsync(profile, settled.Envelope.IntentId, cancellationToken).ConfigureAwait(false);
