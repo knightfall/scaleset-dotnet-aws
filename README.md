@@ -10,6 +10,8 @@ controller and deployment infrastructure are tracked in the task index.
 
 - [Implementation plan](docs/implementation-plan.md): architecture, configuration,
   lifecycle rules, and verification boundaries.
+- [OpenTelemetry integration plan](docs/opentelemetry-integration.md): signal
+  contracts, per-profile visibility, OTLP configuration, and acceptance evidence.
 - [Released SDK baseline](docs/dependency-baseline.md): exact package version,
   release evidence, supported Listener APIs, and session-recovery limits.
 - [Task index](docs/tasks/README.md): 26 tasks across six milestones, with

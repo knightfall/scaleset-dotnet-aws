@@ -36,22 +36,24 @@ Build the standalone TypeScript AWS CDK v2 entry point (`cdk/bin/controller.ts`)
 
 Implement end-to-end OpenTelemetry tracing (`ActivitySource`), metrics (`Meter`), and OTLP structured logging (`ILogger<T>` -> Serilog OTLP sink) across all `Knightfall.ScaleSet.Aws.*` assemblies, along with bounded-cardinality/redaction enforcement, the `telemetry-smoke` CLI diagnostic command, and loopback OTLP collector verification.
 
+Implement the [OpenTelemetry integration plan](../opentelemetry-integration.md), which defines the precise source/meter inventory, metric catalog, resource and profile attribution, configuration precedence, delivery slices, and captured-payload acceptance suite. T19 owns telemetry; T20/T21 own host/deployment wiring and T25/T26 own integrated evidence and operator guidance. The dependency graph is unchanged.
+
 ### Requirements
 
 - **Library vs executable separation (`scaleset.NET` D16/D17/D20)**:
   - Reusable libraries (`Core`, `DynamoDb`, `GitHub`, `Providers.Ec2`, `Providers.Fargate`, `Handoff`, `RunnerBootstrap`) emit only `Microsoft.Extensions.Logging.ILogger<T>`, `System.Diagnostics.ActivitySource`, and `System.Diagnostics.Metrics.Meter` without initializing Serilog or the OpenTelemetry SDK.
-  - `Knightfall.ScaleSet.Aws.Controller` registers `Serilog.Extensions.Hosting` + `Serilog.Sinks.OpenTelemetry` + console sink for logs (with no duplicate OpenTelemetry `ILogger` exporter) and `OpenTelemetry.Extensions.Hosting` + `OpenTelemetry.Exporter.OpenTelemetryProtocol` + HTTP/Runtime instrumentation subscribing to `ScaleSet.Client`, `ScaleSet.Listener`, and `Knightfall.ScaleSet.Aws.*` sources/meters (with no duplicate `Activity` exports).
-  - Unify OTel resource attributes (`service.name`, `service.version`, `service.instance.id`, `deployment.environment`) and `TraceId`/`SpanId` correlation across logs, traces, and metrics.
+  - `Knightfall.ScaleSet.Aws.Controller` registers `Serilog.Extensions.Hosting` + `Serilog.Sinks.OpenTelemetry` + console sink for logs (with no duplicate OpenTelemetry `ILogger` exporter) and `OpenTelemetry.Extensions.Hosting` + `OpenTelemetry.Exporter.OpenTelemetryProtocol` + approved HTTP/Runtime instrumentation. Subscribe to `ScaleSet.Client`, `ScaleSet.Listener`, and explicit `Knightfall.ScaleSet.Aws.*` activity sources, plus Client/application meters. The released Listener has no meter; listener measurements belong to AWS adapters.
+  - Unify OTel resource attributes (`service.name`, `service.version`, `service.instance.id`, `deployment.environment.name`, deployment identity). Logs correlate to traces through `TraceId`/`SpanId`; metrics correlate through resource/profile/time and verified exemplars, never trace-ID labels.
 - **Instrumentation inventory**:
   - Emit correlated spans for listener poll/delivery/acquire/ack loops (parenting `ScaleSet.Client` activities), per-profile reconciliation cycles, DynamoDB transactional intents and `EFFECT-REBUILD` passes, JIT handoff publish/consume/revoke, Direct EC2 `RunInstances`/`TerminateInstances`/Launch Template resolution, Fargate `RunTask`/`StopTask`, and SQS/EventBridge processing.
   - Emit counters, gauges, and histograms for poll/ack latency, rate-limit cooldowns, per-profile `assigned`/`active`/`idle`/`starting`/`unknown`/`deficit`/`drift`/`orphan_candidates`/`cleanup_age_seconds`/`lease_loss`/`effect_rebuild_pages`/`unfinished_effects`, handoff and startup latency, EC2 AZ failover and `$Latest` drift events, launch/cleanup outcomes, and DynamoDB transaction conflicts.
 - **Bounded cardinality & secret redaction**:
-  - Restrict metric dimensions strictly to bounded tags (`environment`, `profile`, `provider`, `operation`, `outcome`, `reason`); forbid `job_id`, `request_id`, `runner_name`, `runner_id`, `instance_id`, `task_arn`, and `trace_id` as metric label keys.
+  - Restrict AWS metric dimensions to the per-instrument bounded subset of `profile`, `provider`, `operation`, `outcome`, and `reason`, with environment on the resource. Maintain separate allowlists for the Client SDK's bounded `dependency`, `method`, `status_class`, and `retry_kind` tags and approved HTTP/runtime instruments. Forbid `job_id`, `request_id`, `runner_name`, `runner_id`, `instance_id`, `task_arn`, and `trace_id` as metric label keys.
   - Scrub GitHub App private keys, PATs, exchanged tokens, signed queue URLs, and plaintext JIT from all logs, span attributes, and exception events.
 - **Config validation, outage isolation, shutdown, and `telemetry-smoke`**:
-  - Validate `--otlp-endpoint` and `OTEL_*` endpoint/protocol settings fail-closed at startup; the receiving collector/sink is operator-supplied (do not bundle an always-on collector sidecar).
+  - Validate `--otlp-endpoint` and supported `OTEL_*` settings using the plan's single precedence/resource model. No endpoint means console-only; invalid supplied configuration fails before cloud work. The receiving collector/sink is operator-supplied (do not bundle an always-on collector sidecar).
   - Ensure an unreachable, slow, or rejecting OTLP receiver never stalls reconciliation loops, GitHub message acknowledgements, or DynamoDB lease renewal.
-  - Bound telemetry flush (`<= 5s`) inside the `60s` total SIGTERM shutdown budget (`T20`).
+  - Bound telemetry flush and disposal to one shared `<= 5s` deadline inside the `60s` total SIGTERM shutdown budget (`T20`), with bounded queues/retries and suppression of exporter self-instrumentation.
   - Provide `telemetry-smoke` CLI command emitting correlated logs, traces, and metrics to the configured OTLP endpoint without AWS or GitHub credentials.
 
 ### Acceptance
@@ -60,6 +62,7 @@ Implement end-to-end OpenTelemetry tracing (`ActivitySource`), metrics (`Meter`)
 2. Cardinality and redaction tests fail on any forbidden high-cardinality metric tag or synthetic secret/JIT leakage in captured OTLP payloads.
 3. Fault tests prove OTLP receiver outage/hang never stalls reconciliation/acks and respects the bounded shutdown flush timeout.
 4. `dotnet run --project src/Knightfall.ScaleSet.Aws.Controller -- telemetry-smoke` succeeds offline against the loopback OTLP receiver with zero cloud credentials.
+5. Complete the integration plan's [captured-payload acceptance suite](../opentelemetry-integration.md#delivery-slices-and-acceptance-evidence), including both transports, disabled/partial configuration, four-profile cardinality, ownership/retirement freshness, saturation/recovery, and unchanged lifecycle decisions with telemetry disabled.
 
 ---
 
@@ -83,7 +86,7 @@ Wire `Knightfall.ScaleSet.Aws.Controller`, native `.NET 10` OCI image publishing
 - **Native `.NET 10` OCI container (no Docker daemon)**:
   - Publish non-root, read-only-rootfs chiseled Linux (`linux-x64` / `linux-arm64`) OCI images directly via `dotnet publish src/Knightfall.ScaleSet.Aws.Controller/Knightfall.ScaleSet.Aws.Controller.csproj --configuration Release /t:PublishContainer`, embedding `cdk/config/schema/*.json` and excluding secrets/build caches.
 - **Health probes and shutdown**:
-  - Compose the [T19](#t19-implement-opentelemetry-tracing-metrics-and-otlp-logging) telemetry pipeline and bounded flush (`<= 5s`) inside the controller host.
+  - Compose the [T19](#t19-implement-opentelemetry-tracing-metrics-and-otlp-logging) telemetry pipeline using the [host configuration contract](../opentelemetry-integration.md#configuration-contract), one shared bounded flush/disposal deadline (`<= 5s`), and no cloud-client initialization for `telemetry-smoke`.
   - Expose loopback `/healthz` (process/supervision progress — one degraded profile does not cause restart loops) and `/readyz` (config, lease, and per-profile state).
   - Enforce a **60-second total** SIGTERM-to-exit shutdown budget inside a **90-second** ECS `stopTimeout`.
 - **CDK ECS Fargate host construct**:
@@ -116,7 +119,7 @@ Implement `npm --prefix cdk run test:synth-matrix` exercising every valid deploy
 - **EC2-only on ECS Fargate host**: controller host cluster/service/task-definition only; **zero** runner `ecs:RunTask`, `ecs:StopTask`, runner `TagResource`, or runner ECS Task EventBridge rules.
 - **Fargate-only**: **zero** `ec2:RunInstances`, `ec2:TerminateInstances`, `ec2:CreateTags`, or EC2 Instance State-change EventBridge rules.
 - **Dry-run**: **zero** Secrets Manager value reads, DynamoDB writes, SQS permissions, runner launches/stops, or `iam:PassRole`.
-- **Observability wiring**: Assert OTLP endpoint/configuration parameters are wired onto the controller ECS task definition and confirm zero bundled Collector sidecar containers.
+- **Observability wiring**: Assert the [host configuration contract](../opentelemetry-integration.md#configuration-contract) maps explicit deployment properties to controller environment variables and secret references; credential values never appear in synthesized artifacts, secret injection permissions belong to the execution role, and no runner permissions are added. Confirm zero bundled Collector sidecar containers.
 - **Non-destructive imports**: **zero** CloudFormation replacement or mutation of imported VPCs, subnets, security groups, Launch Templates, task definitions, tables, or clusters.
 
 ### Acceptance

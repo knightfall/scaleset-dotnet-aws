@@ -310,6 +310,8 @@ Use `.NET 10` BCL cryptography (`System.Security.Cryptography`) in `Knightfall.S
 
 Emit structured redacted logs (`ILogger<T>` -> `Serilog.Extensions.Hosting` -> `Serilog.Sinks.OpenTelemetry`) alongside OpenTelemetry traces and metrics (`OpenTelemetry.Extensions.Hosting`) to the configured OTLP endpoint without duplicate span/log exports or high-cardinality job/runner ID labels. Expose loopback `/healthz` (liveness) and `/readyz` (readiness + degraded profile visibility), built-in `healthcheck` CLI probe, and a 60-second total SIGTERM-to-exit shutdown budget inside a 90-second ECS `stopTimeout`.
 
+The [OpenTelemetry integration plan](opentelemetry-integration.md) defines the released Client/Listener subscriptions, per-profile correlation, metric catalog, resource identity, host-only configuration, privacy/cardinality budgets, outage isolation, and evidence for T19–T21/T25–T26. Export telemetry through an operator-owned receiver; telemetry never replaces durable state or authorizes lifecycle decisions.
+
 ## 8. Migration, rollout and rollback
 
 1. **Inventory & baseline**: Audit target GitHub runner groups, labels, VPC/subnet IP capacity, vCPU quotas, Launch Template revisions, and runner task definitions.
@@ -370,7 +372,7 @@ Run schema, planner, mocked SDK, Roslynator quality gates, CDK offline synthesis
 | Task | Depends on | Acceptance check |
 | --- | --- | --- |
 | T18: Compose shared TypeScript CDK infrastructure and conditional IAM/events | T03, T10–T12, T15 | Synthesize DynamoDB create/import, S3 versioned runtime artifact, active vs dry-run IAM, conditional Direct EC2 & Fargate EventBridge/SQS/DLQ, bootstrap `LeadingKeys` policies, and runtime `preflight retire` gate. |
-| T19: Implement OpenTelemetry tracing, metrics, and OTLP logging | T04, T10, T11, T13, T16 | Emit `ILogger<T>`, `ActivitySource`, and `Meter` in libraries; wire Serilog OTLP logs + OpenTelemetry OTLP traces/metrics (`ScaleSet.Client` + `Knightfall.ScaleSet.Aws.*`) in controller without duplicates. Loopback OTLP tests prove signal/resource correlation, bounded cardinality, secret redaction, collector-outage isolation, bounded flush (`<= 5s`), and offline `telemetry-smoke`. |
+| T19: Implement OpenTelemetry tracing, metrics, and OTLP logging | T04, T10, T11, T13, T16 | Implement the [OpenTelemetry integration plan](opentelemetry-integration.md): library signals, Serilog OTLP logs, Client/Listener/application traces, Client/application metrics, per-profile visibility, validated host settings, redaction/cardinality limits, outage isolation, one shared flush budget (`<= 5s`), and offline `telemetry-smoke` with captured-payload evidence. |
 | T20: Build `.NET 10` controller runtime, OCI container, and ECS Fargate host | T04, T07, T10, T18, T19 | Implement CLI entry points (`config verify`, `telemetry-smoke`, `reconcile`, `run`, `healthcheck`, `preflight`), `/healthz`/`/readyz`, T19 telemetry composition, `dotnet publish /t:PublishContainer` digest build (no Docker daemon), and 1-replica ECS Fargate service (90s `stopTimeout`, 60s SIGTERM). |
 | T21: Verify full offline CDK and IAM synthesis matrix | T18, T19, T20 | `npm --prefix cdk run test:synth-matrix` asserts every valid host × backend × table × mode × cluster × LT permutation offline with negative assertions proving zero unselected runner grants/rules and OTLP config wiring without Collector sidecars. |
 

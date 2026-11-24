@@ -1,10 +1,12 @@
 # Controller Task Specifications
 
-Status: planning baseline for PR review; implementation has not started. After the baseline is merged, create the issue set using the convention below.
+Status: baseline merged in [PR #1](https://github.com/knightfall/scaleset-dotnet-aws/pull/1); implementation is tracked in [issues #2–#27](https://github.com/knightfall/scaleset-dotnet-aws/issues). Use issue and PR evidence for current completion status.
 
 These milestone documents specify all 26 implementation and verification tasks from the [implementation plan](../implementation-plan.md) for the `.NET 10` AWS runner scale set controller. The repository starts greenfield; every task folds in the concurrency, lease-fencing, bounded-recovery, and conservative-admission fixes learned from the [Go reference review](https://github.com/knightfall/scaleset-example-aws/blob/cefd50b24a5fd965af1b803a659bcc64e17c40cd/docs/review-triage.md) and the `D1`–`D9` invariants below from day one.
 
 ## Task index
+
+The [OpenTelemetry integration plan](../opentelemetry-integration.md) expands T19's signal/configuration contracts and maps host wiring, synthesis, mixed-profile verification, and operator guidance to T20, T21, T25, and T26.
 
 | Task | Specification | Milestone |
 | --- | --- | --- |
