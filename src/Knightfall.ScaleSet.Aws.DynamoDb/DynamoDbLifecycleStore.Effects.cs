@@ -82,12 +82,12 @@ public sealed partial class DynamoDbLifecycleStore
         CancellationToken cancellationToken) =>
         WriteEffectAsync(profile, lease, transitionId, write, LeaseAccess.Active, cancellationToken, guard, attemptDeadline);
 
-    internal Task<LifecycleWriteOutcome> WriteAbandonedRunnerEffectAsync(
-        DeploymentLeaseFence lease, Guid transitionId, EffectJournalSnapshot exactAttempt, EffectJournalEntry settled,
-        DateTimeOffset leaseValidThrough, CancellationToken cancellationToken) =>
-        WriteEffectAsync(settled.Envelope.Profile, lease, transitionId,
-            new EffectWrite(settled.Envelope.IntentId, exactAttempt.Revision, settled.State, settled.WritePayload()),
-            LeaseAccess.Active, cancellationToken, leaseValidThrough: leaseValidThrough, exactAttempt: exactAttempt);
+    internal Task<LifecycleWriteOutcome> WriteExactRunnerEffectAsync(
+        DeploymentLeaseFence lease, Guid transitionId, EffectJournalSnapshot expected, EffectJournalEntry replacement,
+        DateTimeOffset? leaseValidThrough, CancellationToken cancellationToken) =>
+        WriteEffectAsync(replacement.Envelope.Profile, lease, transitionId,
+            new EffectWrite(replacement.Envelope.IntentId, expected.Revision, replacement.State, replacement.WritePayload()),
+            LeaseAccess.Active, cancellationToken, leaseValidThrough: leaseValidThrough, exactPrevious: expected);
 
     private async Task<LifecycleWriteOutcome> WriteEffectAsync(
         LifecycleProfile profile,
@@ -98,7 +98,7 @@ public sealed partial class DynamoDbLifecycleStore
         CancellationToken cancellationToken,
         EffectDispatchGuard? guard = null,
         DateTimeOffset? leaseValidThrough = null,
-        EffectJournalSnapshot? exactAttempt = null)
+        EffectJournalSnapshot? exactPrevious = null)
     {
         RequireProfileLease(profile, lease);
         ArgumentNullException.ThrowIfNull(write);
@@ -156,13 +156,13 @@ public sealed partial class DynamoDbLifecycleStore
 
         var leaseCondition = LeaseCondition(lease, leaseAccess, leaseValidThrough);
         var writeOperation = CompareAndPut(operationKey, operation, write.ExpectedRevision, profile.Deployment);
-        if (exactAttempt is not null)
+        if (exactPrevious is not null)
         {
             var put = writeOperation.Write.Put;
-            put.ConditionExpression += " AND transitionId = :previousTransition AND effectState = :executing AND payload = :previousPayload";
-            put.ExpressionAttributeValues[":previousTransition"] = StringValue(exactAttempt.TransitionId.ToString("D"));
-            put.ExpressionAttributeValues[":executing"] = StringValue(EffectStateValue(EffectState.Executing));
-            put.ExpressionAttributeValues[":previousPayload"] = StringValue(exactAttempt.Entry.WritePayload());
+            put.ConditionExpression += " AND transitionId = :previousTransition AND effectState = :previousState AND payload = :previousPayload";
+            put.ExpressionAttributeValues[":previousTransition"] = StringValue(exactPrevious.TransitionId.ToString("D"));
+            put.ExpressionAttributeValues[":previousState"] = StringValue(EffectStateValue(exactPrevious.Entry.State));
+            put.ExpressionAttributeValues[":previousPayload"] = StringValue(exactPrevious.Entry.WritePayload());
         }
         var actions = new List<TransactionAction>
         {
@@ -193,8 +193,8 @@ public sealed partial class DynamoDbLifecycleStore
         {
             actions.Add(DeleteMarker(profile, head.Generation, write.IntentId));
         }
-        // An abandonment retry uses the same durable proof but may read a newer index revision.
-        return await WriteAsync(actions, exactAttempt is null ? transitionId : Guid.NewGuid(), cancellationToken).ConfigureAwait(false);
+        // An exact runner transition can reuse its durable proof with a newer index revision.
+        return await WriteAsync(actions, exactPrevious is null ? transitionId : Guid.NewGuid(), cancellationToken).ConfigureAwait(false);
     }
 
     public async Task<ActiveEffectPage?> ReadActiveOperationsAsync(

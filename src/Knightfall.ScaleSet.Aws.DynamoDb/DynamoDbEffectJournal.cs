@@ -192,7 +192,7 @@ public sealed partial class DynamoDbEffectJournal
         {
             return new EffectBeginOutcome(outcome, permission);
         }
-        if (entry.Envelope.Request is GitHubJitGenerateEffectRequest)
+        if (entry.Envelope.Request is GitHubJitGenerateEffectRequest or GitHubRunnerRemoveEffectRequest)
         {
             // The known commit completed too late, before any caller could use the send authorization.
             _ = await AbandonUnsentRunnerEffectAsync(lease, permission, cancellationToken).ConfigureAwait(false);
@@ -291,6 +291,12 @@ public sealed partial class DynamoDbEffectJournal
             return await _store.WriteRecoveredEffectAsync(entry.Envelope.Profile, lease.Fence, transitionId,
                 new EffectWrite(entry.Envelope.IntentId, current.Revision, EffectState.Settled, entry.WritePayload()),
                 cancellationToken).ConfigureAwait(false);
+        }
+
+        if (current.Entry.State == EffectState.Planned && evidence.Kind == EffectResolutionKind.Absent)
+        {
+            return await _store.WriteExactRunnerEffectAsync(lease.Fence, transitionId, current, entry, null, cancellationToken)
+                .ConfigureAwait(false);
         }
 
         return await WriteAsync(lease, entry, current.Revision, transitionId, cancellationToken).ConfigureAwait(false);

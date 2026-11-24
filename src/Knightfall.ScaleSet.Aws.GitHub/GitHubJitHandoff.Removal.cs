@@ -49,6 +49,15 @@ public sealed partial class GitHubJitHandoff
         }
         string intentId = "remove-" + handoff.OfferId;
         var removal = await _journal.ReadAsync(profile, intentId, token).ConfigureAwait(false);
+        if (removal is { Entry.State: EffectState.Settled, Entry.Resolution.Kind: EffectResolutionKind.AbandonedBeforeSend })
+        {
+            var rearmed = await _journal.RearmAbandonedRunnerRemovalAsync(lease, removal, token).ConfigureAwait(false);
+            if (rearmed != LifecycleWriteOutcome.Committed)
+            {
+                return rearmed;
+            }
+            removal = await _journal.ReadAsync(profile, intentId, token).ConfigureAwait(false);
+        }
         if (removal is not { Entry.State: EffectState.Settled })
         {
             var request = new GitHubRunnerRemoveEffectRequest(handoff.Identity.ScopeIdentity, handoff.Identity.ScaleSetId,
@@ -95,34 +104,54 @@ public sealed partial class GitHubJitHandoff
         {
             return null;
         }
-        var begin = await _journal.BeginRunnerRemovalAsync(lease, catalog, executor, handoff, intent, window.UpperNow, window.Deadline,
-            _timing.WriteReserve, cancellationToken).ConfigureAwait(false);
-        var executing = await _journal.ReadAsync(profile, intentId, cancellationToken).ConfigureAwait(false);
-        if (begin.Permission is not { } authorized || !MatchesAttempt(executing, authorized))
+        var readStartedAt = _clock.GetUtcNow();
+        var exists = await ReadRunnerPresenceAsync(request, connection, window.Deadline - window.UpperNow, cancellationToken).ConfigureAwait(false);
+        if (exists is null || await ReadCurrentAsync(lease, cancellationToken).ConfigureAwait(false) is not { } live ||
+            Window(live, clock) is not { } sendWindow)
         {
             return null;
         }
-        return await SendRemovalAsync(lease, clock, catalog, executor, executing!, authorized, request, connection, cancellationToken)
+        if (!exists.Value)
+        {
+            var envelope = intent.Entry.Envelope;
+            var absence = new EffectEvidence(EffectResolutionKind.Absent, envelope.Sha256, envelope.Target, _clock.GetUtcNow(),
+                EarliestObservedAt: readStartedAt);
+            return await ResolveRemovalAsync(live, intent, absence, cancellationToken).ConfigureAwait(false);
+        }
+        var begin = await _journal.BeginRunnerRemovalAsync(live, catalog, executor, handoff, intent, sendWindow.UpperNow, sendWindow.Deadline,
+            _timing.WriteReserve, cancellationToken).ConfigureAwait(false);
+        if (begin.Permission is not { } authorized)
+        {
+            return null;
+        }
+        var executing = await _journal.ReadAsync(profile, intentId, cancellationToken).ConfigureAwait(false);
+        if (!MatchesAttempt(executing, authorized))
+        {
+            return null;
+        }
+        return await SendRemovalAsync(live, clock, catalog, executor, executing!, authorized, connection, cancellationToken)
             .ConfigureAwait(false);
     }
 
     private async Task<EffectJournalSnapshot?> SendRemovalAsync(
         ControllerLease lease, ControllerClockEvidence clock, CatalogProfile catalog, ExecutorSnapshot executor,
-        EffectJournalSnapshot executing, EffectSendAuthorization authorized, GitHubRunnerRemoveEffectRequest request,
+        EffectJournalSnapshot executing, EffectSendAuthorization authorized,
         GitHubScaleSetConnection connection, CancellationToken cancellationToken)
     {
+        if (await ReadCurrentAsync(lease, cancellationToken).ConfigureAwait(false) is not { } live)
+        {
+            return null;
+        }
+        if (Window(live, clock) is null ||
+            await _store.ReadExecutorAsync(catalog.Profile, executor.Binding.AllocationId, cancellationToken).ConfigureAwait(false) != executor ||
+            await _store.ReadCatalogProfileAsync(catalog.Profile, cancellationToken).ConfigureAwait(false) is not { } applied ||
+            applied.TransitionId != catalog.TransitionId || applied.AppliedGeneration != catalog.AppliedGeneration)
+        {
+            _ = await _journal.AbandonUnsentRunnerEffectAsync(live, authorized, cancellationToken).ConfigureAwait(false);
+            return null;
+        }
         try
         {
-            var found = await connection.ReadExactRunnerAsync(request.ScopeIdentity, request.ScaleSetId, request.RunnerName, request.RunnerId,
-                cancellationToken).ConfigureAwait(false);
-            if (found is null || await ReadCurrentAsync(lease, cancellationToken).ConfigureAwait(false) is not { } live ||
-                Window(live, clock) is null ||
-                await _store.ReadExecutorAsync(catalog.Profile, executor.Binding.AllocationId, cancellationToken).ConfigureAwait(false) != executor ||
-                await _store.ReadCatalogProfileAsync(catalog.Profile, cancellationToken).ConfigureAwait(false) is not { } applied ||
-                applied.TransitionId != catalog.TransitionId || applied.AppliedGeneration != catalog.AppliedGeneration)
-            {
-                return null;
-            }
             if (await connection.RemoveExactRunnerAsync(authorized, cancellationToken).ConfigureAwait(false))
             {
                 return await ResolveRemovalAsync(live, executing, Applied(executing.Entry.Envelope), cancellationToken).ConfigureAwait(false);
@@ -136,7 +165,10 @@ public sealed partial class GitHubJitHandoff
         }
         catch (GitHubOperationException)
         {
-            // Preserve the one-shot attempt. Later reconciliation reads exact absence.
+            if (!authorized.HasStartedSending)
+            {
+                _ = await _journal.AbandonUnsentRunnerEffectAsync(live, authorized, cancellationToken).ConfigureAwait(false);
+            }
         }
         return null;
     }
@@ -158,19 +190,30 @@ public sealed partial class GitHubJitHandoff
         {
             return null;
         }
-        using var deadline = new CancellationTokenSource(window.Deadline - window.UpperNow, _clock);
+        if (await ReadRunnerPresenceAsync(request, connection, window.Deadline - window.UpperNow, cancellationToken).ConfigureAwait(false) != false)
+        {
+            return null;
+        }
+        var observed = _clock.GetUtcNow();
+        var evidence = new EffectEvidence(EffectResolutionKind.Absent, envelope.Sha256, envelope.Target, observed,
+            EarliestObservedAt: lowerBound);
+        return Window(lease, clock) is not null && intent.Entry.CanResolve(evidence) ? evidence : null;
+    }
+
+    private async Task<bool?> ReadRunnerPresenceAsync(
+        GitHubRunnerRemoveEffectRequest request, GitHubScaleSetConnection connection, TimeSpan available, CancellationToken cancellationToken)
+    {
+        using var deadline = new CancellationTokenSource(available, _clock);
         using var bounded = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, deadline.Token);
         try
         {
             var found = await connection.ReadExactRunnerAsync(request.ScopeIdentity, request.ScaleSetId, request.RunnerName, request.RunnerId,
                 bounded.Token).ConfigureAwait(false);
-            if (found is not null)
-            {
-                return null;
-            }
+            return deadline.IsCancellationRequested ? null : found is not null;
         }
         catch (GitHubOperationException failure) when (failure.StatusCode == 404 && failure.DomainError == ScaleSetDomainError.AgentNotFound)
         {
+            return deadline.IsCancellationRequested ? null : false;
         }
         catch (GitHubOperationException)
         {
@@ -180,10 +223,6 @@ public sealed partial class GitHubJitHandoff
         {
             return null;
         }
-        var observed = _clock.GetUtcNow();
-        var evidence = new EffectEvidence(EffectResolutionKind.Absent, envelope.Sha256, envelope.Target, observed,
-            EarliestObservedAt: lowerBound);
-        return Window(lease, clock) is not null && intent.Entry.CanResolve(evidence) ? evidence : null;
     }
 
     private async Task<EffectJournalSnapshot?> ResolveRemovalAsync(

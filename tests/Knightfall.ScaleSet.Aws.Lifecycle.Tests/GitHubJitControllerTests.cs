@@ -25,10 +25,22 @@ public sealed class GitHubJitControllerTests
     private static readonly GitHubJitTiming Timing = new(TimeSpan.FromSeconds(3), TimeSpan.FromSeconds(20),
         TimeSpan.FromMinutes(2), TimeSpan.FromMinutes(3));
 
+    public enum RemovalScenario
+    {
+        ConfirmedDelete = 0,
+        SchedulingConflict = 1,
+        FailedPreliminaryRead = 2,
+        ChangedExecutorRevision = 3,
+        AlreadyAbsent = 4,
+    }
+
     [Theory]
-    [InlineData(false)]
-    [InlineData(true)]
-    public async Task ControllerVerifiesTaskRolePublishesOnlyCiphertextAndRemovesOnlyAfterResourceDeath(bool schedulingConflict)
+    [InlineData(RemovalScenario.ConfirmedDelete)]
+    [InlineData(RemovalScenario.SchedulingConflict)]
+    [InlineData(RemovalScenario.FailedPreliminaryRead)]
+    [InlineData(RemovalScenario.ChangedExecutorRevision)]
+    [InlineData(RemovalScenario.AlreadyAbsent)]
+    public async Task ControllerVerifiesTaskRolePublishesOnlyCiphertextAndRemovesOnlyAfterResourceDeath(RemovalScenario scenario)
     {
         var token = TestContext.Current.CancellationToken;
         using var table = await MiniStackTable.CreateAsync(token);
@@ -36,7 +48,8 @@ public sealed class GitHubJitControllerTests
         var fixture = await JitHandoffStoreTests.CreateFixtureAsync(table, token, configuration);
         var runnerName = "ss-" + JitOfferBinding.GetOfferId(fixture.Identity)[..48];
         string runnerJson = RunnerJson(fixture.Identity.ScaleSetId, runnerName);
-        bool removedElsewhere = false;
+        bool removedElsewhere = scenario == RemovalScenario.AlreadyAbsent;
+        bool failRead = scenario is RemovalScenario.FailedPreliminaryRead or RemovalScenario.ChangedExecutorRevision;
         using var wire = new GitHubWire((request, _) =>
         {
             if (request.Method == HttpMethod.Post)
@@ -48,11 +61,15 @@ public sealed class GitHubJitControllerTests
             Assert.Equal(RunnersPath + "/" + RunnerId, request.Uri.AbsolutePath);
             if (request.Method == HttpMethod.Get)
             {
+                if (failRead)
+                {
+                    return GitHubWire.Reply(HttpStatusCode.Forbidden, """{"message":"synthetic preliminary read failure"}""");
+                }
                 return removedElsewhere
                     ? GitHubWire.Reply(HttpStatusCode.NotFound, """{"typeName":"Microsoft.VisualStudio.Services.AgentPool.AgentNotFoundException"}""")
                     : GitHubWire.Reply(HttpStatusCode.OK, runnerJson);
             }
-            return schedulingConflict
+            return scenario == RemovalScenario.SchedulingConflict
                 ? GitHubWire.Reply(HttpStatusCode.Conflict, """{"typeName":"Microsoft.VisualStudio.Services.AgentPool.JobStillRunningException"}""")
                 : Task.FromResult(new HttpResponseMessage(HttpStatusCode.NoContent));
         });
@@ -89,14 +106,43 @@ public sealed class GitHubJitControllerTests
         using var plaintext = recipient.Open(Assert.IsType<JitOfferEnvelope>(receipt.Offer), fixture.Identity, fixture.Clock);
         Assert.Equal(EncodedJit, Encoding.UTF8.GetString(plaintext.Bytes));
 
-        fixture.Clock.Now = fixture.Clock.Now.AddSeconds(1);
+        fixture.Clock.Now = fixture.Clock.Now.AddSeconds(4);
         Assert.Equal(LifecycleWriteOutcome.Committed, await fixture.Store.ObserveResourceAsync(fixture.Lease.Fence, fixture.Executor.Binding,
             new ExecutorResourceObservation(ExecutorResourceState.IrreversiblyTerminated, fixture.Clock.Now, fixture.Executor.State.StartedAt,
                 Guid.NewGuid()), token));
         Task<LifecycleWriteOutcome> RemoveAsync() => service.RemoveTerminatedRunnerAsync(authority, fixture.Catalog.Profile,
             fixture.Identity.AllocationId, connection, ownership.OwnershipLost, token);
+        if (failRead)
+        {
+            Assert.Equal(LifecycleWriteOutcome.Indeterminate, await RemoveAsync());
+            string removalId = "remove-" + JitOfferBinding.GetOfferId(fixture.Identity);
+            var planned = await fixture.Journal.ReadAsync(fixture.Catalog.Profile, removalId, token);
+            Assert.Equal(EffectState.Planned, planned?.Entry.State);
+            Assert.DoesNotContain(ServiceRequests(wire), request => request.Method == HttpMethod.Delete);
+            failRead = false;
+            if (scenario == RemovalScenario.ChangedExecutorRevision)
+            {
+                var pause = table.Wire.PauseAfterNextSuccessfulTransactionWrite(LifecycleKey.Operation(fixture.Catalog.Profile, removalId));
+                var removing = RemoveAsync();
+                try
+                {
+                    await pause.Captured.WaitAsync(TimeSpan.FromSeconds(5), token);
+                    Assert.Equal(LifecycleWriteOutcome.Committed, await fixture.Store.ObserveResourceAsync(fixture.Lease.Fence, fixture.Executor.Binding,
+                        new ExecutorResourceObservation(ExecutorResourceState.IrreversiblyTerminated, fixture.Clock.Now.AddSeconds(-1),
+                            fixture.Executor.State.StartedAt, Guid.NewGuid()), token));
+                }
+                finally
+                {
+                    pause.Resume();
+                }
+                Assert.Equal(LifecycleWriteOutcome.Indeterminate, await removing);
+                var abandoned = await fixture.Journal.ReadAsync(fixture.Catalog.Profile, removalId, token);
+                Assert.Equal(EffectResolutionKind.AbandonedBeforeSend, abandoned?.Entry.Resolution?.Kind);
+                Assert.DoesNotContain(ServiceRequests(wire), request => request.Method == HttpMethod.Delete);
+            }
+        }
         var cleanup = await RemoveAsync();
-        if (schedulingConflict)
+        if (scenario == RemovalScenario.SchedulingConflict)
         {
             Assert.Equal(LifecycleWriteOutcome.Indeterminate, cleanup);
             Assert.Equal(1, (await fixture.Store.ReadProfileHandoffObservationAsync(fixture.Catalog.Profile, token)).OutstandingOffers);
@@ -108,7 +154,8 @@ public sealed class GitHubJitControllerTests
             Assert.Equal(2, ServiceRequests(wire).Count(request => request.Method == HttpMethod.Get));
         }
         Assert.Equal(LifecycleWriteOutcome.Committed, cleanup);
-        Assert.Single(ServiceRequests(wire), request => request.Method == HttpMethod.Delete && request.Uri.AbsolutePath == RunnersPath + "/" + RunnerId);
+        Assert.Equal(scenario == RemovalScenario.AlreadyAbsent ? 0 : 1,
+            ServiceRequests(wire).Count(request => request.Method == HttpMethod.Delete && request.Uri.AbsolutePath == RunnersPath + "/" + RunnerId));
         Assert.Equal(0, (await fixture.Store.ReadProfileHandoffObservationAsync(fixture.Catalog.Profile, token)).OutstandingOffers);
     }
 

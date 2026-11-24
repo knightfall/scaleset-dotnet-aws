@@ -124,6 +124,11 @@ public sealed class EffectJournalEntry
         return Settle(evidence);
     }
 
+    internal EffectJournalEntry? RearmAbandonedRunnerRemoval() =>
+        State == EffectState.Settled && Envelope.Request is GitHubRunnerRemoveEffectRequest &&
+        Resolution is { Kind: EffectResolutionKind.AbandonedBeforeSend } evidence && ValidAbandonment(evidence)
+            ? Plan(Envelope) : null;
+
     private EffectJournalEntry Settle(EffectEvidence evidence) =>
         new(Envelope, EffectState.Settled,
             _body with
@@ -198,6 +203,13 @@ public sealed class EffectJournalEntry
         if (evidence.Kind == EffectResolutionKind.CanceledBeforeSend)
         {
             return State == EffectState.Planned && evidence.AttemptId is null;
+        }
+
+        if (State == EffectState.Planned)
+        {
+            return Envelope.Request is GitHubRunnerRemoveEffectRequest && Attempt is null && LatestAuthorizedDeadline is null &&
+                !EarlierSendUncertain && evidence is { Kind: EffectResolutionKind.Absent, AttemptId: null, EarliestObservedAt: { } lowerBound } &&
+                lowerBound != default && evidence.ObservedAt >= Envelope.EarliestPossibleFirstSend;
         }
 
         if (State is not (EffectState.Executing or EffectState.Uncertain) || Attempt is not { } attempt)

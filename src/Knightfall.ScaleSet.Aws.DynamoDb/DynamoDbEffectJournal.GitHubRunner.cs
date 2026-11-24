@@ -42,7 +42,7 @@ public sealed partial class DynamoDbEffectJournal
         }
 
         var settled = current.Entry.AbandonRunnerEffectBeforeSend(authorization.Attempt, discard.ObservedAt);
-        var outcome = await _store.WriteAbandonedRunnerEffectAsync(owner.Fence, discard.TransitionId, current, settled,
+        var outcome = await _store.WriteExactRunnerEffectAsync(owner.Fence, discard.TransitionId, current, settled,
             authorization.EstimateUtcNow(), cancellationToken).ConfigureAwait(false);
         if (outcome is LifecycleWriteOutcome.Conflict or LifecycleWriteOutcome.Indeterminate &&
             MatchesAbandonment(await ReadAsync(envelope.Profile, envelope.IntentId, cancellationToken).ConfigureAwait(false), authorization, discard))
@@ -59,6 +59,47 @@ public sealed partial class DynamoDbEffectJournal
         current.Revision == checked(authorization.Revision + 1) && current.TransitionId == discard.TransitionId &&
         current.Entry.Attempt == authorization.Attempt && current.Entry.Envelope.Matches(authorization.Envelope) &&
         current.Entry.Resolution.ObservedAt == discard.ObservedAt;
+
+    /// <summary>Restores the exact runner removal to planned after durable proof that its attempt was never sent.</summary>
+    public async Task<LifecycleWriteOutcome> RearmAbandonedRunnerRemovalAsync(
+        ControllerLease lease, EffectJournalSnapshot expected, CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(lease);
+        ArgumentNullException.ThrowIfNull(expected);
+        if (lease.Mode != ControllerLeaseMode.Active || lease.Deployment != expected.Entry.Envelope.Profile.Deployment)
+        {
+            return LifecycleWriteOutcome.LeaseRejected;
+        }
+        if (expected.Entry.RearmAbandonedRunnerRemoval() is not { } planned)
+        {
+            return LifecycleWriteOutcome.Conflict;
+        }
+
+        var owner = await _store.ReadLeaseAsync(lease.Deployment, cancellationToken).ConfigureAwait(false);
+        if (owner is not { Mode: ControllerLeaseMode.Active } || owner.Fence != lease.Fence || owner.ValidUntil <= _timeProvider.GetUtcNow())
+        {
+            return LifecycleWriteOutcome.LeaseRejected;
+        }
+
+        Guid transition = Guid.NewGuid();
+        var current = await ReadCurrentAsync(owner, expected, transition, cancellationToken).ConfigureAwait(false);
+        if (current is not { Entry.State: EffectState.Settled } || current.Entry.WritePayload() != expected.Entry.WritePayload())
+        {
+            return LifecycleWriteOutcome.Conflict;
+        }
+        var outcome = await _store.WriteExactRunnerEffectAsync(owner.Fence, transition, current, planned, null, cancellationToken)
+            .ConfigureAwait(false);
+        if (outcome is LifecycleWriteOutcome.Conflict or LifecycleWriteOutcome.Indeterminate)
+        {
+            var stored = await ReadAsync(planned.Envelope.Profile, planned.Envelope.IntentId, cancellationToken).ConfigureAwait(false);
+            if (stored is { Entry.State: EffectState.Planned } && stored.Revision == checked(current.Revision + 1) &&
+                stored.TransitionId == transition && stored.Entry.WritePayload() == planned.WritePayload())
+            {
+                return LifecycleWriteOutcome.Committed;
+            }
+        }
+        return outcome;
+    }
 
     public async Task<EffectBeginOutcome> BeginJitAsync(
         ControllerLease lease, CatalogProfile catalog, ExecutorSnapshot executor, JitHandoffSnapshot handoff,
@@ -83,6 +124,7 @@ public sealed partial class DynamoDbEffectJournal
         DateTimeOffset upperUtcNow, DateTimeOffset deadline, TimeSpan writeReserve, CancellationToken cancellationToken)
     {
         if (intent.Entry.Envelope.Request is not GitHubRunnerRemoveEffectRequest request || !AllowsRemoval(executor, request.RunnerId) ||
+            !DynamoDbLifecycleStore.MatchesJitCatalog(catalog, handoff.Identity) || !DynamoDbLifecycleStore.MatchesJitProvider(catalog, executor) ||
             intent.Entry.Envelope.IntentId != "remove-" + handoff.OfferId ||
             handoff.RunnerId != request.RunnerId || handoff.RunnerName != request.RunnerName ||
             handoff.Identity.AllocationId != request.AllocationId || handoff.Identity.ResourceArn != request.ResourceArn ||
@@ -109,7 +151,8 @@ public sealed partial class DynamoDbEffectJournal
         var envelope = intent.Entry.Envelope;
         var binding = executor.Binding;
         if (lease.Mode != ControllerLeaseMode.Active || lease.Deployment != envelope.Profile.Deployment ||
-            catalog.Profile != envelope.Profile || catalog.Profile != binding.Profile || envelope.Generation != catalog.AppliedGeneration ||
+            catalog.Profile != envelope.Profile || catalog.Profile != binding.Profile ||
+            envelope.Generation > catalog.AppliedGeneration || (removal is null && envelope.Generation != catalog.AppliedGeneration) ||
             catalog.State is not (CatalogProfileState.Active or CatalogProfileState.Draining) ||
             catalog.Binding.ScopeIdentity != scopeIdentity || catalog.Binding.ScaleSetId != setId ||
             binding.AllocationId != allocationId.ToString("D") || binding.ResourceArn != resourceArn || binding.Incarnation != incarnation)

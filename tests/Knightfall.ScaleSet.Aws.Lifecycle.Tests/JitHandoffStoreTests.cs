@@ -77,6 +77,73 @@ public sealed class JitHandoffStoreTests
         Assert.Equal(authorization.Attempt.Id, settled.Entry.Resolution?.AttemptId);
     }
 
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task RunnerRemovalRearmsOnlyDurableAbandonmentAndRestoresOneActiveMarker(bool consumed)
+    {
+        var cancellation = TestContext.Current.CancellationToken;
+        using var table = await MiniStackTable.CreateAsync(cancellation);
+        using var recipient = JitRecipientKey.Create();
+        var fixture = await CreateFixtureAsync(table, cancellation);
+        var (staged, generation) = await StageAndBeginAsync(fixture, recipient, cancellation);
+        var offered = await PublishAsync(fixture, staged, generation, cancellation);
+        _ = await ResolveAppliedAsync(fixture, generation, cancellation);
+        var revoked = await fixture.Store.RevokeJitHandoffAsync(fixture.Lease, offered, cancellation);
+        Assert.Equal(LifecycleWriteOutcome.Committed, revoked.Outcome);
+        var handoff = Assert.IsType<JitHandoffSnapshot>(revoked.Handoff);
+        fixture.Clock.Now = fixture.Clock.Now.AddSeconds(1);
+        Assert.Equal(LifecycleWriteOutcome.Committed, await fixture.Store.ObserveResourceAsync(fixture.Lease.Fence,
+            fixture.Executor.Binding, new ExecutorResourceObservation(ExecutorResourceState.IrreversiblyTerminated, fixture.Clock.Now,
+                fixture.Executor.State.StartedAt, Guid.NewGuid()), cancellation));
+        var (attempt, authorization) = await BeginRemovalAsync(fixture, handoff, cancellation);
+        var envelope = attempt.Entry.Envelope;
+
+        if (consumed)
+        {
+            Assert.True(authorization.TryConsume(out _));
+            Assert.Equal(LifecycleWriteOutcome.Conflict,
+                await fixture.Journal.AbandonUnsentRunnerEffectAsync(fixture.Lease, authorization, cancellation));
+            Assert.Equal(LifecycleWriteOutcome.Committed, await fixture.Journal.MarkUncertainAsync(fixture.Lease, attempt,
+                Guid.NewGuid(), authorization.Attempt.Id, cancellation));
+            var uncertain = Assert.IsType<EffectJournalSnapshot>(await fixture.Journal.ReadAsync(envelope.Profile, envelope.IntentId, cancellation));
+            table.Wire.Clear();
+            Assert.Equal(LifecycleWriteOutcome.Conflict,
+                await fixture.Journal.RearmAbandonedRunnerRemovalAsync(fixture.Lease, uncertain, cancellation));
+            Assert.DoesNotContain(table.Wire.Requests, call => call.Operation == "TransactWriteItems");
+            var retained = Assert.IsType<EffectJournalSnapshot>(await fixture.Journal.ReadAsync(envelope.Profile, envelope.IntentId, cancellation));
+            Assert.Equal(EffectState.Uncertain, retained.Entry.State);
+            Assert.Equal(uncertain.TransitionId, retained.TransitionId);
+            return;
+        }
+
+        Assert.Equal(LifecycleWriteOutcome.Committed,
+            await fixture.Journal.AbandonUnsentRunnerEffectAsync(fixture.Lease, authorization, cancellation));
+        var abandoned = Assert.IsType<EffectJournalSnapshot>(await fixture.Journal.ReadAsync(envelope.Profile, envelope.IntentId, cancellation));
+        Assert.Equal(EffectResolutionKind.AbandonedBeforeSend, abandoned.Entry.Resolution?.Kind);
+        Assert.Equal(0, (await fixture.Store.ReadEffectIndexAsync(envelope.Profile, cancellation))?.UnfinishedCount);
+
+        table.Wire.Clear();
+        table.Wire.DropNextSuccessfulTransactionResponse();
+        Assert.Equal(LifecycleWriteOutcome.Committed,
+            await fixture.Journal.RearmAbandonedRunnerRemovalAsync(fixture.Lease, abandoned, cancellation));
+        Assert.Equal(LifecycleWriteOutcome.Conflict,
+            await fixture.Journal.RearmAbandonedRunnerRemovalAsync(fixture.Lease, abandoned, cancellation));
+        Assert.Single(table.Wire.Requests, call => call.Operation == "TransactWriteItems");
+        Assert.False(authorization.TryConsume(out _));
+
+        var planned = Assert.IsType<EffectJournalSnapshot>(await fixture.Journal.ReadAsync(envelope.Profile, envelope.IntentId, cancellation));
+        Assert.Equal(abandoned.Revision + 1, planned.Revision);
+        Assert.Equal(EffectState.Planned, planned.Entry.State);
+        Assert.Null(planned.Entry.Attempt);
+        Assert.Null(planned.Entry.LatestAuthorizedDeadline);
+        Assert.True(planned.Entry.Envelope.Matches(envelope));
+        var active = Assert.IsType<ActiveEffectPage>(await fixture.Store.ReadActiveOperationsAsync(envelope.Profile, fixture.Lease.Fence,
+            null, cancellation));
+        Assert.Equal(envelope.IntentId, Assert.Single(active.IntentIds));
+        Assert.Null(active.Continuation);
+    }
+
     [Fact]
     public async Task DuplicateAndForeignHellosCannotReplaceTheKeyBoundToAnOffer()
     {
@@ -392,6 +459,14 @@ public sealed class JitHandoffStoreTests
     private static async Task<EffectJournalSnapshot> SettleRemovalAsync(
         TestContextFixture fixture, JitHandoffSnapshot handoff, CancellationToken cancellationToken)
     {
+        var (attempt, authorization) = await BeginRemovalAsync(fixture, handoff, cancellationToken);
+        Assert.True(authorization.TryConsume(out _));
+        return await ResolveAppliedAsync(fixture, attempt, cancellationToken);
+    }
+
+    private static async Task<(EffectJournalSnapshot Attempt, EffectSendAuthorization Authorization)> BeginRemovalAsync(
+        TestContextFixture fixture, JitHandoffSnapshot handoff, CancellationToken cancellationToken)
+    {
         var profile = fixture.Catalog.Profile;
         var identity = fixture.Identity;
         var request = new GitHubRunnerRemoveEffectRequest(identity.ScopeIdentity, identity.ScaleSetId,
@@ -404,9 +479,8 @@ public sealed class JitHandoffStoreTests
             cancellationToken));
         var begin = await fixture.Journal.BeginRunnerRemovalAsync(fixture.Lease, fixture.Catalog, executor, handoff, intent,
             fixture.Clock.Now, fixture.Clock.Now.AddSeconds(40), TimeSpan.FromSeconds(1), cancellationToken);
-        Assert.True(Assert.IsType<EffectSendAuthorization>(begin.Permission).TryConsume(out _));
         var attempt = Assert.IsType<EffectJournalSnapshot>(await fixture.Journal.ReadAsync(profile, envelope.IntentId, cancellationToken));
-        return await ResolveAppliedAsync(fixture, attempt, cancellationToken);
+        return (attempt, Assert.IsType<EffectSendAuthorization>(begin.Permission));
     }
 
     private static async Task<EffectJournalSnapshot> ResolveAppliedAsync(

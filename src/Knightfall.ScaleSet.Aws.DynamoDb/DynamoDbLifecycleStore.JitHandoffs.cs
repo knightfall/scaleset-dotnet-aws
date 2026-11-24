@@ -244,7 +244,7 @@ public sealed partial class DynamoDbLifecycleStore
         actual is not null && expected.Revision == actual.Revision && expected.TransitionId == actual.TransitionId &&
         BootstrapItems.Serialize(JitHandoffPayload.From(expected)) == BootstrapItems.Serialize(JitHandoffPayload.From(actual));
 
-    private static bool MatchesJitCatalog(CatalogProfile catalog, JitHandoffIdentity identity) =>
+    internal static bool MatchesJitCatalog(CatalogProfile catalog, JitHandoffIdentity identity) =>
         IsHandoffProfile(catalog.Profile, identity) && catalog.State is CatalogProfileState.Active or CatalogProfileState.Draining &&
         catalog.Binding.ScopeIdentity == identity.ScopeIdentity && catalog.Binding.ScaleSetId == identity.ScaleSetId &&
         catalog.Binding.BootstrapProtocol == "v1";
@@ -253,7 +253,7 @@ public sealed partial class DynamoDbLifecycleStore
         IsHandoffProfile(executor.Binding.Profile, identity) && executor.Binding.AllocationId == identity.AllocationId.ToString("D") &&
         executor.Binding.Incarnation == identity.Incarnation && executor.Binding.ResourceArn == identity.ResourceArn;
 
-    private static bool MatchesJitProvider(CatalogProfile catalog, ExecutorSnapshot executor) => executor.Binding.Provider switch
+    internal static bool MatchesJitProvider(CatalogProfile catalog, ExecutorSnapshot executor) => executor.Binding.Provider switch
     {
         Ec2ExecutorIdentity ec2 => catalog.Binding.ProvisionerType == RunnerProvisionerType.Ec2 &&
             catalog.Binding.ProviderDefinition == ec2.LaunchTemplateId,
