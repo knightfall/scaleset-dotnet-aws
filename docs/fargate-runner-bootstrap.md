@@ -34,7 +34,7 @@ For example, set the following fields on the existing task definition. Populate 
 }
 ```
 
-The exact image, entrypoint, command, and scratch path must match the profile's Fargate preflight approval. T16 launches one task with no runtime overrides. ECS supplies the metadata and task credential endpoint variables. Do not set environment entries, environment files, or secrets on the runner container.
+The exact image, entrypoint, command, and scratch path must match the profile's Fargate preflight approval. Omit the task definition's runner `healthCheck` field because the approval covers the bootstrap command. T16 launches one task with no runtime overrides. ECS supplies the metadata and task credential endpoint variables. Do not set environment entries, environment files, or secrets on the runner container.
 
 The binding file contains only nonsecret deployment settings. This example uses an existing scale set. For an automatically created scale set, omit `scaleSetId`. The bootstrap then accepts the positive scale-set ID authenticated by the controller's scoped offer.
 

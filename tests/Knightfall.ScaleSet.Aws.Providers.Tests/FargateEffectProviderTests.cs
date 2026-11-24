@@ -1,4 +1,5 @@
 using System.Net;
+using System.Text.Json.Nodes;
 using Knightfall.ScaleSet.Aws.Core.Catalog;
 using Knightfall.ScaleSet.Aws.Core.Configuration;
 using Knightfall.ScaleSet.Aws.Core.Lifecycle;
@@ -42,6 +43,27 @@ public sealed class FargateEffectProviderTests
         Assert.Equal(1024, first.CpuUnits);
         Assert.Throws<ArgumentException>(() => FargateProfileInspector.CreateLaunchRequest(verified, FirstAllocation, [Subnet1, Subnet1]));
         Assert.Throws<ArgumentException>(() => FargateProfileInspector.CreateLaunchRequest(verified, FirstAllocation, ["subnet-0123456789abcdef9"]));
+    }
+
+    [Fact]
+    public async Task ConfiguredRunnerHealthCheckHoldsInspectionAndDispatch()
+    {
+        var token = TestContext.Current.CancellationToken;
+        using var aws = new FargateInspectionFixture();
+        var configuration = await ConfigurationAsync(token);
+        var adapter = aws.Inspector.CreateEffectProvider(configuration, Scope, Approval);
+        var eligible = Assert.IsType<EffectDispatchPrecondition>(await adapter.CheckAsync(Launch(), Catalog, token));
+        Assert.True(eligible.Eligible);
+
+        aws.TaskDefinition["containerDefinitions"]![0]!["healthCheck"] =
+            new JsonObject { ["command"] = new JsonArray("CMD", "/usr/bin/true") };
+
+        var inspection = await aws.Inspector.ResolvePreflightAsync(configuration, Profile, Approval, token);
+        Assert.Equal(FargatePreflightStatus.ContainerUnapproved, inspection.Status);
+        Assert.Null(inspection.Task);
+        var held = Assert.IsType<EffectDispatchPrecondition>(await adapter.CheckAsync(Launch(), Catalog, token));
+        Assert.False(held.Eligible);
+        Assert.DoesNotContain(aws.Requests, request => Operation(request) == "RunTask");
     }
 
     [Fact]
