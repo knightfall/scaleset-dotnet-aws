@@ -298,8 +298,10 @@ public sealed class EffectJournalEntry
         return evidence is { ExecutorBinding: null, ResourceObservation: null } &&
             (Envelope.Request is not Ec2LaunchEffectRequest { OwnershipTags: not null } ||
              evidence.Kind is not (EffectResolutionKind.Applied or EffectResolutionKind.Rejected)) &&
-            (Envelope.Request is not (FargateLaunchEffectRequest { OwnershipTags: not null } or FargateStopEffectRequest { Incarnation: not null }) ||
-                evidence.Kind == EffectResolutionKind.CanceledBeforeSend);
+            (Envelope.Request is not FargateLaunchEffectRequest { OwnershipTags: not null } ||
+                evidence.Kind == EffectResolutionKind.CanceledBeforeSend) &&
+            (Envelope.Request is not FargateStopEffectRequest { Incarnation: not null } ||
+                evidence.Kind is EffectResolutionKind.CanceledBeforeSend or EffectResolutionKind.AbandonedBeforeSend);
     }
 
     private bool ValidState()
