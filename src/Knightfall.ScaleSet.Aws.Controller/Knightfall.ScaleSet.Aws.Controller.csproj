@@ -4,6 +4,7 @@
     <OutputType>Exe</OutputType>
   </PropertyGroup>
   <ItemGroup>
+    <InternalsVisibleTo Include="Knightfall.ScaleSet.Aws.Telemetry.Tests" />
     <ProjectReference Include="../Knightfall.ScaleSet.Aws.Core/Knightfall.ScaleSet.Aws.Core.csproj" />
     <ProjectReference Include="../Knightfall.ScaleSet.Aws.DynamoDb/Knightfall.ScaleSet.Aws.DynamoDb.csproj" />
     <ProjectReference Include="../Knightfall.ScaleSet.Aws.GitHub/Knightfall.ScaleSet.Aws.GitHub.csproj" />
