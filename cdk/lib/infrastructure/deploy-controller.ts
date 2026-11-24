@@ -5,14 +5,15 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { compileConfig, validateRuntime } from "../config/compiler.ts";
 import { synthesizeController } from "./controller-stack.ts";
+import { resolveControllerTelemetry } from "./controller-telemetry.ts";
 import {
   controllerStackName,
   deploymentIdentity,
   generationValue,
   trackingTableName,
 } from "./deployment-input.ts";
+import type { ControllerDeploymentEnvironment } from "./deployment-input.ts";
 import { validateFargatePreflight } from "./fargate-preflight.ts";
-import type { ControllerDeploymentEnvironment } from "./fargate-preflight.ts";
 
 type Compiled = ReturnType<typeof compileConfig>;
 type ObjectProperties = Record<string, unknown>;
@@ -109,6 +110,7 @@ export function deployController(
     runtime,
     target.fargatePreflight,
   );
+  resolveControllerTelemetry(target.telemetry, runtime.spec.aws);
   const aws = (...args: string[]) =>
     run("aws", [
       "--no-cli-pager",
@@ -326,6 +328,7 @@ export function deployController(
     const assembly = join(workspace, "assembly");
     const artifact = synthesizeController(compiled, generation, assembly, {
       fargatePreflight,
+      telemetry: target.telemetry,
     });
     const changeSetName = `scaleset-${randomUUID()}`;
     commandResult(

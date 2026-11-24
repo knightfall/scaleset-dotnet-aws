@@ -317,7 +317,7 @@ function requireArn(
   }
 }
 
-function awsPartition(region: string): string {
+export function awsPartition(region: string): string {
   if (region.startsWith("cn-")) return "aws-cn";
   if (region.startsWith("us-gov-")) return "aws-us-gov";
   if (region.startsWith("us-isob-")) return "aws-iso-b";

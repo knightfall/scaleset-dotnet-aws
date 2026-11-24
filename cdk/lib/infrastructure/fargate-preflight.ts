@@ -6,10 +6,6 @@ export const fargatePreflightEnvironmentName = "SCALESET_FARGATE_PREFLIGHT";
 const maximumBytes = 16 * 1024;
 const maximumCpuUnits = 9_223_372_036_854_775_807n;
 
-export interface ControllerDeploymentEnvironment {
-  readonly fargatePreflight?: string;
-}
-
 function invalid(): never {
   throw new Error(
     "SCALESET_FARGATE_PREFLIGHT is invalid for the configured deployment.",

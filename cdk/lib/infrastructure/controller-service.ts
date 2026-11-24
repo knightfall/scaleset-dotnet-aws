@@ -5,6 +5,7 @@ import * as iam from "aws-cdk-lib/aws-iam";
 import * as logs from "aws-cdk-lib/aws-logs";
 import type { Construct } from "constructs";
 import type { RunnerControllerRuntime } from "../config/types.ts";
+import type { resolveControllerTelemetry } from "./controller-telemetry.ts";
 import { fargatePreflightEnvironmentName } from "./fargate-preflight.ts";
 
 export const controllerHealthAddress = "127.0.0.1:8080";
@@ -15,6 +16,7 @@ interface ControllerServiceProps {
   readonly taskRole: iam.IRole;
   readonly command: readonly string[];
   readonly fargatePreflight?: string;
+  readonly telemetry: ReturnType<typeof resolveControllerTelemetry>;
 }
 
 const memoryGiBRanges = new Map<number, readonly [number, number, number]>([
@@ -91,16 +93,17 @@ export function createControllerService(
           : ecs.CpuArchitecture.X86_64,
     },
   });
+  const environment = { ...props.telemetry.environment };
+  if (props.fargatePreflight !== undefined) {
+    environment[fargatePreflightEnvironmentName] = props.fargatePreflight;
+  }
   task.addContainer("Controller", {
     image: ecs.ContainerImage.fromEcrRepository(
       repository,
       image.slice(digestSeparator + 1),
     ),
     command: [...props.command],
-    environment:
-      props.fargatePreflight === undefined
-        ? undefined
-        : { [fargatePreflightEnvironmentName]: props.fargatePreflight },
+    environment: Object.keys(environment).length > 0 ? environment : undefined,
     essential: true,
     readonlyRootFilesystem: true,
     stopTimeout: Duration.seconds(90),
@@ -119,6 +122,41 @@ export function createControllerService(
       startPeriod: Duration.seconds(30),
     },
   });
+  const { headers } = props.telemetry;
+  if (headers.length > 0) {
+    const taskDefinition = task.node.defaultChild as ecs.CfnTaskDefinition;
+    // ECS retrieves these references using the execution role at task startup.
+    taskDefinition.addPropertyOverride(
+      "ContainerDefinitions.0.Secrets",
+      headers.map(({ name, secretArn }) => ({
+        Name: name,
+        ValueFrom: secretArn,
+      })),
+    );
+    executionRole.addToPolicy(
+      new iam.PolicyStatement({
+        actions: ["secretsmanager:GetSecretValue"],
+        resources: [
+          ...new Set(headers.map(({ secretArn }) => secretArn)),
+        ].sort(),
+      }),
+    );
+    for (const { secretArn, kmsKeyArn } of headers) {
+      if (kmsKeyArn === undefined) continue;
+      executionRole.addToPolicy(
+        new iam.PolicyStatement({
+          actions: ["kms:Decrypt"],
+          resources: [kmsKeyArn],
+          conditions: {
+            StringEquals: {
+              "kms:ViaService": `secretsmanager.${stack.region}.${stack.urlSuffix}`,
+              "kms:EncryptionContext:SecretARN": secretArn,
+            },
+          },
+        }),
+      );
+    }
+  }
   // Exact configured IDs avoid a VPC lookup, default security group, or inferred subnet selection.
   const service = new ecs.CfnService(scope, "ControllerService", {
     cluster: props.clusterArn,
