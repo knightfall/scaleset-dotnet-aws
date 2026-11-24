@@ -22,6 +22,8 @@ Build the `tests/Knightfall.ScaleSet.Aws.IntegrationTests` harness running deter
 
 1. `dotnet test --project tests/Knightfall.ScaleSet.Aws.IntegrationTests/Knightfall.ScaleSet.Aws.IntegrationTests.csproj --configuration Release` passes `T22` deterministically offline after package restore, with zero GitHub credentials.
 
+Run `make check-integration` to start pinned MiniStack and execute the IntegrationTests project. The GitHub simulator serves TLS and HTTP/2 on loopback. The test transport preserves the SDK's GitHub, Actions service and queue host names while connecting only to the simulator. The AWS test clients share the same loopback endpoint. Wire faults model the recovery cases above and establish local behavior within the [released SDK qualification boundary](../dependency-baseline.md#session-recovery-and-qualification-boundary).
+
 ---
 
 ## T23: Verify Direct EC2 flows against local AWS emulation
