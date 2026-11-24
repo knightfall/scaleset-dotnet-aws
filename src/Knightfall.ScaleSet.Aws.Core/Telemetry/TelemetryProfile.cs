@@ -28,7 +28,7 @@ public sealed record TelemetryProfile
             return null;
         }
 
-        return profile.Provisioner.Type switch
+        return profile.Provisioner?.Type switch
         {
             RunnerProvisionerType.Ec2 => new TelemetryProfile(BoundId(profile.Id), "ec2"),
             RunnerProvisionerType.Fargate => new TelemetryProfile(BoundId(profile.Id), "fargate"),
@@ -53,7 +53,7 @@ public sealed record TelemetryProfile
         // ':' is excluded by the profile schema, so compact IDs cannot alias ordinary names.
         const int digestLength = 64;
         string hash = Convert.ToHexStringLower(SHA256.HashData(Encoding.ASCII.GetBytes(id)));
-        return string.Concat(id.AsSpan(0, MaximumIdLength - digestLength - 1), ":", hash);
+        return $"{id.AsSpan(0, MaximumIdLength - digestLength - 1)}:{hash}";
     }
 }
 
