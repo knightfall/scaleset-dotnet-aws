@@ -7,6 +7,9 @@
     <PackageVersion Include="xunit.v3" Version="[4.0.3]" />
   </ItemGroup>
   <ItemGroup>
+    <PackageVersion Include="JsonSchema.Net" Version="[9.7.0]" />
+  </ItemGroup>
+  <ItemGroup>
     <PackageVersion Include="Knightfall.ScaleSet.Client" Version="[0.1.0-alpha.1]" />
     <PackageVersion Include="Knightfall.ScaleSet.Listener" Version="[0.1.0-alpha.1]" />
   </ItemGroup>

@@ -243,6 +243,22 @@
     ]
   },
   {
+    "name": "snapshot S3 key contains Unicode whitespace",
+    "fault": "configuration",
+    "code": "schema",
+    "edits": [
+      {
+        "path": "/spec/dryRun/demand",
+        "value": {
+          "type": "snapshot",
+          "s3Uri": "s3://config-fixtures/demand\u2002data.json",
+          "versionId": "recorded-version",
+          "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      }
+    ]
+  },
+  {
     "name": "inline GitHub token",
     "fault": "configuration",
     "code": "inline-credentials-unsupported",
@@ -463,6 +479,39 @@
     ]
   },
   {
+    "name": "runner group starts with a nonbreaking space",
+    "fault": "configuration",
+    "code": "schema",
+    "edits": [
+      {
+        "path": "/spec/profiles/0/github/runnerGroup",
+        "value": "\u00a0Linux-EC2"
+      }
+    ]
+  },
+  {
+    "name": "runner group starts with a byte-order mark",
+    "fault": "configuration",
+    "code": "schema",
+    "edits": [
+      {
+        "path": "/spec/profiles/0/github/runnerGroup",
+        "value": "\ufeffLinux-EC2"
+      }
+    ]
+  },
+  {
+    "name": "runner group starts with an en space",
+    "fault": "configuration",
+    "code": "schema",
+    "edits": [
+      {
+        "path": "/spec/profiles/0/github/runnerGroup",
+        "value": "\u2002Linux-EC2"
+      }
+    ]
+  },
+  {
     "name": "scale set name absent from labels",
     "fault": "configuration",
     "code": "semantic",
@@ -578,6 +627,28 @@
       {
         "path": "/spec/profiles/0/github/registration",
         "value": "create-if-missing"
+      }
+    ]
+  },
+  {
+    "name": "bootstrap role ARN contains a nonbreaking space",
+    "fault": "configuration",
+    "code": "schema",
+    "edits": [
+      {
+        "path": "/spec/profiles/0/provisioner/bootstrapRoleArn",
+        "value": "arn:aws:iam::111122223333:role/runner-linux\u00a0bootstrap"
+      }
+    ]
+  },
+  {
+    "name": "instance profile ARN contains a byte-order mark",
+    "fault": "configuration",
+    "code": "schema",
+    "edits": [
+      {
+        "path": "/spec/profiles/0/provisioner/instanceProfileArn",
+        "value": "arn:aws:iam::111122223333:instance-profile/runner-linux\ufeffbootstrap"
       }
     ]
   },
