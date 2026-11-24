@@ -50,9 +50,9 @@ Use the existing T01–T26 implementation chat and repository PR workflow. Start
 | 4 | Runner input package | Pending combined verification. |
 | 5 | Held invalid runner-authored HELLO input at its decode boundary in `ad27576`. | `MalformedRetainedHelloHoldsOnlyItsOwnHandoffAcrossStoreRestart` passed under loopback MiniStack. |
 | 6 | Shared Fargate task-definition validation rejects a configured runner health check in `51b9e3c`. | `ConfiguredRunnerHealthCheckHoldsInspectionAndDispatch` passed. Both patched controller images passed their health checks. |
-| 7 | Fargate capacity package | Pending combined verification. |
-| 8 | Fargate capacity package | Pending combined verification. |
-| 9 | Fargate capacity package | Pending combined verification. |
-| 10 | EC2 recovery package | Pending combined verification. |
-| 11 | EC2 recovery package | Pending combined verification. |
+| 7 | Shared Fargate ownership classification separates profile occupancy from physical headroom in `a882615`. | Provider tests kept ambiguous same-definition tasks and excluded identified foreign work. Active shared-cluster MiniStack cases exercised zero, one, and two physical slots across two profiles capped at one. |
+| 8 | An exact warm allocation can satisfy reserve without counting as a ready job slot in `a882615`. | Core tests cover the pending-to-running and registration transitions. Active MiniStack held reserve one at maximum 24, then replaced one corroborated terminal task. |
+| 9 | The controller can refresh one trusted, scoped S3 quota observation for all profiles in `a882615`. | A fake clock exercised expiry, outage, rollback, recovery, and known zero beyond ten minutes. The active worker resumed from fresh evidence and shared one available slot across profiles. |
+| 10 | Periodic inventory and SQS share corroborated detached-terminal EC2 readback in `5b9660f`. | Queue tests covered no evidence, mismatches, and duplicates. The native MiniStack integration retired the exact terminated allocation after restart and launched one distinct replacement. |
+| 11 | Automatic EC2 cleanup requires the selected AMI and role, root-owned boot proof, and exact supervisor STATUS evidence in `5b9660f`. | Qualified MiniStack cleanup required GitHub completion, process exit and the grace period. Default mode and mismatched AMI held the host. The Linux bootstrap and CDK grant checks passed. Real IAM, AMI, and IMDS protections remain target qualification. |
 | 12 | Effective OTLP HTTPS validation in runtime and CDK in `b0521ff`. | All 49 .NET telemetry tests and seven CDK telemetry tests passed. Tests cover inherited and direct headers on all three signals for both protocols, HTTPS, loopback, and errors that omit values. |

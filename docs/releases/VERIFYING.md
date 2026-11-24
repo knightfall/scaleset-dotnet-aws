@@ -8,19 +8,18 @@ Select an explicit tag from
 ```sh
 repo=knightfall/scaleset-dotnet-aws
 tag=v0.1.0-alpha.1  # Replace with the release you intend to verify.
-download_dir=$(mktemp -d)
+download_dir=$(mktemp -d) || exit 1
 
-gh release verify "$tag" --repo "$repo"
-gh release download "$tag" --repo "$repo" --dir "$download_dir"
+gh release verify "$tag" --repo "$repo" || exit 1
+gh release download "$tag" --repo "$repo" --dir "$download_dir" || exit 1
 for asset in "$download_dir"/*; do
   gh release verify-asset "$tag" "$asset" --repo "$repo" || exit 1
 done
-(cd "$download_dir" && shasum -a 256 -c SHA256SUMS)
 ```
 
-GitHub verifies the release attestation and asset digests. The checksum file also
-supports subsequent offline checks once the release assets have been
-authenticated. [GitHub CLI release verification](https://cli.github.com/manual/gh_release_verify)
+GitHub verifies the release attestation and asset digests. Continue with the
+build attestation and payload checks below before using the downloaded files.
+[GitHub CLI release verification](https://cli.github.com/manual/gh_release_verify)
 
 ## Verify the published manifest and payloads
 
@@ -38,6 +37,9 @@ gh attestation verify "$download_dir/release.json" --repo "$repo" \
   --source-ref refs/heads/main --source-digest "$commit" --deny-self-hosted-runners || exit 1
 python3 .github/release/candidate.py verify "$download_dir" --commit "$commit" || exit 1
 ```
+
+This also checks `SHA256SUMS` against the authenticated file set. You can use
+that file for subsequent offline checksum checks.
 
 ### Inspect an Actions candidate
 
