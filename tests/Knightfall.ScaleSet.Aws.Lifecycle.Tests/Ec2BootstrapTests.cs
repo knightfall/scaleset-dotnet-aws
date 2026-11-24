@@ -155,7 +155,7 @@ public sealed class Ec2BootstrapTests
     [InlineData("valid")]
     [InlineData("bad-target")]
     [InlineData("tampered")]
-    [InlineData("expired")]
+    [InlineData("expires-in-flight")]
     [InlineData("lost")]
     public async Task OnlyTheAuthenticConsumedOfferLaunchesAndAReconstructedSupervisorCannotRepeatIt(string condition)
     {
@@ -176,7 +176,7 @@ public sealed class Ec2BootstrapTests
         }
         var runner = new FixtureRunner();
         OneJobBootstrap Bootstrap() => new(new DynamoDbBootstrapOfferClient(table.Client, table.Name, Principal, Arn, clock),
-            Target, Arn, Principal, Reserve, runner, clock, TimeSpan.FromSeconds(2), TimeSpan.FromMilliseconds(30), ObserveAsync);
+            Target, Arn, Principal, Reserve, runner, clock, TimeSpan.FromSeconds(15), TimeSpan.FromMilliseconds(30), ObserveAsync);
         var observed = new List<bool>();
         var status = new DynamoDbEc2BootstrapStatusClient(table.Client, table.Name, Principal, Arn, clock);
         async Task ObserveAsync(BootstrapRunnerObservation observation, CancellationToken token)
@@ -208,22 +208,28 @@ public sealed class Ec2BootstrapTests
         {
             envelope = envelope with { Tag = envelope.Tag.SetItem(0, (byte)(envelope.Tag[0] ^ 1)) };
         }
-        if (condition == "expired")
-        {
-            clock.Now = clock.Now.AddSeconds(21);
-        }
+        var offerKey = LifecycleKey.Offer(Principal);
+        var successfulDelete = condition == "expires-in-flight" ? table.Wire.PauseAfterNextSuccessfulBootstrapDelete(offerKey) : null;
         if (condition == "lost")
         {
             table.Wire.DropNextSuccessfulBootstrapDeleteResponse();
         }
         await table.Client.PutItemAsync(table.Name, BootstrapItems.EncodeOffer(envelope, BootstrapItems.HelloDigest(hello)), cancellation);
-
-        var expected = condition switch
+        if (successfulDelete is not null)
         {
-            "valid" => RunnerBootstrapOutcome.Completed,
-            "expired" => RunnerBootstrapOutcome.OfferUnavailable,
-            _ => RunnerBootstrapOutcome.OfferRejected,
-        };
+            try
+            {
+                await successfulDelete.Captured.WaitAsync(TimeSpan.FromSeconds(10), cancellation);
+                Assert.Empty(await table.ReadAsync(offerKey, cancellation));
+                clock.Now = DateTimeOffset.FromUnixTimeMilliseconds(binding.ExpiresAtUnixMilliseconds);
+            }
+            finally
+            {
+                successfulDelete.Resume();
+            }
+        }
+
+        var expected = condition == "valid" ? RunnerBootstrapOutcome.Completed : RunnerBootstrapOutcome.OfferRejected;
         Assert.Equal(expected, await startup);
         Assert.True(spent);
         if (condition == "valid")
@@ -251,6 +257,34 @@ public sealed class Ec2BootstrapTests
         int requests = table.Wire.Requests.Count;
         Assert.Equal(RunnerBootstrapOutcome.AlreadySpent, await Bootstrap().RunAsync(cancellation));
         Assert.Equal(requests, table.Wire.Requests.Count);
+    }
+
+    [Fact]
+    public async Task OfferAtExactExpiryCannotBeDeleted()
+    {
+        var cancellation = TestContext.Current.CancellationToken;
+        using var table = await MiniStackTable.CreateAsync(cancellation);
+        var clock = new FixtureClock();
+        var identity = new JitHandoffIdentity(Target.Deployment, Target.ProfileId, Target.ScopeIdentity, Target.ScaleSetId!.Value,
+            Guid.NewGuid(), Arn, Guid.NewGuid(), Principal);
+        using var recipient = JitRecipientKey.Create();
+        var bootstrap = new DynamoDbBootstrapOfferClient(table.Client, table.Name, Principal, Arn, clock);
+        Assert.Equal(LifecycleWriteOutcome.Committed, await bootstrap.RegisterHelloAsync(recipient.Hello, cancellation));
+        var expiresAt = clock.Now.AddSeconds(20);
+        var binding = JitOfferBinding.Create(identity, recipient.Hello.BootNonce, expiresAt);
+        var offer = JitOfferCryptography.Seal(binding, recipient.Hello, FixtureJit("ss-" + binding.OfferId[..48]), clock);
+        var key = LifecycleKey.Offer(Principal);
+        await table.Client.PutItemAsync(table.Name, BootstrapItems.EncodeOffer(offer, BootstrapItems.HelloDigest(recipient.Hello)), cancellation);
+        clock.Now = expiresAt;
+
+        var attempt = await bootstrap.TryConsumeOfferAsync(recipient.Hello, cancellation);
+        Assert.Equal(BootstrapOfferStatus.NotAvailable, attempt.Status);
+        Assert.Null(attempt.Offer);
+        var wire = Assert.Single(table.Wire.Requests, call => call.Operation == "DeleteItem");
+        Assert.Equal(binding.ExpiresAtUnixMilliseconds.ToString(System.Globalization.CultureInfo.InvariantCulture),
+            wire.Request.GetProperty("ExpressionAttributeValues").GetProperty(":now").GetProperty("N").GetString());
+        var retained = await table.ReadAsync(key, cancellation);
+        Assert.Equal(binding.OfferId, retained["offerId"].S);
     }
 
     [Theory]
@@ -316,7 +350,7 @@ public sealed class Ec2BootstrapTests
 
     private static async Task WaitForFirstConditionalDeleteAsync(MiniStackTable table, CancellationToken cancellationToken)
     {
-        using var budget = new CancellationTokenSource(TimeSpan.FromSeconds(2));
+        using var budget = new CancellationTokenSource(TimeSpan.FromSeconds(10));
         using var linked = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, budget.Token);
         while (!table.Wire.Requests.Any(call => call.Operation == "DeleteItem"))
         {

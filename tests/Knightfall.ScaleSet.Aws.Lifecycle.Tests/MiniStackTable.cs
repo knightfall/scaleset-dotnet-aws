@@ -192,6 +192,7 @@ internal sealed class MiniStackWire : DelegatingHandler
     private PausedRequest? _pausedRead;
     private PausedRequest? _pausedWrite;
     private PausedRequest? _pausedSuccessfulWrite;
+    private PausedRequest? _pausedSuccessfulBootstrapDelete;
     private StorageFailure? _failedGetItem;
     private StorageFailure? _failedTransactWrite;
 
@@ -241,6 +242,13 @@ internal sealed class MiniStackWire : DelegatingHandler
         return pause;
     }
 
+    internal PausedRequest PauseAfterNextSuccessfulBootstrapDelete(LifecycleKey key)
+    {
+        var pause = new PausedRequest(key);
+        _pausedSuccessfulBootstrapDelete = pause;
+        return pause;
+    }
+
     protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
     {
         if (request.RequestUri is not { Scheme: "http", Host: "127.0.0.1" })
@@ -287,6 +295,12 @@ internal sealed class MiniStackWire : DelegatingHandler
             Interlocked.CompareExchange(ref _pausedSuccessfulWrite, null, afterWrite) == afterWrite)
         {
             await afterWrite.AwaitResumeAsync(cancellationToken);
+        }
+        if (operation == "DeleteItem" && actual.IsSuccessStatusCode && _pausedSuccessfulBootstrapDelete is { } afterDelete &&
+            afterDelete.Matches(call.Request.GetProperty("Key")) &&
+            Interlocked.CompareExchange(ref _pausedSuccessfulBootstrapDelete, null, afterDelete) == afterDelete)
+        {
+            await afterDelete.AwaitResumeAsync(cancellationToken);
         }
         if (operation == "GetItem" && _pausedRead is { } pause &&
             pause.Matches(call.Request.GetProperty("Key")) &&
