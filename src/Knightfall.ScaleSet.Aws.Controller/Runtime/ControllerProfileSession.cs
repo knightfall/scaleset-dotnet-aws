@@ -1,0 +1,449 @@
+using Knightfall.ScaleSet.Aws.Core.Catalog;
+using Knightfall.ScaleSet.Aws.Core.Configuration;
+using Knightfall.ScaleSet.Aws.Core.Lifecycle;
+using Knightfall.ScaleSet.Aws.Core.Telemetry;
+using Knightfall.ScaleSet.Aws.DynamoDb;
+using Knightfall.ScaleSet.Aws.GitHub;
+using ScaleSet.Client;
+using ScaleSet.Listener;
+
+namespace Knightfall.ScaleSet.Aws.Controller.Runtime;
+
+internal sealed class ControllerProfileSession : IDisposable
+{
+    private static readonly TimeSpan PollRetry = TimeSpan.FromSeconds(1);
+    private static readonly TimeSpan RotationInterval = TimeSpan.FromMinutes(1);
+    private static readonly TimeSpan DemandFreshness = TimeSpan.FromMinutes(10);
+    private static readonly TimeSpan LogFlushGrace = TimeSpan.FromSeconds(30);
+    private static readonly ListenerCapacity NoAdmission = new(0, 0, IsReady: false);
+
+    private readonly RuntimeConfiguration _configuration;
+    private readonly RunnerProfile _profile;
+    private readonly LifecycleProfile _key;
+    private readonly GitHubConnectionConfiguration _github;
+    private readonly long _generation;
+    private readonly ControllerLeaseOwnership _ownership;
+    private readonly DynamoDbLifecycleStore _store;
+    private readonly GitHubSecretLoader _secrets;
+    private readonly GitHubScaleSetClientFactory _clients;
+    private readonly GitHubScaleSetRegistration _registration;
+    private readonly GitHubListenerSupervisor _supervisor;
+    private readonly GitHubCredentialRotator _rotation;
+    private readonly GitHubCredentialCooldown _cooldown;
+    private readonly TimeProvider _clock;
+    private readonly TelemetryProfile? _telemetry;
+    private readonly string _scope;
+    private readonly string _runnerGroup;
+    private readonly string _scaleSet;
+    private readonly string[] _labels;
+    private readonly SemaphoreSlim _serial = new(1);
+    private readonly CancellationTokenSource _admissions = new();
+    private readonly CancellationTokenSource _polls;
+    private readonly CancellationToken _processStopping;
+    private GitHubScaleSetBinding? _binding;
+    private GitHubScaleSetConnection? _connection;
+    private GitHubListenerLane? _lane;
+    private GitHubListenerLaneResult? _listenerResult;
+    private Task? _pollTask;
+    private DateTimeOffset _nextRotation;
+    private int _disposed;
+
+    internal ControllerProfileSession(RuntimeConfiguration configuration, RunnerProfile profile, long generation,
+        ControllerLeaseOwnership ownership, DynamoDbLifecycleStore store, GitHubSecretLoader secrets, GitHubScaleSetClientFactory clients,
+        GitHubScaleSetRegistration registration, GitHubListenerSupervisor supervisor, GitHubCredentialRotator rotation,
+        GitHubCredentialCooldown cooldown, TimeProvider clock, CancellationToken processStopping = default)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(generation);
+        if (configuration.Mode != ControllerMode.Active || profile.State == RunnerProfileState.Disabled ||
+            !configuration.Profiles.Contains(profile))
+        {
+            throw new ArgumentException("An enabled active-mode runtime profile is required.", nameof(profile));
+        }
+
+        _configuration = configuration;
+        _profile = profile;
+        _generation = generation;
+        _ownership = ownership;
+        _store = store;
+        _secrets = secrets;
+        _clients = clients;
+        _registration = registration;
+        _supervisor = supervisor;
+        _rotation = rotation;
+        _cooldown = cooldown;
+        _clock = clock;
+        _processStopping = processStopping;
+        _polls = CancellationTokenSource.CreateLinkedTokenSource(processStopping);
+        _telemetry = TelemetryProfile.From(profile);
+        _key = new LifecycleProfile(ControllerLeaseRecoveryCoordinator.DeploymentKey(configuration), profile.Id);
+        _github = configuration.GitHub[profile.GitHub.Connection];
+        _scope = GitHubRoutingIdentity.Scope(_github.ScopeUrl);
+        _runnerGroup = GitHubRoutingIdentity.Name(profile.GitHub.RunnerGroup);
+        _scaleSet = GitHubRoutingIdentity.Name(profile.GitHub.ScaleSet);
+        _labels = profile.GitHub.Labels.Select(GitHubRoutingIdentity.Name).Order(StringComparer.Ordinal).ToArray();
+    }
+
+    internal GitHubListenerLaneResult? ListenerResult => Volatile.Read(ref _listenerResult);
+
+    internal DateTimeOffset? ReadCredentialCooldown()
+    {
+        var current = _cooldown.Read(_github.SecretArn);
+        var listener = Volatile.Read(ref _lane)?.ReadCredentialCooldown();
+        return current is null || listener > current ? listener : current;
+    }
+
+    internal void RecordCredentialFailure(GitHubOperationException failure) => _cooldown.Record(_github.SecretArn, failure);
+
+    internal async Task<GitHubScaleSetBinding?> EnsureRegisteredAsync(CancellationToken cancellationToken)
+    {
+        if (AdmissionsStopped || _polls.IsCancellationRequested)
+        {
+            return null;
+        }
+        using var linked = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _admissions.Token, _ownership.OwnershipLost);
+        var token = linked.Token;
+        await _serial.WaitAsync(token).ConfigureAwait(false);
+        using var telemetry = TelemetryProfileScope.Enter(_telemetry);
+        try
+        {
+            if (AdmissionsStopped || _polls.IsCancellationRequested || ReadCredentialCooldown() is not null ||
+                await ReadCatalogAsync(allowClosing: false, token).ConfigureAwait(false) is not { } catalog)
+            {
+                return null;
+            }
+
+            if (_binding is { } alreadyBound)
+            {
+                return MatchesBound(catalog, alreadyBound) ? alreadyBound : null;
+            }
+
+            return await RegisterAsync(catalog, token).ConfigureAwait(false);
+        }
+        catch (GitHubOperationException failure)
+        {
+            RecordCredentialFailure(failure);
+            return null;
+        }
+        catch (GitHubSecretLoadException failure)
+        {
+            RecordCredentialFailure(new GitHubOperationException(GitHubOperationError.CredentialUnavailable, failure.StatusCode));
+            return null;
+        }
+        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested && AdmissionsStopped)
+        {
+            return null;
+        }
+        finally
+        {
+            _serial.Release();
+        }
+    }
+
+    /// <summary>Gets the connection owned by this profile's serial reconciliation loop.</summary>
+    internal async Task<GitHubScaleSetConnection?> GetConnectionAsync(CancellationToken cancellationToken)
+    {
+        if (AdmissionsStopped || ReadCredentialCooldown() is not null)
+        {
+            return null;
+        }
+        using var linked = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _admissions.Token, _ownership.OwnershipLost);
+        var token = linked.Token;
+        await _serial.WaitAsync(token).ConfigureAwait(false);
+        using var telemetry = TelemetryProfileScope.Enter(_telemetry);
+        try
+        {
+            if (_connection is not { } current || _binding is not { } binding ||
+                await ReadCatalogAsync(allowClosing: true, token).ConfigureAwait(false) is not { } catalog || !MatchesBound(catalog, binding))
+            {
+                return null;
+            }
+
+            if (_clock.GetUtcNow() >= _nextRotation)
+            {
+                _nextRotation = _clock.GetUtcNow() + RotationInterval;
+                var check = await _rotation.CheckAsync(_configuration, _profile.GitHub, binding, current, token).ConfigureAwait(false);
+                if (check.Failure?.RateLimit is not null)
+                {
+                    RecordCredentialFailure(check.Failure);
+                }
+                if (check.Candidate is { } candidate)
+                {
+                    current.Dispose();
+                    _connection = candidate;
+                }
+            }
+
+            return !AdmissionsStopped && ReadCredentialCooldown() is null && ReadLocalOwnership() is not null ? _connection : null;
+        }
+        finally
+        {
+            _serial.Release();
+        }
+    }
+
+    internal Task StopAdmissionsAsync(CancellationToken cancellationToken) => _admissions.CancelAsync().WaitAsync(cancellationToken);
+
+    internal Task CancelPollsAsync(CancellationToken cancellationToken) => _polls.CancelAsync().WaitAsync(cancellationToken);
+
+    internal async Task JoinMutatorsAsync(CancellationToken cancellationToken)
+    {
+        await _serial.WaitAsync(cancellationToken).ConfigureAwait(false);
+        var poll = _pollTask;
+        _serial.Release();
+        if (poll is not null)
+        {
+            await poll.WaitAsync(cancellationToken).ConfigureAwait(false);
+        }
+    }
+
+    internal async Task CloseOwnedSessionsAsync(CancellationToken cancellationToken)
+    {
+        if (Volatile.Read(ref _lane) is { } lane)
+        {
+            Volatile.Write(ref _listenerResult, await lane.StopAsync(cancellationToken).ConfigureAwait(false));
+        }
+    }
+
+    internal async Task<GitHubListenerLaneResult?> RetireDrainingSessionAsync(ProfileRetirementCoordinator retirement, CancellationToken cancellationToken)
+    {
+        if (AdmissionsStopped || _profile.State != RunnerProfileState.Draining)
+        {
+            return null;
+        }
+        await _serial.WaitAsync(cancellationToken).ConfigureAwait(false);
+        GitHubListenerLane? lane;
+        try
+        {
+            var catalog = await ReadCatalogAsync(allowClosing: true, cancellationToken).ConfigureAwait(false);
+            if (catalog is not { State: CatalogProfileState.ClosureHeld })
+            {
+                return null;
+            }
+            lane = _lane ?? await RegisterClosureLaneAsync(catalog, cancellationToken).ConfigureAwait(false);
+        }
+        finally
+        {
+            _serial.Release();
+        }
+        if (lane is null)
+        {
+            return null;
+        }
+
+        await CancelPollsAsync(cancellationToken).ConfigureAwait(false);
+        await JoinMutatorsAsync(cancellationToken).ConfigureAwait(false);
+        var result = await lane.RetireDrainingSessionAsync(retirement, cancellationToken).ConfigureAwait(false);
+        Volatile.Write(ref _listenerResult, result);
+        return result;
+    }
+
+    private bool AdmissionsStopped => Volatile.Read(ref _disposed) != 0 || _admissions.IsCancellationRequested ||
+        _processStopping.IsCancellationRequested || _ownership.OwnershipLost.IsCancellationRequested;
+
+    private async Task<GitHubScaleSetBinding?> RegisterAsync(CatalogProfile catalog, CancellationToken cancellationToken)
+    {
+        if (await ReadDurableOwnershipAsync(cancellationToken).ConfigureAwait(false) is not { } owner ||
+            await _secrets.LoadAsync(_configuration, _profile.GitHub.Connection, cancellationToken).ConfigureAwait(false) is not { } version)
+        {
+            return null;
+        }
+        GitHubScaleSetConnection? candidate = _clients.Create(version);
+        try
+        {
+            var result = await _registration.ResolveAsync(_configuration, _profile.Id, candidate, owner, FromCatalog(catalog), cancellationToken)
+                .ConfigureAwait(false);
+            if (result.Failure is { } failure)
+            {
+                RecordCredentialFailure(failure);
+            }
+            if (result is not { Status: GitHubRegistrationStatus.Bound, Binding: { } binding } || AdmissionsStopped)
+            {
+                return null;
+            }
+
+            var saved = await _store.BindCatalogScaleSetAsync(owner.Lease.Fence, catalog, binding.RunnerGroupId, binding.ScaleSetId, cancellationToken)
+                .ConfigureAwait(false);
+            if (saved is not (LifecycleWriteOutcome.Committed or LifecycleWriteOutcome.Indeterminate) ||
+                await ReadCatalogAsync(allowClosing: false, cancellationToken).ConfigureAwait(false) is not { } published ||
+                !MatchesBound(published, binding) || AdmissionsStopped || _polls.IsCancellationRequested)
+            {
+                return null;
+            }
+
+            var lane = RegisterLane(binding, version, owner.Lease.Fence);
+            _binding = binding;
+            _connection = candidate;
+            _nextRotation = _clock.GetUtcNow() + RotationInterval;
+            candidate = null;
+            _pollTask = PollAsync(lane);
+            return binding;
+        }
+        finally
+        {
+            candidate?.Dispose();
+        }
+    }
+
+    private async Task<GitHubListenerLane?> RegisterClosureLaneAsync(CatalogProfile catalog, CancellationToken cancellationToken)
+    {
+        if (FromCatalog(catalog) is not { } binding ||
+            await ReadDurableOwnershipAsync(cancellationToken).ConfigureAwait(false) is not { } owner ||
+            await _secrets.LoadAsync(_configuration, _profile.GitHub.Connection, cancellationToken).ConfigureAwait(false) is not { } version)
+        {
+            return null;
+        }
+        using var check = _clients.Create(version);
+        _ = await check.LookupAsync(_profile.GitHub, binding, cancellationToken).ConfigureAwait(false);
+        return !AdmissionsStopped && await ReadCatalogAsync(allowClosing: true, cancellationToken).ConfigureAwait(false) is
+            { State: CatalogProfileState.ClosureHeld } current && MatchesBound(current, binding)
+            ? RegisterLane(binding, version, owner.Lease.Fence) : null;
+    }
+
+    private GitHubListenerLane RegisterLane(GitHubScaleSetBinding binding, GitHubSecretVersion version, DeploymentLeaseFence owner)
+    {
+        var connection = _clients.Create(version);
+        try
+        {
+            var lane = _supervisor.Register(new GitHubListenerProfile(_configuration, _profile.Id, binding, connection, owner,
+                ReadListenerOwnershipAsync, ReadListenerCapacityAsync, CanOpenAsync, _ownership.OwnershipLost));
+            Volatile.Write(ref _lane, lane);
+            return lane;
+        }
+        catch
+        {
+            connection.Dispose();
+            throw;
+        }
+    }
+
+    private async Task PollAsync(GitHubListenerLane lane)
+    {
+        using var cancellation = CancellationTokenSource.CreateLinkedTokenSource(_polls.Token, _ownership.OwnershipLost);
+        var token = cancellation.Token;
+        var rotation = _clock.GetUtcNow() + RotationInterval;
+        try
+        {
+            while (!token.IsCancellationRequested)
+            {
+                if (ReadCredentialCooldown() is not null)
+                {
+                    await Task.Delay(PollRetry, _clock, token).ConfigureAwait(false);
+                    continue;
+                }
+                if (_clock.GetUtcNow() >= rotation)
+                {
+                    Volatile.Write(ref _listenerResult, await lane.RotateAsync(token).ConfigureAwait(false));
+                    rotation = _clock.GetUtcNow() + RotationInterval;
+                }
+
+                var stepped = await lane.StepAsync(token).ConfigureAwait(false);
+                Volatile.Write(ref _listenerResult, stepped);
+                if (stepped.Status == GitHubListenerLaneStatus.Stopped)
+                {
+                    return;
+                }
+                if (stepped.Step?.Status is not (ScaleSetListenerStepStatus.MessageAcknowledged or ScaleSetListenerStepStatus.Initialized))
+                {
+                    await Task.Delay(PollRetry, _clock, token).ConfigureAwait(false);
+                }
+            }
+        }
+        catch (OperationCanceledException) when (token.IsCancellationRequested)
+        {
+        }
+        catch (Exception error) when (error is InvalidOperationException or IOException or GitHubOperationException or TimeoutException or OperationCanceledException)
+        {
+            Volatile.Write(ref _listenerResult, new GitHubListenerLaneResult(GitHubListenerLaneStatus.Failed,
+                Failure: new GitHubOperationException(GitHubOperationError.RequestFailed)));
+        }
+    }
+
+    private async Task<bool> CanOpenAsync(SessionRecord? session, CancellationToken cancellationToken)
+    {
+        if (AdmissionsStopped || _polls.IsCancellationRequested || session is not (null or { Phase: SessionPhase.Retired }) ||
+            _binding is not { } binding || await ReadCatalogAsync(allowClosing: false, cancellationToken).ConfigureAwait(false) is not { } catalog ||
+            !MatchesBound(catalog, binding) || await _store.ReadSessionAsync(_key, cancellationToken).ConfigureAwait(false) != session)
+        {
+            return false;
+        }
+        return !AdmissionsStopped && !_polls.IsCancellationRequested;
+    }
+
+    internal async Task<ListenerCapacity> ReadListenerCapacityAsync(CancellationToken cancellationToken)
+    {
+        if (AdmissionsStopped || _polls.IsCancellationRequested || _profile.State != RunnerProfileState.Active || _binding is not { } binding ||
+            await ReadCatalogAsync(allowClosing: false, cancellationToken).ConfigureAwait(false) is not { State: CatalogProfileState.Active } catalog ||
+            !MatchesBound(catalog, binding))
+        {
+            return NoAdmission;
+        }
+        var capacity = await _store.ReadListenerCapacityAsync(_key, _profile.Capacity.MaxRunners, DemandFreshness, LogFlushGrace, cancellationToken)
+            .ConfigureAwait(false);
+        return !AdmissionsStopped && !_polls.IsCancellationRequested ? capacity : NoAdmission;
+    }
+
+    private async Task<CatalogProfile?> ReadCatalogAsync(bool allowClosing, CancellationToken cancellationToken)
+    {
+        if (await ReadDurableOwnershipAsync(cancellationToken).ConfigureAwait(false) is not { } owner ||
+            await _store.ReadCatalogRolloutAsync(_key.Deployment, cancellationToken).ConfigureAwait(false) is not { Pending: null } head ||
+            head.AppliedGeneration != _generation || head.AppliedDigest != _configuration.Sha256 || head.AppliedEpoch != owner.Lease.Epoch)
+        {
+            return null;
+        }
+        var catalog = await _store.ReadCatalogProfileAsync(_key, cancellationToken).ConfigureAwait(false);
+        bool stateMatches = (_profile.State, catalog?.State) switch
+        {
+            (RunnerProfileState.Active, CatalogProfileState.Active) => true,
+            (RunnerProfileState.Draining, CatalogProfileState.Draining) => true,
+            (RunnerProfileState.Draining, CatalogProfileState.ClosureHeld) => allowClosing,
+            _ => false,
+        };
+        return catalog?.AppliedGeneration == _generation && catalog.Binding.ScopeIdentity == _scope &&
+            catalog.Binding.RunnerGroup == _runnerGroup && catalog.Binding.ScaleSet == _scaleSet && catalog.Binding.Labels.SequenceEqual(_labels) &&
+            (_profile.GitHub.ScaleSetId is null || _profile.GitHub.ScaleSetId == catalog.Binding.ScaleSetId) &&
+            stateMatches && ReadLocalOwnership() is { } current && current.Lease.Fence == owner.Lease.Fence ? catalog : null;
+    }
+
+    private GitHubRegistrationLease? ReadLocalOwnership() => _ownership.ReadAuthority() is { } authority && authority.Lease.Deployment == _key.Deployment
+        ? new GitHubRegistrationLease(authority.Lease, _generation, authority.Clock) : null;
+
+    private async Task<GitHubRegistrationLease?> ReadDurableOwnershipAsync(CancellationToken cancellationToken)
+    {
+        var read = await _store.ReadLeaseAsync(_key.Deployment, cancellationToken).ConfigureAwait(false);
+        return read is { Mode: ControllerLeaseMode.Active } && ReadLocalOwnership() is { } local && local.Lease.Fence == read.Fence
+            ? local with { Lease = read } : null;
+    }
+
+    private Task<GitHubRegistrationLease?> ReadListenerOwnershipAsync(CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        return Task.FromResult(ReadLocalOwnership());
+    }
+
+    private GitHubScaleSetBinding? FromCatalog(CatalogProfile catalog) =>
+        catalog.Binding is { RunnerGroupId: long group, ScaleSetId: long set } ?
+            new GitHubScaleSetBinding(_github.ScopeUrl, _profile.GitHub.RunnerGroup, group, _profile.GitHub.ScaleSet, set, _profile.GitHub.Labels) : null;
+
+    private static bool MatchesBound(CatalogProfile catalog, GitHubScaleSetBinding binding) =>
+        catalog.Binding.RunnerGroupId == binding.RunnerGroupId && catalog.Binding.ScaleSetId == binding.ScaleSetId;
+
+    public void Dispose()
+    {
+        if (Interlocked.Exchange(ref _disposed, 1) == 0)
+        {
+            _ = DisposeResourcesAsync();
+        }
+    }
+
+    private async Task DisposeResourcesAsync()
+    {
+        await _admissions.CancelAsync().ConfigureAwait(false);
+        await _polls.CancelAsync().ConfigureAwait(false);
+        await JoinMutatorsAsync(CancellationToken.None).ConfigureAwait(false);
+        _lane?.Dispose();
+        _connection?.Dispose();
+        _serial.Dispose();
+        _admissions.Dispose();
+        _polls.Dispose();
+    }
+}

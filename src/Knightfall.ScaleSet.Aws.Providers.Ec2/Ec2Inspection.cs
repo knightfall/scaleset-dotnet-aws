@@ -69,6 +69,8 @@ public sealed record Ec2InventoryEntry(
     bool IsAuthoritative = true)
 {
     public Ec2InstanceState State => IsAuthoritative && Incarnation.HasValue ? ReportedState : Ec2InstanceState.Unknown;
+
+    public string? InstanceProfileArn { get; init; }
 }
 
 public sealed record Ec2InventorySnapshot(

@@ -1,3 +1,4 @@
+using System.Collections.Immutable;
 using Knightfall.ScaleSet.Aws.Core.Lifecycle;
 using Knightfall.ScaleSet.Aws.Handoff;
 
@@ -25,3 +26,5 @@ public sealed record JitHandoffSnapshot(
 }
 
 public sealed record JitHandoffChange(LifecycleWriteOutcome Outcome, JitHandoffSnapshot? Handoff = null);
+
+public sealed record JitHandoffPage(ImmutableArray<JitHandoffSnapshot> Handoffs, string? Continuation);

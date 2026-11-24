@@ -43,7 +43,7 @@ public sealed class TelemetrySettings
     {
         var read = readEnvironment ?? Environment.GetEnvironmentVariable;
         bool disabled = ReadBoolean(read("OTEL_SDK_DISABLED"), "OTEL_SDK_DISABLED");
-        var attributes = Resource(read, runtime);
+        var attributes = Resource(read);
         var commonEndpoint = ReadUri(read(Exporter + "ENDPOINT"), Exporter + "ENDPOINT");
         var commonProtocol = ReadProtocol(read(Exporter + "PROTOCOL"), Exporter + "PROTOCOL") ?? TelemetryProtocol.Grpc;
         int commonTimeout = ReadMilliseconds(read(Exporter + "TIMEOUT"), 3_000, minimum: 1, maximum: 5_000, Exporter + "TIMEOUT");
@@ -56,8 +56,23 @@ public sealed class TelemetrySettings
         double ratio = ReadTraceRatio(read);
         int interval = ReadMilliseconds(read("OTEL_METRIC_EXPORT_INTERVAL"), 30_000, minimum: 1_000,
             maximum: 3_600_000, "OTEL_METRIC_EXPORT_INTERVAL");
-        return new TelemetrySettings(disabled, attributes, ReadProfiles(runtime), disabled ? null : traces, disabled ? null : metrics,
+        var settings = new TelemetrySettings(disabled, attributes, FrozenDictionary<string, string>.Empty,
+            disabled ? null : traces, disabled ? null : metrics,
             disabled ? null : logs, ratio, interval);
+        return runtime is null ? settings : settings.WithRuntimeConfiguration(runtime);
+    }
+
+    internal TelemetrySettings WithRuntimeConfiguration(RuntimeConfiguration runtime)
+    {
+        var attributes = new Dictionary<string, object>(ResourceAttributes, StringComparer.Ordinal)
+        {
+            ["scaleset.deployment.name"] = runtime.EnvironmentName,
+            ["cloud.provider"] = "aws",
+            ["cloud.account.id"] = runtime.Aws.Account,
+            ["cloud.region"] = runtime.Aws.Region,
+        };
+        return new TelemetrySettings(IsDisabled, attributes.ToFrozenDictionary(StringComparer.Ordinal), ReadProfiles(runtime),
+            Traces, Metrics, Logs, TraceRatio, MetricIntervalMilliseconds);
     }
 
     private static TelemetryEndpoint? ReadEndpoint(Func<string, string?> read, TelemetrySignal signal, CommonSettings common, Uri? endpointOverride)
@@ -90,7 +105,7 @@ public sealed class TelemetrySettings
         return new TelemetryEndpoint(signal, protocol, wireEndpoint, TimeSpan.FromMilliseconds(timeout), headers);
     }
 
-    private static FrozenDictionary<string, object> Resource(Func<string, string?> read, RuntimeConfiguration? runtime)
+    private static FrozenDictionary<string, object> Resource(Func<string, string?> read)
     {
         const string nameKey = "OTEL_SERVICE_NAME";
         const string resourceKey = "OTEL_RESOURCE_ATTRIBUTES";
@@ -122,27 +137,17 @@ public sealed class TelemetrySettings
             ["service.instance.id"] = InstanceId,
             ["deployment.environment.name"] = tier,
         };
-        if (runtime is not null)
-        {
-            attributes["scaleset.deployment.name"] = runtime.EnvironmentName;
-            attributes["cloud.provider"] = "aws";
-            attributes["cloud.account.id"] = runtime.Aws.Account;
-            attributes["cloud.region"] = runtime.Aws.Region;
-        }
         return attributes.ToFrozenDictionary(StringComparer.Ordinal);
     }
 
-    private static FrozenDictionary<string, string> ReadProfiles(RuntimeConfiguration? runtime)
+    private static FrozenDictionary<string, string> ReadProfiles(RuntimeConfiguration runtime)
     {
         var profiles = new Dictionary<string, string>(StringComparer.Ordinal);
-        if (runtime is not null)
+        foreach (var profile in runtime.Profiles)
         {
-            foreach (var profile in runtime.Profiles)
+            if (TelemetryProfile.From(profile) is { } identity)
             {
-                if (TelemetryProfile.From(profile) is { } identity)
-                {
-                    profiles.Add(identity.Id, identity.Provider);
-                }
+                profiles.Add(identity.Id, identity.Provider);
             }
         }
         return profiles.ToFrozenDictionary(StringComparer.Ordinal);

@@ -127,7 +127,10 @@ public sealed partial class Ec2ProfileInspector
             version is long verifiedVersion && original is { } initial
             ? Ec2ExecutorIncarnation.Compute(target.Aws.Account, target.Aws.Region, instance.InstanceId, initial, verifiedVersion) : null;
         return new Ec2InventoryEntry(instance.InstanceId, resourceArn, GetReportedState(instance.State),
-            allocation, nativeTemplate, version, original, incarnation);
+            allocation, nativeTemplate, version, original, incarnation)
+        {
+            InstanceProfileArn = instance.IamInstanceProfile?.Arn,
+        };
     }
 
     private static Dictionary<string, string>? ReadOwnershipTags(List<Tag>? source)

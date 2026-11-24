@@ -39,15 +39,17 @@ internal sealed class Ec2InspectionFixture : IDisposable
     internal const string Namespace = "http://ec2.amazonaws.com/doc/2016-11-15/";
 
     private readonly AwsWireTransport _wire;
+    private readonly TimeProvider _clock;
 
-    internal Ec2InspectionFixture(string ec2Region = Region)
+    internal Ec2InspectionFixture(string ec2Region = Region, TimeProvider? clock = null)
     {
         _wire = new AwsWireTransport(Respond);
+        _clock = clock ?? new FixtureClock();
         var ec2 = _wire.Configure(new AmazonEC2Config());
         ec2.AuthenticationRegion = ec2Region;
         Inspector = new Ec2ProfileInspector(AwsWireTransport.Credentials, ec2,
             _wire.Configure(new AmazonIdentityManagementServiceConfig()),
-            _wire.Configure(new AmazonSecurityTokenServiceConfig()), new FixtureClock());
+            _wire.Configure(new AmazonSecurityTokenServiceConfig()), _clock);
     }
 
     internal Ec2ProfileInspector Inspector { get; }
@@ -59,7 +61,7 @@ internal sealed class Ec2InspectionFixture : IDisposable
         ec2.AllowAutoRedirect = false;
         return new Ec2EffectProvider(configuration, new LifecycleProfile(RunnerOwnershipTags.DeploymentIdentity(configuration), ProfileId), AwsWireTransport.Credentials,
             ec2, _wire.Configure(new AmazonIdentityManagementServiceConfig()),
-            _wire.Configure(new AmazonSecurityTokenServiceConfig()), new FixtureClock());
+            _wire.Configure(new AmazonSecurityTokenServiceConfig()), _clock);
     }
     internal IReadOnlyList<AwsWireRequest> WireRequests => _wire.Requests;
     internal NameValueCollection[] Requests => _wire.Requests.Select(ParseQuery).ToArray();
@@ -244,11 +246,13 @@ internal sealed class Ec2InspectionFixture : IDisposable
     }
 
     internal static string Instance(string id = Instance1, string state = "running", int code = 16, string version = "12",
-        string lastLaunch = OriginalLaunch, string? originalLaunch = OriginalLaunch, string profile = ProfileId, string allocation = Allocation)
+        string lastLaunch = OriginalLaunch, string? originalLaunch = OriginalLaunch, string profile = ProfileId, string allocation = Allocation,
+        string? instanceProfileArn = null)
     {
         string network = originalLaunch is null ? string.Empty : $"""
             <networkInterfaceSet><item><attachment><deviceIndex>0</deviceIndex><attachTime>{originalLaunch}</attachTime></attachment></item></networkInterfaceSet>
             """;
+        string credential = instanceProfileArn is null ? string.Empty : $"<iamInstanceProfile><arn>{instanceProfileArn}</arn></iamInstanceProfile>";
         return FormattableString.Invariant($"""
             <item><instanceId>{id}</instanceId><launchTime>{lastLaunch}</launchTime>
               <instanceState><code>{code}</code><name>{state}</name></instanceState>
@@ -259,7 +263,7 @@ internal sealed class Ec2InspectionFixture : IDisposable
                 <item><key>scaleset-aws:allocation</key><value>{allocation}</value></item>
                 <item><key>aws:ec2launchtemplate:id</key><value>{TemplateId}</value></item>
                 <item><key>aws:ec2launchtemplate:version</key><value>{version}</value></item>
-              </tagSet>{network}
+              </tagSet>{network}{credential}
             </item>
             """);
     }

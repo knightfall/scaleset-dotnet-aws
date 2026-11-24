@@ -15,6 +15,26 @@ public sealed partial class DynamoDbLifecycleStore
         PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
     };
 
+    /// <summary>Resolves an existing deployment claim and confirms its exact executor binding.</summary>
+    public async Task<ExecutorBinding?> ReadExecutorBindingForResourceAsync(
+        string deployment, string resourceArn, CancellationToken cancellationToken)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(deployment);
+        ArgumentException.ThrowIfNullOrWhiteSpace(resourceArn);
+        var claim = await ReadRecordAsync(LifecycleKey.Claim("aws-resource#" + resourceArn), cancellationToken).ConfigureAwait(false);
+        if (claim is null)
+        {
+            return null;
+        }
+        var binding = ParseExecutorRecord<ExecutorBinding>(claim);
+        if (binding.Profile.Deployment != deployment || binding.ResourceArn != resourceArn)
+        {
+            return null;
+        }
+        var executor = await ReadExecutorAsync(binding.Profile, binding.AllocationId, cancellationToken).ConfigureAwait(false);
+        return executor?.Binding == binding ? binding : null;
+    }
+
     public async Task<ExecutorSnapshot?> ReadExecutorAsync(
         LifecycleProfile profile, string allocationId, CancellationToken cancellationToken)
     {
@@ -207,13 +227,7 @@ public sealed partial class DynamoDbLifecycleStore
     public async Task<ListenerCapacity> ReadListenerCapacityAsync(
         LifecycleProfile profile, int maximum, TimeSpan freshness, TimeSpan logFlushGrace, CancellationToken cancellationToken)
     {
-        var demandRecord = await ReadRecordAsync(LifecycleKey.Demand(profile), cancellationToken).ConfigureAwait(false);
-        var demand = demandRecord is null ? null : ParseExecutorRecord<SessionDemandObservation>(demandRecord);
-        var session = await ReadSessionAsync(profile, cancellationToken).ConfigureAwait(false);
-        if (session?.Phase != SessionPhase.Active || session.SessionId != demand?.SessionId)
-        {
-            demand = null;
-        }
+        var (demandRecord, demand, _) = await ReadDemandEnvelopeAsync(profile, cancellationToken).ConfigureAwait(false);
         var inventory = await ReadExecutorInventoryAsync(profile, cancellationToken).ConfigureAwait(false);
         var capacity = ExecutorClassifier.ProjectListenerCapacity(
             inventory, demand, maximum, _timeProvider.GetUtcNow(), freshness, logFlushGrace);
@@ -225,6 +239,24 @@ public sealed partial class DynamoDbLifecycleStore
                 new LifecycleRecordCondition(LifecycleKey.RunnerInventory(profile), inventory.Revision),
             ],
         };
+    }
+
+    /// <summary>Returns demand from an active session under the supplied owner fence.</summary>
+    public async Task<SessionDemandObservation?> ReadCurrentSessionDemandAsync(
+        LifecycleProfile profile, DeploymentLeaseFence lease, CancellationToken cancellationToken)
+    {
+        RequireProfileLease(profile, lease);
+        var (_, demand, owner) = await ReadDemandEnvelopeAsync(profile, cancellationToken).ConfigureAwait(false);
+        return owner == lease ? demand : null;
+    }
+
+    private async Task<(LifecycleRecord? Record, SessionDemandObservation? Demand, DeploymentLeaseFence? Owner)> ReadDemandEnvelopeAsync(
+        LifecycleProfile profile, CancellationToken cancellationToken)
+    {
+        var record = await ReadRecordAsync(LifecycleKey.Demand(profile), cancellationToken).ConfigureAwait(false);
+        var demand = record is null ? null : ParseExecutorRecord<SessionDemandObservation>(record);
+        var session = await ReadSessionAsync(profile, cancellationToken).ConfigureAwait(false);
+        return (record, session is { Phase: SessionPhase.Active } && session.SessionId == demand?.SessionId ? demand : null, session?.Owner);
     }
 
     private async Task<LifecycleWriteOutcome> UpdateExecutorAsync(

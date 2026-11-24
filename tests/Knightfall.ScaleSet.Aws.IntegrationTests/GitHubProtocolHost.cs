@@ -7,6 +7,7 @@ using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Hosting.Server;
 using Microsoft.AspNetCore.Hosting.Server.Features;
+using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Server.Kestrel.Core;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
@@ -23,20 +24,21 @@ internal sealed class GitHubProtocolHost : IAsyncDisposable
 
     private readonly WebApplication _app;
     private readonly X509Certificate2 _certificate;
-    private readonly IPAddress _address;
-    private readonly int _port;
-
     private GitHubProtocolHost(WebApplication app, X509Certificate2 certificate)
     {
         _app = app;
         _certificate = certificate;
         var listening = app.Services.GetRequiredService<IServer>().Features.Get<IServerAddressesFeature>()!.Addresses.Single();
         var endpoint = new Uri(listening);
-        _address = IPAddress.Parse(endpoint.Host);
-        _port = endpoint.Port;
+        Port = endpoint.Port;
     }
 
-    internal static async Task<GitHubProtocolHost> StartAsync(GitHubSimulator simulator, CancellationToken cancellationToken)
+    internal int Port { get; }
+
+    internal string Fingerprint => _certificate.GetCertHashString(HashAlgorithmName.SHA256);
+
+    internal static async Task<GitHubProtocolHost> StartAsync(GitHubSimulator simulator, CancellationToken cancellationToken,
+        Func<HttpContext, Task>? beforeRequest = null)
     {
         var certificate = CreateCertificate();
         var builder = WebApplication.CreateSlimBuilder();
@@ -54,6 +56,17 @@ internal sealed class GitHubProtocolHost : IAsyncDisposable
         var app = builder.Build();
         try
         {
+            if (beforeRequest is not null)
+            {
+                app.Use(async (context, next) =>
+                {
+                    await beforeRequest(context).ConfigureAwait(false);
+                    if (!context.RequestAborted.IsCancellationRequested)
+                    {
+                        await next(context).ConfigureAwait(false);
+                    }
+                });
+            }
             simulator.Map(app);
             await app.StartAsync(cancellationToken).ConfigureAwait(false);
             return new GitHubProtocolHost(app, certificate);
@@ -66,9 +79,10 @@ internal sealed class GitHubProtocolHost : IAsyncDisposable
         }
     }
 
-    internal HttpClient CreateClient()
+    internal HttpClient CreateClient() => CreateClient(Port, Fingerprint);
+
+    internal static HttpClient CreateClient(int port, string fingerprint)
     {
-        string fingerprint = _certificate.GetCertHashString(HashAlgorithmName.SHA256);
         return new HttpClient(new RequireHttp2(new SocketsHttpHandler
         {
             UseProxy = false,
@@ -79,7 +93,7 @@ internal sealed class GitHubProtocolHost : IAsyncDisposable
                     cert is not null && cert.GetCertHashString(HashAlgorithmName.SHA256) == fingerprint &&
                     errors is SslPolicyErrors.None or SslPolicyErrors.RemoteCertificateChainErrors,
             },
-            ConnectCallback = ConnectAsync,
+            ConnectCallback = (context, token) => ConnectAsync(context, port, token),
         }))
         {
             Timeout = TimeSpan.FromSeconds(10),
@@ -92,7 +106,7 @@ internal sealed class GitHubProtocolHost : IAsyncDisposable
         _certificate.Dispose();
     }
 
-    private async ValueTask<Stream> ConnectAsync(SocketsHttpConnectionContext context, CancellationToken cancellationToken)
+    private static async ValueTask<Stream> ConnectAsync(SocketsHttpConnectionContext context, int port, CancellationToken cancellationToken)
     {
         if (context.DnsEndPoint.Port != 443 || !Hosts.Contains(context.DnsEndPoint.Host, StringComparer.OrdinalIgnoreCase) ||
             context.InitialRequestMessage.RequestUri?.Scheme != Uri.UriSchemeHttps)
@@ -102,7 +116,7 @@ internal sealed class GitHubProtocolHost : IAsyncDisposable
         var socket = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
         try
         {
-            await socket.ConnectAsync(_address, _port, cancellationToken).ConfigureAwait(false);
+            await socket.ConnectAsync(IPAddress.Loopback, port, cancellationToken).ConfigureAwait(false);
             return new NetworkStream(socket, ownsSocket: true);
         }
         catch

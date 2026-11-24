@@ -47,8 +47,11 @@ public sealed class Ec2StateChangeConsumer
         _instanceArnPrefix = $"arn:{partition}:ec2:{_aws.Region}:{_aws.Account}:instance/";
     }
 
-    public async Task<int> ReceiveOnceAsync(
-        Func<Ec2StateChangeHint, CancellationToken, Task<bool>> refresh, CancellationToken cancellationToken)
+    public Task<int> ReceiveOnceAsync(Func<Ec2StateChangeHint, CancellationToken, Task<bool>> refresh, CancellationToken cancellationToken) =>
+        ReceiveOnceAsync(refresh, null, cancellationToken);
+
+    public async Task<int> ReceiveOnceAsync(Func<Ec2StateChangeHint, CancellationToken, Task<bool>> refresh,
+        Func<CancellationToken, Task<bool>>? authorizeAcknowledgement, CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(refresh);
         ReceiveMessageResponse response;
@@ -80,9 +83,15 @@ public sealed class Ec2StateChangeConsumer
                 process?.Complete("deferred", "readback_not_accepted");
                 continue;
             }
+            if (authorizeAcknowledgement is not null && !await authorizeAcknowledgement(cancellationToken).ConfigureAwait(false))
+            {
+                process?.Complete("deferred", "readback_not_accepted");
+                return acknowledged;
+            }
 
             using (var delete = Ec2Diagnostics.Start("sqs_delete", null, cancellationToken))
             {
+                cancellationToken.ThrowIfCancellationRequested();
                 await _sqs.DeleteMessageAsync(new DeleteMessageRequest { QueueUrl = _queueUrl, ReceiptHandle = receipt },
                     cancellationToken).ConfigureAwait(false);
                 delete?.Complete("success", "acknowledged");

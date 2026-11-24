@@ -1,7 +1,11 @@
 using System.Globalization;
+using System.Net;
 using System.Text;
 using System.Text.Json;
+using System.Web;
 using Knightfall.ScaleSet.Aws.Controller.Commands;
+using Knightfall.ScaleSet.Aws.Core.Configuration;
+using Knightfall.ScaleSet.Aws.Core.Planning;
 using Xunit;
 
 namespace Knightfall.ScaleSet.Aws.Core.Tests;
@@ -143,26 +147,89 @@ public sealed class DryRunCommandTests
     }
 
     [Fact]
-    public async Task RecognizesVersionPinnedS3DemandAsUnavailableOffline()
+    public async Task ReadsVersionPinnedS3DemandUsingTheVerifiedRuntimeRegion()
     {
         using var files = new TemporaryDirectory();
+        byte[] evidence = """
+            {
+              "apiVersion":"scaleset-aws/v1alpha1",
+              "kind":"RunnerDemandSnapshot",
+              "environment":"engineering-dev",
+              "aws":{"account":"111122223333","region":"ap-southeast-2"},
+              "records":[{
+                "profileId":"linux-ec2-build",
+                "scopeURL":"https://github.com/example-engineering",
+                "runnerGroup":"Linux-EC2-Arm",
+                "scaleSet":"linux-ec2-build",
+                "scaleSetId":"9223372036854775807",
+                "observedAt":"2026-01-01T00:00:00Z",
+                "demand":{"totalAssignedJobs":1}
+              }]
+            }
+            """u8.ToArray();
         var config = ConfigurationFixtures.EditRuntime(ConfigurationFixtures.Ec2Pinned,
             ConfigurationEdit.Set("/spec/dryRun/demand", new
             {
                 type = "snapshot",
-                s3Uri = "s3://runner-snapshots/demand.json",
-                versionId = "version-123",
-                sha256 = new string('a', 64),
+                s3Uri = RuntimeArtifactTests.S3Uri,
+                versionId = RuntimeArtifactTests.Version,
+                sha256 = ConfigurationFixtures.Sha256(evidence),
             }));
         var path = files.Write("runtime.json", config);
+        using var wire = new VersionedS3Wire(evidence, RuntimeArtifactTests.Version);
+        var clock = new FixedTimeProvider(new DateTimeOffset(2026, 1, 1, 0, 3, 0, TimeSpan.Zero));
+        await using var stdout = new StringWriter(CultureInfo.InvariantCulture);
+        await using var stderr = new StringWriter(CultureInfo.InvariantCulture);
 
-        var result = await RunAsync(
-            ["reconcile", "--config", path, "--dry-run", "--once", "--sha256", ConfigurationFixtures.Sha256(config)]);
+        int exit = await DryRunCommand.RunAsync(
+            ["reconcile", "--config", path, "--dry-run", "--once", "--sha256", ConfigurationFixtures.Sha256(config)],
+            stdout, stderr, region =>
+            {
+                Assert.Equal("ap-southeast-2", region);
+                return wire.CreateClient();
+            }, _ => null, inspectInventory: null, clock, TestContext.Current.CancellationToken);
 
-        Assert.Equal(1, result.ExitCode);
-        Assert.Empty(result.Output);
-        Assert.Contains("S3 snapshots require", result.Error, StringComparison.Ordinal);
-        Assert.DoesNotContain("runner-snapshots", result.Error, StringComparison.Ordinal);
+        Assert.True(exit == 0, stderr.ToString());
+        Assert.Empty(stderr.ToString());
+        var request = Assert.Single(wire.Requests);
+        Assert.Equal(HttpMethod.Get, request.Method);
+        Assert.Equal(RuntimeArtifactTests.Version, HttpUtility.ParseQueryString(request.Uri.Query)["versionId"]);
+        using var report = JsonDocument.Parse(stdout.ToString());
+        Assert.Equal("snapshot", report.RootElement.GetProperty("demandSource").GetString());
+        var profile = Assert.Single(report.RootElement.GetProperty("profiles").EnumerateArray());
+        Assert.Equal(1, profile.GetProperty("capacity").GetProperty("totalAssignedJobs").GetInt32());
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task ActiveDocumentCanOnlyInvokeTheOptionalReadOnlyInventoryGraph(bool inspect)
+    {
+        byte[] config = ConfigurationFixtures.EditRuntime(ConfigurationFixtures.Mixed,
+            ConfigurationEdit.Set("/spec/dryRun/inspectAws", inspect));
+        using var wire = new VersionedS3Wire(config, RuntimeArtifactTests.Version);
+        await using var stdout = new StringWriter(CultureInfo.InvariantCulture);
+        await using var stderr = new StringWriter(CultureInfo.InvariantCulture);
+        int inspected = 0;
+
+        int exit = await DryRunCommand.RunAsync(
+            ["reconcile", "--config-s3-uri", RuntimeArtifactTests.S3Uri, "--config-version-id", RuntimeArtifactTests.Version,
+             "--sha256", ConfigurationFixtures.Sha256(config), "--dry-run", "--once"],
+            stdout, stderr, _ => wire.CreateClient(), _ => null, (configuration, _) =>
+            {
+                Assert.Equal(ControllerMode.Active, configuration.Mode);
+                inspected++;
+                return Task.FromResult<IReadOnlyDictionary<string, InventorySample>?>(
+                    new Dictionary<string, InventorySample>(StringComparer.Ordinal));
+            }, timeProvider: null, TestContext.Current.CancellationToken);
+
+        Assert.Equal(0, exit);
+        Assert.Empty(stderr.ToString());
+        Assert.Equal(inspect ? 1 : 0, inspected);
+        var request = Assert.Single(wire.Requests);
+        Assert.Equal(HttpMethod.Get, request.Method);
+        using var report = JsonDocument.Parse(stdout.ToString());
+        Assert.Equal(inspect, report.RootElement.GetProperty("inspection").GetProperty("performed").GetBoolean());
     }
 
     private static async Task<(int ExitCode, string Output, string Error)> RunAsync(

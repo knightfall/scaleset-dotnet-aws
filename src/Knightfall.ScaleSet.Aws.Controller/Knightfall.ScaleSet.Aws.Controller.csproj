@@ -2,18 +2,36 @@
   <PropertyGroup>
     <TargetFramework>net10.0</TargetFramework>
     <OutputType>Exe</OutputType>
+    <UseAppHost>false</UseAppHost>
+    <EnableSdkContainerSupport>true</EnableSdkContainerSupport>
+    <!-- Microsoft .NET 10.0.11 Noble chiseled-extra, multi-architecture digest. -->
+    <ContainerBaseImage>mcr.microsoft.com/dotnet/aspnet@sha256:f5b3b2e2e548828d50e349726f51a5de001286f02c4bbde77db0dd34eb9f55ff</ContainerBaseImage>
+    <ContainerImageFormat>OCI</ContainerImageFormat>
+    <ContainerRepository>scaleset-aws-controller</ContainerRepository>
+    <ContainerUser>1654</ContainerUser>
+    <ContainerAppCommandInstruction>Entrypoint</ContainerAppCommandInstruction>
   </PropertyGroup>
   <ItemGroup>
+    <ContainerAppCommand Include="dotnet;/app/Knightfall.ScaleSet.Aws.Controller.dll" />
+    <ContainerEnvironmentVariable Include="DOTNET_EnableDiagnostics_IPC" Value="0" />
+    <EmbeddedResource Include="../../cdk/config/schema/*.json" LogicalName="Knightfall.ScaleSet.Aws.Controller.Schemas.%(Filename)%(Extension)" />
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+    <InternalsVisibleTo Include="Knightfall.ScaleSet.Aws.Core.Tests" />
     <InternalsVisibleTo Include="Knightfall.ScaleSet.Aws.Telemetry.Tests" />
+    <InternalsVisibleTo Include="Knightfall.ScaleSet.Aws.Lifecycle.Tests" />
     <ProjectReference Include="../Knightfall.ScaleSet.Aws.Core/Knightfall.ScaleSet.Aws.Core.csproj" />
     <ProjectReference Include="../Knightfall.ScaleSet.Aws.DynamoDb/Knightfall.ScaleSet.Aws.DynamoDb.csproj" />
     <ProjectReference Include="../Knightfall.ScaleSet.Aws.GitHub/Knightfall.ScaleSet.Aws.GitHub.csproj" />
     <ProjectReference Include="../Knightfall.ScaleSet.Aws.Handoff/Knightfall.ScaleSet.Aws.Handoff.csproj" />
+    <ProjectReference Include="../Knightfall.ScaleSet.Aws.Providers.Ec2/Knightfall.ScaleSet.Aws.Providers.Ec2.csproj" />
+    <ProjectReference Include="../Knightfall.ScaleSet.Aws.Providers.Fargate/Knightfall.ScaleSet.Aws.Providers.Fargate.csproj" />
     <PackageReference Include="AWSSDK.Core" />
     <PackageReference Include="AWSSDK.DynamoDBv2" />
+    <PackageReference Include="AWSSDK.EC2" />
     <PackageReference Include="AWSSDK.ECS" />
     <PackageReference Include="AWSSDK.IdentityManagement" />
     <PackageReference Include="AWSSDK.S3" />
+    <PackageReference Include="AWSSDK.SecretsManager" />
     <PackageReference Include="AWSSDK.SecurityToken" />
     <PackageReference Include="AWSSDK.SQS" />
     <PackageReference Include="Microsoft.Extensions.Hosting" />

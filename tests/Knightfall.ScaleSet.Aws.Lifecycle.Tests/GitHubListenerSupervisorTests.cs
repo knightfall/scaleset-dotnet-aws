@@ -29,6 +29,31 @@ public sealed class GitHubListenerSupervisorTests
     private static readonly GitHubListenerTiming Timing = new(TimeSpan.FromSeconds(5), TimeSpan.FromSeconds(25), TimeSpan.FromSeconds(15));
     private static readonly ListenerCapacity Capacity = new(8, 0);
 
+    [Fact]
+    public async Task ExistingLaneHonorsCooldownRecordedByAnotherCredentialConsumer()
+    {
+        var token = TestContext.Current.CancellationToken;
+        using var table = await MiniStackTable.CreateAsync(token);
+        var clock = new ContractClock();
+        var store = new DynamoDbLifecycleStore(table.Client, table.Name, clock);
+        var configuration = await ConfigurationAsync(token);
+        var lease = await AcquireActiveAsync(store, configuration, clock, MiniStackTable.FirstTask, token);
+        var cooldown = new GitHubCredentialCooldown(clock, Timing.UnauthorizedCooldown);
+        using var wire = new GitHubWire((_, _) => throw new InvalidOperationException("A cooled-down lane sent a GitHub request."));
+        using var http = new HttpClient(wire, disposeHandler: false);
+        var connection = await ConnectAsync(configuration, http, clock, token);
+        using var lane = new GitHubListenerSupervisor(store, clock, Timing, rotation: null, cooldown)
+            .Register(Definition(configuration, FirstProfile, connection, lease, clock));
+
+        cooldown.Record(configuration.GitHub["engineering"].SecretArn,
+            new GitHubOperationException(GitHubOperationError.RequestFailed, statusCode: 401));
+        var step = await lane.StepAsync(token);
+
+        Assert.Equal(GitHubListenerLaneStatus.Waiting, step.Status);
+        Assert.Equal(clock.Now + Timing.UnauthorizedCooldown, step.RetryAt);
+        Assert.Empty(wire.Requests);
+    }
+
     [Theory]
     [InlineData("confirmed")]
     [InlineData("lost")]

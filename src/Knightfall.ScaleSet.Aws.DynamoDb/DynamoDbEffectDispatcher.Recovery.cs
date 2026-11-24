@@ -44,6 +44,51 @@ public sealed partial class DynamoDbEffectDispatcher
             : Task.FromResult(new EffectReconciliationPass(LifecycleWriteOutcome.LeaseRejected, 0, 0, 0, null));
     }
 
+    /// <summary>Cancels inherited, provably unstarted runner launches before opening a session or planning in this epoch.</summary>
+    public async Task<bool> CancelInheritedLaunchesAsync(ControllerLeaseOwnership ownership,
+        IReadOnlyCollection<LifecycleProfile> configured, CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(ownership);
+        ArgumentNullException.ThrowIfNull(configured);
+        if (ownership.ReadAuthority() is not { } initial)
+        {
+            return false;
+        }
+
+        var deployment = initial.Lease.Deployment;
+        if (configured.Any(profile => profile.Deployment != deployment))
+        {
+            throw new ArgumentException("Startup profiles must belong to the controller deployment.", nameof(configured));
+        }
+        var durable = await _store.ReadEffectProfilesAsync(deployment, cancellationToken).ConfigureAwait(false);
+        foreach (var profile in configured.Concat(durable).Distinct())
+        {
+            EffectCandidateCursor? continuation = null;
+            do
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                if (ownership.ReadAuthority() is not { } current)
+                {
+                    return false;
+                }
+
+                var pass = await RunPassAsync(current.Lease, profile, continuation, CancelPlannedLaunchAsync, cancellationToken).ConfigureAwait(false);
+                if (pass.Outcome != LifecycleWriteOutcome.Committed)
+                {
+                    return false;
+                }
+                continuation = pass.Continuation;
+            }
+            while (continuation is not null);
+        }
+        return true;
+    }
+
+    private Task<LifecycleWriteOutcome?> CancelPlannedLaunchAsync(ControllerLease lease, EffectJournalSnapshot effect,
+        CancellationToken cancellationToken) => effect.Entry.Envelope.Request is Ec2LaunchEffectRequest or FargateLaunchEffectRequest
+            ? CancelPlannedAsync(lease, effect, cancellationToken)
+            : Task.FromResult<LifecycleWriteOutcome?>(null);
+
     public async Task<bool> HasNoUnfinishedEffectsAsync(ControllerLease lease, LifecycleProfile profile, CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(lease);

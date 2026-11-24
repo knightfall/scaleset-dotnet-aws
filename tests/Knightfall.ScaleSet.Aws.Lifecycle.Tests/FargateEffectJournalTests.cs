@@ -162,6 +162,9 @@ public sealed class FargateEffectJournalTests
         var plannedReservation = Assert.Single((await ReservationsAsync(fixture, token)).Reservations);
         Assert.Equal(request.AllocationId, plannedReservation.AllocationId);
         Assert.Equal(request.CpuUnits, plannedReservation.CpuUnits);
+        Assert.Equal(fixture.Profile, plannedReservation.Profile);
+        Assert.Equal(request.ClusterArn, plannedReservation.ClusterArn);
+        Assert.Equal(request.TaskDefinitionArn, plannedReservation.TaskDefinitionArn);
         Assert.Null(plannedReservation.TaskArn);
         var provider = new FixtureProvider(fixture.Clock)
         {
@@ -174,6 +177,9 @@ public sealed class FargateEffectJournalTests
         Assert.Equal(plannedReservation.AllocationId, pendingReservation.AllocationId);
         Assert.Equal(plannedReservation.CpuUnits, pendingReservation.CpuUnits);
         Assert.Equal(plannedReservation.EligibleSubnetIds, pendingReservation.EligibleSubnetIds);
+        Assert.Equal(plannedReservation.Profile, pendingReservation.Profile);
+        Assert.Equal(plannedReservation.ClusterArn, pendingReservation.ClusterArn);
+        Assert.Equal(plannedReservation.TaskDefinitionArn, pendingReservation.TaskDefinitionArn);
         Assert.Equal(TaskArn, pendingReservation.TaskArn);
 
         fixture.Clock.Now = fixture.Clock.Now.AddSeconds(1);

@@ -26,10 +26,18 @@ function rewrite(
   );
 }
 
-function synthesize(compiled: ReturnType<typeof fixture>) {
+function synthesize(
+  compiled: ReturnType<typeof fixture>,
+  fargatePreflight?: string,
+) {
   const directory = mkdtempSync(join(tmpdir(), "scaleset-template-"));
   try {
-    const stack = synthesizeController(compiled, "9007199254740993", directory);
+    const stack = synthesizeController(
+      compiled,
+      "9007199254740993",
+      directory,
+      { fargatePreflight },
+    );
     const asset = readdirSync(directory).find((file) =>
       /^asset\..+\.json$/u.test(file),
     );
@@ -47,14 +55,15 @@ interface Statement {
   readonly Resource?: unknown;
 }
 
-function runtimePolicy(template: Template): Statement[] {
+function rolePolicy(
+  template: Template,
+  role = "ControllerTaskRole",
+): Statement[] {
   const policies = Object.entries({
     ...template.findResources("AWS::IAM::Policy"),
     ...template.findResources("AWS::IAM::ManagedPolicy"),
   });
-  const matching = policies.filter(([key]) =>
-    key.startsWith("ControllerTaskRole"),
-  );
+  const matching = policies.filter(([key]) => key.startsWith(role));
   assert.ok(matching.length > 0);
   return matching.flatMap(
     ([, policy]) => policy.Properties.PolicyDocument.Statement as Statement[],
@@ -62,8 +71,168 @@ function runtimePolicy(template: Template): Statement[] {
 }
 
 function actions(template: Template) {
-  return new Set(runtimePolicy(template).flatMap(({ Action }) => Action));
+  return new Set(rolePolicy(template).flatMap(({ Action }) => Action));
 }
+
+const shellApproval = {
+  image: `111122223333.dkr.ecr.ap-southeast-2.amazonaws.com/runner@sha256:${"a".repeat(64)}`,
+  entryPoint: ["/opt/scaleset/RunnerBootstrap"],
+  command: ["fargate", "/opt/scaleset/fargate-bootstrap.json"],
+  scratchMountPaths: ["/work"],
+};
+
+const quota = {
+  account: "111122223333",
+  region: "ap-southeast-2",
+  observedAt: "2026-11-23T10:00:00.0000001Z",
+  expiresAt: "2026-11-23T10:15:00+00:00",
+  remainingCpuUnits: 8_192,
+  reservedCpuUnits: 1_024,
+};
+
+test("explicit Fargate preflight changes only the controller task definition environment", () => {
+  const config = fixture("mixed-ec2-fargate");
+  const raw = JSON.stringify(
+    { profiles: { "linux-shell": shellApproval }, quota },
+    null,
+    2,
+  ).replace("8192", "9223372036854775807");
+  const defaultTemplate = synthesize(config);
+  const configuredTemplate = synthesize(config, raw);
+  configuredTemplate.resourceCountIs("AWS::ECS::TaskDefinition", 1);
+  configuredTemplate.hasResourceProperties("AWS::ECS::TaskDefinition", {
+    ContainerDefinitions: Match.arrayWith([
+      Match.objectLike({
+        Name: "Controller",
+        Environment: [{ Name: "SCALESET_FARGATE_PREFLIGHT", Value: raw }],
+      }),
+    ]),
+  });
+  defaultTemplate.hasResourceProperties("AWS::ECS::TaskDefinition", {
+    ContainerDefinitions: Match.arrayWith([
+      Match.objectLike({
+        Environment: Match.absent(),
+      }),
+    ]),
+  });
+  configuredTemplate.hasOutput("RuntimeConfigSha256", { Value: config.sha256 });
+  const wholeTemplate = configuredTemplate.toJSON();
+  const task = Object.values(wholeTemplate.Resources).find(
+    (entry) => (entry as { Type: string }).Type === "AWS::ECS::TaskDefinition",
+  ) as {
+    Properties: { ContainerDefinitions: [{ Environment?: unknown }] };
+  };
+  delete task.Properties.ContainerDefinitions[0].Environment;
+  assert.deepEqual(wholeTemplate, defaultTemplate.toJSON());
+});
+
+test("Fargate preflight is available in inspection mode and refuses unrelated profiles or modes", () => {
+  const mixed = fixture("mixed-ec2-fargate");
+  const inspection = rewrite(mixed, {
+    ...mixed.runtime.spec,
+    mode: "dry-run",
+    dryRun: { demand: { type: "none" }, inspectAws: true },
+  });
+  const evidence = JSON.stringify({
+    profiles: { "linux-shell": shellApproval },
+  });
+  synthesize(inspection, evidence).hasResourceProperties(
+    "AWS::ECS::TaskDefinition",
+    {
+      ContainerDefinitions: Match.arrayWith([
+        Match.objectLike({
+          Environment: [
+            { Name: "SCALESET_FARGATE_PREFLIGHT", Value: evidence },
+          ],
+        }),
+      ]),
+    },
+  );
+  const offline = rewrite(inspection, {
+    ...inspection.runtime.spec,
+    dryRun: { demand: { type: "none" }, inspectAws: false },
+  });
+  const disabled = rewrite(mixed, {
+    ...mixed.runtime.spec,
+    profiles: mixed.runtime.spec.profiles.map((profile) =>
+      profile.id === "linux-shell"
+        ? { ...profile, state: "disabled" }
+        : profile,
+    ),
+  });
+  for (const config of [offline, disabled, fixture("ec2-only-pinned")]) {
+    assert.throws(
+      () => synthesize(config, evidence),
+      /SCALESET_FARGATE_PREFLIGHT is invalid/u,
+    );
+  }
+  assert.throws(
+    () =>
+      synthesize(
+        mixed,
+        JSON.stringify({ profiles: { "linux-ec2-build": shellApproval } }),
+      ),
+    /SCALESET_FARGATE_PREFLIGHT is invalid/u,
+  );
+});
+
+test("Fargate preflight rejects invalid or oversized JSON without reflecting input", () => {
+  const config = fixture("mixed-ec2-fargate");
+  const approved = { profiles: { "linux-shell": shellApproval } };
+  const sentinel = "unexpected-value-must-stay-private";
+  const invalid = [
+    JSON.stringify({ ...approved, secrets: sentinel }),
+    JSON.stringify({
+      profiles: {
+        "linux-shell": {
+          ...shellApproval,
+          environment: { password: sentinel },
+        },
+      },
+    }),
+    JSON.stringify({
+      ...approved,
+      quota: { ...quota, account: "000000000000" },
+    }),
+    JSON.stringify({
+      ...approved,
+      quota: { ...quota, expiresAt: quota.observedAt },
+    }),
+    JSON.stringify({
+      ...approved,
+      quota: { ...quota, observedAt: "2026-02-30T01:00:00Z" },
+    }),
+    JSON.stringify({
+      ...approved,
+      quota: { ...quota, remainingCpuUnits: "8192" },
+    }),
+    JSON.stringify({ ...approved, quota }).replace(
+      "8192",
+      "9223372036854775808",
+    ),
+    JSON.stringify({ ...approved, quota }).replace("8192", "8.192e3"),
+    `{"profiles":{},"profiles":${JSON.stringify(approved.profiles)}}`,
+    JSON.stringify({
+      profiles: {
+        "linux-shell": {
+          ...shellApproval,
+          command: [`{{resolve:secretsmanager:${sentinel}}}`],
+        },
+      },
+    }),
+    JSON.stringify({
+      profiles: {
+        "linux-shell": { ...shellApproval, command: ["😀".repeat(4_096)] },
+      },
+    }),
+  ];
+  for (const input of invalid) {
+    assert.throws(() => synthesize(config, input), {
+      message:
+        "SCALESET_FARGATE_PREFLIGHT is invalid for the configured deployment.",
+    });
+  }
+});
 
 test("the versioned artifact and retained tracking table match the runtime contract", () => {
   const config = fixture("mixed-ec2-fargate");
@@ -118,7 +287,7 @@ test("the versioned artifact and retained tracking table match the runtime contr
   assert.ok(
     template.findResources("Custom::ScaleSetRuntimeArtifact")[resource],
   );
-  const read = runtimePolicy(template).find(
+  const read = rolePolicy(template).find(
     ({ Action }) => Action === "s3:GetObjectVersion",
   );
   assert.deepEqual(read?.Condition, {
@@ -133,11 +302,203 @@ test("the versioned artifact and retained tracking table match the runtime contr
     "--config-version-id",
     "--sha256",
     "--generation",
+    "--health-addr",
     "--ec2-event-queue-url",
     "--ecs-event-queue-url",
   ]) {
     assert.match(command, new RegExp(arg, "u"));
   }
+});
+
+test("the controller runs one shell-free Fargate task on the exact private network", () => {
+  const config = fixture("mixed-ec2-fargate");
+  const { spec } = config.runtime;
+  const { image, hosting } = spec.controller;
+  const network = spec.networks[hosting.network];
+  const template = synthesize(config);
+  template.resourceCountIs("AWS::ECS::Service", 1);
+  template.resourceCountIs("AWS::ECS::TaskDefinition", 1);
+  template.resourceCountIs("AWS::EC2::VPC", 0);
+  template.resourceCountIs("AWS::EC2::Subnet", 0);
+  template.resourceCountIs("AWS::EC2::SecurityGroup", 0);
+  template.resourceCountIs("AWS::ECR::Repository", 0);
+  const cluster = template.getResourceId("AWS::ECS::Cluster", {
+    Properties: { ClusterName: "engineering-dev-controller" },
+  });
+  const task = template.getResourceId("AWS::ECS::TaskDefinition");
+  template.hasResourceProperties("AWS::ECS::Service", {
+    Cluster: { "Fn::GetAtt": [cluster, "Arn"] },
+    TaskDefinition: { Ref: task },
+    LaunchType: "FARGATE",
+    PlatformVersion: "1.4.0",
+    SchedulingStrategy: "REPLICA",
+    DesiredCount: 1,
+    EnableExecuteCommand: false,
+    AvailabilityZoneRebalancing: "DISABLED",
+    DeploymentController: { Type: "ECS" },
+    DeploymentConfiguration: {
+      MinimumHealthyPercent: 0,
+      MaximumPercent: 100,
+      DeploymentCircuitBreaker: { Enable: true, Rollback: true },
+    },
+    NetworkConfiguration: {
+      AwsvpcConfiguration: {
+        AssignPublicIp: "DISABLED",
+        Subnets: network.subnets.map(({ id }) => id),
+        SecurityGroups: network.securityGroupIds,
+      },
+    },
+    LoadBalancers: Match.absent(),
+  });
+  const roles = Object.keys(template.findResources("AWS::IAM::Role"));
+  const taskRole = roles.find((role) => role.startsWith("ControllerTaskRole"));
+  const executionRole = roles.find((role) =>
+    role.startsWith("ControllerExecutionRole"),
+  );
+  assert.ok(taskRole);
+  assert.ok(executionRole);
+  const [service] = Object.values(template.findResources("AWS::ECS::Service"));
+  for (const role of ["ControllerTaskRole", "ControllerExecutionRole"]) {
+    const dependencies = service.DependsOn as string[];
+    assert.ok(dependencies.some((id) => id.startsWith(`${role}DefaultPolicy`)));
+  }
+  const logGroup = template.getResourceId("AWS::Logs::LogGroup", {
+    Properties: {
+      LogGroupName: "/ecs/engineering-dev-runner-controller",
+      RetentionInDays: 30,
+    },
+  });
+  const queues = Object.keys(template.findResources("AWS::SQS::Queue"));
+  const ec2Queue = queues.find((queue) => queue.startsWith("Ec2EventQueue"));
+  const ecsQueue = queues.find((queue) =>
+    queue.startsWith("FargateEventQueue"),
+  );
+  assert.ok(ec2Queue);
+  assert.ok(ecsQueue);
+  const outputs = template.findOutputs("*");
+  const [registryPrefix, repositoryDigest] = image.split("amazonaws.com");
+  template.hasResourceProperties("AWS::ECS::TaskDefinition", {
+    TaskRoleArn: { "Fn::GetAtt": [taskRole, "Arn"] },
+    ExecutionRoleArn: { "Fn::GetAtt": [executionRole, "Arn"] },
+    RequiresCompatibilities: ["FARGATE"],
+    NetworkMode: "awsvpc",
+    Cpu: "512",
+    Memory: "1024",
+    RuntimePlatform: {
+      CpuArchitecture: "ARM64",
+      OperatingSystemFamily: "LINUX",
+    },
+    ContainerDefinitions: [
+      Match.objectLike({
+        Image: {
+          "Fn::Join": [
+            "",
+            [registryPrefix, { Ref: "AWS::URLSuffix" }, repositoryDigest],
+          ],
+        },
+        Command: [
+          "run",
+          "--config-s3-uri",
+          outputs.RuntimeConfigUri.Value,
+          "--config-version-id",
+          outputs.RuntimeConfigVersionId.Value,
+          "--sha256",
+          config.sha256,
+          "--generation",
+          "9007199254740993",
+          "--health-addr",
+          "127.0.0.1:8080",
+          "--ec2-event-queue-url",
+          { Ref: ec2Queue },
+          "--ecs-event-queue-url",
+          { Ref: ecsQueue },
+        ],
+        Essential: true,
+        ReadonlyRootFilesystem: true,
+        StopTimeout: 90,
+        HealthCheck: {
+          Command: [
+            "CMD",
+            "dotnet",
+            "/app/Knightfall.ScaleSet.Aws.Controller.dll",
+            "healthcheck",
+          ],
+        },
+        LogConfiguration: {
+          LogDriver: "awslogs",
+          Options: {
+            "awslogs-group": { Ref: logGroup },
+            "awslogs-region": "ap-southeast-2",
+            "awslogs-stream-prefix": "controller",
+            mode: "non-blocking",
+          },
+        },
+        PortMappings: Match.absent(),
+        Secrets: Match.absent(),
+      }),
+    ],
+  });
+  const permissions = rolePolicy(template, "ControllerExecutionRole");
+  assert.deepEqual(
+    new Set(permissions.flatMap(({ Action }) => Action)),
+    new Set([
+      "ecr:BatchCheckLayerAvailability",
+      "ecr:BatchGetImage",
+      "ecr:GetDownloadUrlForLayer",
+      "ecr:GetAuthorizationToken",
+      "logs:CreateLogStream",
+      "logs:PutLogEvents",
+    ]),
+  );
+  for (const statement of permissions) {
+    const actions = [statement.Action].flat();
+    if (actions.includes("ecr:GetAuthorizationToken")) {
+      assert.deepEqual(actions, ["ecr:GetAuthorizationToken"]);
+      assert.equal(statement.Resource, "*");
+    } else if (actions.includes("ecr:BatchGetImage")) {
+      assert.match(
+        JSON.stringify(statement.Resource),
+        /:ecr:ap-southeast-2:111122223333:repository\/scaleset-dotnet-controller/u,
+      );
+    } else {
+      assert.match(
+        JSON.stringify(statement.Resource),
+        new RegExp(logGroup, "u"),
+      );
+    }
+  }
+  assert.ok(
+    [...actions(template)].every((action) => !/^(ecr|logs):/u.test(action)),
+  );
+});
+
+test("offline synth rejects unsupported Fargate task sizes and awsvpc limits", () => {
+  const config = fixture("fargate-only");
+  const { spec } = config.runtime;
+  const { controller } = spec;
+  const badSize = rewrite(config, {
+    ...spec,
+    controller: {
+      ...controller,
+      hosting: { ...controller.hosting, cpu: 512, memoryMiB: 512 },
+    },
+  });
+  assert.throws(() => synthesize(badSize), /valid Fargate size/u);
+  const key = controller.hosting.network;
+  const badNetwork = rewrite(config, {
+    ...spec,
+    networks: {
+      ...spec.networks,
+      [key]: {
+        ...spec.networks[key],
+        securityGroupIds: Array.from(
+          { length: 6 },
+          (_, index) => `sg-0000000${index}`,
+        ),
+      },
+    },
+  });
+  assert.throws(() => synthesize(badNetwork), /ECS awsvpc limits/u);
 });
 
 test("active profiles alone supply provider permissions, event rules and role-scoped bootstrap actions", () => {
@@ -171,6 +532,20 @@ test("active profiles alone supply provider permissions, event rules and role-sc
       "dynamodb:UpdateItem",
     ]) {
       assert.ok(names.has(action), `${name} grants ${action}`);
+    }
+    if (!ecs) {
+      const cluster = template.getResourceId("AWS::ECS::Cluster");
+      const describe = rolePolicy(template).filter(({ Action }) =>
+        [Action].flat().includes("ecs:DescribeTasks"),
+      );
+      assert.equal(describe.length, 1);
+      assert.deepEqual(describe[0].Condition, {
+        ArnEquals: { "ecs:cluster": { "Fn::GetAtt": [cluster, "Arn"] } },
+      });
+      assert.match(
+        JSON.stringify(describe[0].Resource),
+        /:task\/engineering-dev-controller\/\*/u,
+      );
     }
     assert.ok(!names.has("dynamodb:TransactWriteItems"));
     template.resourceCountIs(
@@ -223,8 +598,16 @@ test("dry run uses neither lifecycle mutations nor event consumers", () => {
       }),
     );
     const names = actions(template);
+    template.resourceCountIs("AWS::ECS::Service", 1);
     template.resourceCountIs("AWS::SQS::Queue", 0);
     template.resourceCountIs("AWS::Events::Rule", 0);
+    const [task] = Object.values(
+      template.findResources("AWS::ECS::TaskDefinition"),
+    );
+    const command = task.Properties.ContainerDefinitions[0].Command as string[];
+    assert.equal(command[0], "run");
+    assert.ok(!command.includes("--ec2-event-queue-url"));
+    assert.ok(!command.includes("--ecs-event-queue-url"));
     for (const action of [
       "secretsmanager:GetSecretValue",
       "iam:PassRole",
@@ -246,7 +629,7 @@ test("dry run uses neither lifecycle mutations nor event consumers", () => {
     assert.equal(names.has("ec2:DescribeInstances"), inspectAws);
     assert.equal(names.has("ecs:DescribeTaskDefinition"), inspectAws);
     assert.equal(names.has("dynamodb:GetItem"), inspectAws);
-    const reads = runtimePolicy(template).filter(
+    const reads = rolePolicy(template).filter(
       ({ Action }) => Action === "s3:GetObjectVersion",
     );
     assert.equal(reads.length, 2);
@@ -275,6 +658,10 @@ test("imports never create replacement resources and profile ordering never chan
 
   const importConfig = rewrite(original, {
     ...spec,
+    controller: {
+      ...spec.controller,
+      hosting: { ...spec.controller.hosting, cpuArchitecture: "x64" },
+    },
     tracking: { table: { type: "import", name: "existing-tracking" } },
     ecsClusters: {
       ...spec.ecsClusters,
@@ -288,7 +675,17 @@ test("imports never create replacement resources and profile ordering never chan
   imported.resourceCountIs("AWS::DynamoDB::Table", 0);
   imported.resourceCountIs("AWS::ECS::Cluster", 0);
   imported.resourceCountIs("AWS::EC2::VPC", 0);
-  imported.resourceCountIs("AWS::ECS::TaskDefinition", 0);
+  imported.resourceCountIs("AWS::ECS::TaskDefinition", 1);
+  imported.hasResourceProperties("AWS::ECS::TaskDefinition", {
+    RuntimePlatform: {
+      CpuArchitecture: "X86_64",
+      OperatingSystemFamily: "LINUX",
+    },
+  });
+  imported.hasResourceProperties("AWS::ECS::Service", {
+    Cluster:
+      "arn:aws:ecs:ap-southeast-2:111122223333:cluster/engineering-dev-controller",
+  });
   imported.hasOutput("TrackingTableName", { Value: "existing-tracking" });
 });
 
@@ -308,7 +705,13 @@ test("shared cluster aliases deduplicate creation and disabled backends contribu
         : profile,
     ),
   });
-  synthesize(sameCluster).resourceCountIs("AWS::ECS::Cluster", 1);
+  const shared = synthesize(sameCluster);
+  shared.resourceCountIs("AWS::ECS::Cluster", 1);
+  shared.hasResourceProperties("AWS::ECS::Service", {
+    Cluster: {
+      "Fn::GetAtt": [shared.getResourceId("AWS::ECS::Cluster"), "Arn"],
+    },
+  });
   const disabled = rewrite(mixed, {
     ...spec,
     profiles: spec.profiles.map((profile) =>

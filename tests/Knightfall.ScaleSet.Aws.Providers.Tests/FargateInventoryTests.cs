@@ -445,4 +445,56 @@ public sealed class FargateInventoryTests
         Assert.Equal(new FargateHeadroom(null, 0, null), aws.Inspector.EstimateHeadroom(
             knownZero with { SubnetSampleStartedAt = Now.AddMinutes(-11) }, inventory, quota, []));
     }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task PeerAttachmentCreditsOnlyAnExactFreshDeploymentReservation(bool differentCluster)
+    {
+        var token = TestContext.Current.CancellationToken;
+        using var aws = new FargateInspectionFixture
+        {
+            Ip1 = 1,
+            Ip2 = 0,
+            ListTasks = query => query.GetProperty("desiredStatus").GetString() == "STOPPED" ? ListReply([]) : ListReply([FirstTask]),
+            DescribeTasks = _ => TasksReply(TaskRow(FirstTask, FirstAllocation)),
+        };
+        var config = await ConfigurationAsync(token);
+        var observed = await aws.Inspector.ReadInventoryAsync(config, Profile, token);
+        var task = Assert.Single(observed.Tasks, observation => observation.IsOwned);
+        var inventory = observed with { Tasks = [] };
+        var peerScope = observed.Scope with
+        {
+            ProfileId = "peer-shell",
+            ClusterArn = differentCluster ? Cluster.Replace("engineering-shell", "peer-shell", StringComparison.Ordinal) : Cluster,
+            TaskDefinitionArn = DefinitionArn.Replace("linux-shell-runner:7", "peer-shell-runner:3", StringComparison.Ordinal),
+        };
+        string peerArn = differentCluster ? FirstTask.Replace("engineering-shell", "peer-shell", StringComparison.Ordinal) : FirstTask;
+        var peerTask = task with
+        {
+            ResourceArn = peerArn,
+            TaskDefinitionArn = peerScope.TaskDefinitionArn,
+            Incarnation = FargateExecutorIncarnation.Compute(peerArn, peerScope.TaskDefinitionArn, FirstAllocation),
+        };
+        var peer = observed with { Scope = peerScope, Tasks = [peerTask] };
+        var reservation = new FargateLaunchReservation(FirstAllocation, 1024, [Subnet1], peerArn) { Scope = peerScope };
+        aws.UtcNow = Now.AddSeconds(1);
+        var approved = Assert.IsType<FargateResolvedTask>((await aws.Inspector.ResolvePreflightAsync(config, Profile, Approval, token)).Task);
+        var quota = new FargateQuotaEvidence(Account, Region, aws.UtcNow, Now.AddMinutes(5), 1024, 0);
+        var held = new FargateHeadroom(0, 0, 0);
+
+        Assert.Equal(new FargateHeadroom(1, 1, 1), aws.Inspector.EstimateHeadroom(approved, inventory, quota, [reservation], [peer]));
+        Assert.Equal(held, aws.Inspector.EstimateHeadroom(approved, inventory, quota,
+            [reservation with { Scope = inventory.Scope, TaskArn = null }], [peer]));
+        Assert.Equal(held, aws.Inspector.EstimateHeadroom(approved, inventory, quota,
+            [reservation with { Scope = peerScope with { TaskDefinitionArn = DefinitionArn }, TaskArn = null }], [peer]));
+        Assert.Equal(held, aws.Inspector.EstimateHeadroom(approved, inventory, quota, [reservation with { TaskArn = SecondTask }], [peer]));
+        Assert.Equal(held, aws.Inspector.EstimateHeadroom(approved, inventory, quota, [reservation],
+            [peer with { Status = FargateInventoryStatus.Incomplete }]));
+        Assert.Equal(held, aws.Inspector.EstimateHeadroom(approved, inventory, quota, [reservation],
+            [peer with { ObservedAt = Now.AddMinutes(-11) }]));
+        var outside = peerScope with { Deployment = "other-deployment" };
+        Assert.Equal(held, aws.Inspector.EstimateHeadroom(approved, inventory, quota,
+            [reservation with { Scope = outside }], [peer with { Scope = outside }]));
+    }
 }

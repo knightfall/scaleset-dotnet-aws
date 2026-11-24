@@ -49,14 +49,17 @@ public sealed class FargateTaskEventConsumer : IDisposable
     public void Dispose() => _poll.Dispose();
 
     /// <summary>Polls one bounded batch. Owned task observations are acknowledged after the caller accepts them durably.</summary>
+    public Task PollAsync(Func<ExecutorBinding, ExecutorResourceObservation, CancellationToken, Task<bool>> apply,
+        CancellationToken cancellationToken) => PollAsync(apply, null, cancellationToken);
+
     public async Task PollAsync(Func<ExecutorBinding, ExecutorResourceObservation, CancellationToken, Task<bool>> apply,
-        CancellationToken cancellationToken)
+        Func<CancellationToken, Task<bool>>? authorizeAcknowledgement, CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(apply);
         await _poll.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
-            await PollBatchAsync(apply, cancellationToken).ConfigureAwait(false);
+            await PollBatchAsync(apply, authorizeAcknowledgement, cancellationToken).ConfigureAwait(false);
         }
         finally
         {
@@ -65,7 +68,7 @@ public sealed class FargateTaskEventConsumer : IDisposable
     }
 
     private async Task PollBatchAsync(Func<ExecutorBinding, ExecutorResourceObservation, CancellationToken, Task<bool>> apply,
-        CancellationToken cancellationToken)
+        Func<CancellationToken, Task<bool>>? authorizeAcknowledgement, CancellationToken cancellationToken)
     {
         ReceiveMessageResponse result;
         using (var receive = FargateDiagnostics.Start("sqs_receive", null, cancellationToken))
@@ -95,7 +98,10 @@ public sealed class FargateTaskEventConsumer : IDisposable
             {
                 using var invalid = FargateDiagnostics.Start("sqs_process", null, cancellationToken);
                 invalid?.Complete("rejected", "invalid_event");
-                await AcknowledgeAsync(message, cancellationToken).ConfigureAwait(false);
+                if (!await AcknowledgeAsync(message, authorizeAcknowledgement, null, cancellationToken).ConfigureAwait(false))
+                {
+                    return;
+                }
             }
         }
 
@@ -146,17 +152,27 @@ public sealed class FargateTaskEventConsumer : IDisposable
             foreach (var (message, hint) in group)
             {
                 FargateDiagnostics.RecordEventAge(identity, hint.EventTime, receivedAt);
-                await AcknowledgeAsync(message, cancellationToken, identity).ConfigureAwait(false);
+                if (!await AcknowledgeAsync(message, authorizeAcknowledgement, identity, cancellationToken).ConfigureAwait(false))
+                {
+                    return;
+                }
             }
         }
     }
 
-    private async Task AcknowledgeAsync(Message message, CancellationToken cancellationToken, TelemetryProfile? identity = null)
+    private async Task<bool> AcknowledgeAsync(Message message, Func<CancellationToken, Task<bool>>? authorizeAcknowledgement,
+        TelemetryProfile? identity, CancellationToken cancellationToken)
     {
+        if (authorizeAcknowledgement is not null && !await authorizeAcknowledgement(cancellationToken).ConfigureAwait(false))
+        {
+            return false;
+        }
+        cancellationToken.ThrowIfCancellationRequested();
         using var operation = FargateDiagnostics.Start("sqs_delete", identity, cancellationToken);
         _ = await _sqs.DeleteMessageAsync(new DeleteMessageRequest { QueueUrl = _queueUrl, ReceiptHandle = message.ReceiptHandle },
             cancellationToken).ConfigureAwait(false);
         operation?.Complete("success", "acknowledged");
+        return true;
     }
 
     private void Remember(string taskArn, long version)

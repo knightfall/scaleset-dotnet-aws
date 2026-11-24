@@ -3,18 +3,25 @@ import { readFileSync } from "node:fs";
 import { compileConfig } from "../lib/config/compiler.ts";
 import { deployController } from "../lib/infrastructure/deploy-controller.ts";
 import { deploymentArguments } from "../lib/infrastructure/deployment-input.ts";
+import { fargatePreflightEnvironmentName } from "../lib/infrastructure/fargate-preflight.ts";
 
 try {
   const { config, generation } = deploymentArguments(process.argv.slice(2));
   const env = Object.fromEntries(
     Object.entries(process.env).filter(
-      ([name]) => !name.startsWith("AWS_ENDPOINT_URL"),
+      ([name]) =>
+        !name.startsWith("AWS_ENDPOINT_URL") &&
+        name !== fargatePreflightEnvironmentName,
     ),
   );
   env.AWS_IGNORE_CONFIGURED_ENDPOINT_URLS = "true";
   env.AWS_CLI_AUTO_PROMPT = "off";
   deployController(
-    { compiled: compileConfig(readFileSync(config, "utf8")), generation },
+    {
+      compiled: compileConfig(readFileSync(config, "utf8")),
+      generation,
+      fargatePreflight: process.env[fargatePreflightEnvironmentName],
+    },
     (program, args) => {
       const result = spawnSync(program, args, {
         encoding: "utf8",
