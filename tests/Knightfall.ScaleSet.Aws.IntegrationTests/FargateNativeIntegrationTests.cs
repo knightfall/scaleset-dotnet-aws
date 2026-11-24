@@ -132,6 +132,43 @@ public sealed class FargateNativeIntegrationTests
         Assert.Equal("RUNNING", native.LastStatus);
     }
 
+    [Fact(Timeout = 35_000)]
+    public async Task PeriodicReconciliationCancelsExpiredPlanWhileItsSubnetsHaveZeroHeadroom()
+    {
+        var token = TestContext.Current.CancellationToken;
+        using var aws = await FargateNativeFixture.CreateAsync(token);
+        var lease = await aws.StartOwnerAsync(token);
+        await aws.BindScaleSetAsync(lease, 7, GitHubSimulator.SetId, token);
+        var launch = await aws.PlanLaunchAsync(lease, token);
+        string intentId = FargateNativeFixture.Intent(launch);
+        var planned = Assert.IsType<EffectJournalSnapshot>(await aws.Journal.ReadAsync(aws.Profile, intentId, token));
+        aws.Clock.Now = planned.Entry.Envelope.ProviderReplayDeadline!.Value.AddSeconds(2);
+        aws.Wire.SubnetEvidence = FargateSubnetEvidence.Zero;
+
+        var inventory = await aws.Inspector.ReadInventoryAsync(aws.Configuration, FargateNativeFixture.ProfileId, token);
+        var task = Assert.IsType<FargateResolvedTask>((await PreflightAsync(aws, aws.DefinitionArn, token)).Task);
+        var before = Assert.IsType<TrackedFargateLaunchReservations>(
+            await aws.Store.ReadTrackedFargateLaunchReservationsAsync(aws.Profile, lease.Fence, token));
+        Assert.Equal(launch.AllocationId, Assert.Single(before.Reservations).AllocationId);
+        var now = aws.Clock.Now;
+        var quota = new FargateQuotaEvidence(FargateNativeFixture.Account, FargateNativeFixture.Region,
+            now, now.AddMinutes(1), task.CpuUnits * 2, 0);
+        Assert.Equal(0, aws.Inspector.EstimateHeadroom(task, inventory, quota, []).LaunchSlots);
+
+        var observer = aws.Inspector.CreateEffectObserver(aws.Configuration, aws.Profile);
+        var pass = await aws.Dispatcher.ReconcilePassAsync(lease, aws.Clock.Proof(), aws.Profile, null, observer, recovery: null, token);
+        Assert.Equal(LifecycleWriteOutcome.Committed, pass.Outcome);
+        Assert.Equal(1, pass.Settled);
+        var settled = Assert.IsType<EffectJournalSnapshot>(await aws.Journal.ReadAsync(aws.Profile, intentId, token));
+        Assert.Equal(EffectResolutionKind.CanceledBeforeSend, settled.Entry.Resolution?.Kind);
+        Assert.Null(settled.Entry.Attempt);
+        Assert.True(settled.Entry.Envelope.Matches(planned.Entry.Envelope));
+        var after = Assert.IsType<TrackedFargateLaunchReservations>(
+            await aws.Store.ReadTrackedFargateLaunchReservationsAsync(aws.Profile, lease.Fence, token));
+        Assert.Empty(after.Reservations);
+        Assert.DoesNotContain(aws.Wire.Requests, request => request.Operation == "RunTask");
+    }
+
     private static bool HasExactStartedBy(string body, string expected)
     {
         using var request = JsonDocument.Parse(body);

@@ -138,14 +138,9 @@ public sealed partial class DynamoDbEffectDispatcher
         {
             return EffectDispatchStatus.Ineligible;
         }
-        if (envelope.Request is FargateLaunchEffectRequest { OwnershipTags: not null } &&
-            envelope.ProviderReplayDeadline - checkWindow.UpperUtcNow <= _timing.WriteReserve)
-        {
-            // An expired immutable envelope still in Planned has never authorized a send.
-            var canceled = await CancelPlannedAsync(lease, effect, token).ConfigureAwait(false);
-            return canceled == LifecycleWriteOutcome.Committed ? EffectDispatchStatus.Settled : EffectDispatchStatus.AwaitingEvidence;
-        }
-        if (checkWindow.UpperUtcNow >= firstSendDeadline)
+        if (checkWindow.UpperUtcNow >= firstSendDeadline ||
+            (envelope.Request is FargateLaunchEffectRequest { OwnershipTags: not null } &&
+                envelope.ProviderReplayDeadline - checkWindow.UpperUtcNow <= _timing.WriteReserve))
         {
             return EffectDispatchStatus.Ineligible;
         }

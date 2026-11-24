@@ -74,21 +74,53 @@ public sealed class FargateEffectJournalTests
     }
 
     [Fact]
-    public async Task PlannedLaunchPastItsImmutableCutoffReleasesOnlyItsOwnReservation()
+    public async Task PeriodicReconciliationReleasesOnlyAnExpiredPlannedLaunchReservation()
     {
         var token = TestContext.Current.CancellationToken;
         using var table = await MiniStackTable.CreateAsync(token);
         var fixture = await CreateFixtureAsync(table, token);
         var expired = Launch(fixture.Profile);
+        var later = Launch(fixture.Profile, earliest: Now.AddMinutes(1));
         var provider = new FixtureProvider(fixture.Clock);
         await PlanAsync(fixture, expired, token);
-        fixture.Clock.Now = expired.ProviderReplayDeadline!.Value.AddSeconds(1);
+        await PlanAsync(fixture, later, token);
+        fixture.Clock.Now = expired.ProviderReplayDeadline!.Value;
 
-        Assert.Equal(EffectDispatchStatus.Settled, await fixture.Dispatcher.DispatchPlannedAsync(fixture.Lease, Proof(fixture.Clock),
-            fixture.Profile, expired.IntentId, provider, fixture.Clock.Now.AddMinutes(1), CancellationToken.None, token));
+        var tooEarly = await PassAsync();
+        Assert.Equal(LifecycleWriteOutcome.Committed, tooEarly.Outcome);
+        Assert.Equal(0, tooEarly.Settled);
+        Assert.Equal(2, (await ReservationsAsync(fixture, token)).Reservations.Length);
+        fixture.Clock.Now = fixture.Clock.Now.AddSeconds(1);
+
+        var expiredPass = await PassAsync();
+        Assert.Equal(LifecycleWriteOutcome.Committed, expiredPass.Outcome);
+        Assert.Equal(1, expiredPass.Settled);
         Assert.Empty(provider.Sends);
+        Assert.Empty(provider.Probes);
         Assert.Equal(EffectResolutionKind.CanceledBeforeSend, (await ReadAsync(fixture, expired, token)).Entry.Resolution?.Kind);
-        Assert.Empty((await ReservationsAsync(fixture, token)).Reservations);
+        var remaining = Assert.Single((await ReservationsAsync(fixture, token)).Reservations);
+        Assert.Equal(Assert.IsType<FargateLaunchEffectRequest>(later.Request).AllocationId, remaining.AllocationId);
+
+        fixture.Clock.Now = fixture.Lease.ValidUntil.AddSeconds(1);
+        var acquired = await fixture.Store.TryAcquireLeaseAsync(fixture.Profile.Deployment, "next-owner", NextOwnerTask,
+            fixture.Lease.WriterProtocol, fixture.Clock.Now, fixture.Clock.Now.AddMinutes(5), token);
+        var next = Assert.IsType<ControllerLease>(acquired.Lease);
+        Assert.Equal(ControllerLeaseMode.RecoveryOnly, next.Mode);
+        var recovery = new EffectRecoveryAuthority(new ControllerLeaseRecoveryCoordinator(fixture.Store, new StoppedFenceObserver(),
+            fixture.Clock, Reserve), []);
+        EffectReconciliationPass? heldPass = null;
+        for (int pass = 0; pass < 4 && heldPass is null or { Outcome: LifecycleWriteOutcome.RebuildRequired }; pass++)
+        {
+            heldPass = await fixture.Dispatcher.ReconcilePassAsync(next, Proof(fixture.Clock), fixture.Profile, null, provider, recovery, token);
+        }
+        Assert.Equal(LifecycleWriteOutcome.Committed, heldPass?.Outcome);
+        Assert.Equal(0, heldPass?.Settled);
+        Assert.Equal(EffectState.Planned, (await ReadAsync(fixture, later, token)).Entry.State);
+        Assert.Empty(provider.Sends);
+        Assert.Empty(provider.Probes);
+
+        Task<EffectReconciliationPass> PassAsync() => fixture.Dispatcher.ReconcilePassAsync(fixture.Lease, Proof(fixture.Clock),
+            fixture.Profile, null, provider, recovery: null, token);
     }
 
     [Fact]
@@ -569,13 +601,14 @@ public sealed class FargateEffectJournalTests
             cancellationToken));
     }
 
-    private static EffectEnvelope Launch(LifecycleProfile profile, Guid? clientToken = null)
+    private static EffectEnvelope Launch(LifecycleProfile profile, Guid? clientToken = null, DateTimeOffset? earliest = null)
     {
         var allocation = Guid.NewGuid();
         var tags = new FargateLaunchOwnershipTags(RunnerOwnershipTags.ControllerValue, profile.Deployment, profile.ProfileId, allocation.ToString("D"), "v1");
         var request = new FargateLaunchEffectRequest(allocation, Cluster, Definition, [RunnerSubnet], ["sg-0123456789abcdef1"],
             TaskRole, ExecutionRole, "runner", clientToken ?? Guid.NewGuid(), tags, 1024);
-        return EffectEnvelope.Create(profile, EffectIntentIdentity.ForAllocation(request)!, 1, request, Now, Now.AddMinutes(50));
+        var start = earliest ?? Now;
+        return EffectEnvelope.Create(profile, EffectIntentIdentity.ForAllocation(request)!, 1, request, start, start.AddMinutes(50));
     }
 
     private static EffectEnvelope Stop(Fixture fixture, ExecutorBinding binding)
