@@ -20,6 +20,15 @@ dotnet run --project src/Knightfall.ScaleSet.Aws.Controller -- \
 
 For S3 runtime input, configure the AWS SDK region and credentials for the configuration bucket. S3 reads require both the supplied version and the expected bytes to match. Configuration and demand reads from S3 each support artifacts up to 64 MiB. A local demand snapshot or replay uses the local runtime file's directory to resolve relative paths. A remote demand snapshot uses its own configured S3 version and digest.
 
+The long-running controller verifies its runtime digest and requires a positive configuration generation.
+
+```sh
+dotnet run --project src/Knightfall.ScaleSet.Aws.Controller -- \
+  run --config /tmp/runner-runtime.json --sha256 "$runtime_sha256" --generation 1
+```
+
+Use `--config-s3-uri` and `--config-version-id` in place of `--config` to use a versioned S3 runtime. Event queue URLs are optional and each requires its corresponding enabled provider in active mode. A runtime configured for dry-run stays in a read-only supervision loop and reports readiness without a lease. On SIGTERM or SIGINT, the controller stops admissions and polls immediately and uses one 60-second process shutdown budget, including health listener shutdown and up to five seconds for telemetry.
+
 The controller binds health to `127.0.0.1:8080` by default. The `healthcheck` command calls `/healthz`, which reports whether process and supervision are progressing. `/readyz` reports verified configuration, lease state where ownership is required, and readiness for each profile. Use the same `--health-addr` on the controller and probe when overriding the default.
 
 ## Build the OCI archives

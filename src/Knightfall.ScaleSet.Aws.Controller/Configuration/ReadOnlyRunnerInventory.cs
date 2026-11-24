@@ -8,8 +8,13 @@ namespace Knightfall.ScaleSet.Aws.Controller.Configuration;
 
 internal static class ReadOnlyRunnerInventory
 {
+    internal static Task<IReadOnlyDictionary<string, InventorySample>?> ReadAsync(
+        RuntimeConfiguration configuration, CancellationToken cancellationToken) =>
+        ReadAsync(configuration, ControllerAwsClientConfiguration.ReadLoopbackEndpoint(
+            Environment.GetEnvironmentVariable("AWS_ENDPOINT_URL")), cancellationToken);
+
     internal static async Task<IReadOnlyDictionary<string, InventorySample>?> ReadAsync(
-        RuntimeConfiguration configuration, CancellationToken cancellationToken)
+        RuntimeConfiguration configuration, Uri? endpoint, CancellationToken cancellationToken)
     {
         if (!configuration.DryRun.InspectAws)
         {
@@ -18,13 +23,16 @@ internal static class ReadOnlyRunnerInventory
 
         var clock = TimeProvider.System;
         var enabled = configuration.Profiles.Where(profile => profile.State != RunnerProfileState.Disabled).ToLookup(profile => profile.Provisioner.Type);
+        var snapshots = new Dictionary<string, InventorySample>(StringComparer.Ordinal);
+        if (enabled.Count == 0)
+        {
+            return snapshots;
+        }
         var fargate = enabled[RunnerProvisionerType.Fargate];
         FargateRuntimeEvidence? evidence = fargate.Any()
             ? FargateRuntimeEvidence.Load(configuration, Environment.GetEnvironmentVariable(FargateRuntimeEvidence.EnvironmentVariable))
             : null;
-        var endpoint = ControllerAwsClientConfiguration.ReadLoopbackEndpoint(Environment.GetEnvironmentVariable("AWS_ENDPOINT_URL"));
         using var clients = await ControllerCloudClients.ConnectAsync(configuration.Aws, endpoint, cancellationToken).ConfigureAwait(false);
-        var snapshots = new Dictionary<string, InventorySample>(StringComparer.Ordinal);
 
         var ec2 = enabled[RunnerProvisionerType.Ec2];
         if (ec2.Any())

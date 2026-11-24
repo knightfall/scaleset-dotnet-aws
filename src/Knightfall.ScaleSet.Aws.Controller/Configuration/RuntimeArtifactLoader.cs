@@ -1,4 +1,3 @@
-using Amazon;
 using Amazon.Runtime;
 using Amazon.S3;
 using Amazon.S3.Model;
@@ -60,8 +59,21 @@ public static class RuntimeArtifactLoader
         }
     }
 
-    internal static IAmazonS3 CreateS3Client(string? region)
+    internal static IAmazonS3 CreateS3Client(string? region) =>
+        CreateS3Client(region, ControllerAwsClientConfiguration.ReadLoopbackEndpoint(Environment.GetEnvironmentVariable("AWS_ENDPOINT_URL")));
+
+    internal static IAmazonS3 CreateS3Client(string? region, Uri? loopbackEndpoint)
     {
+        if (region is not null || loopbackEndpoint is not null)
+        {
+            // A remote runtime artifact has not yet supplied the region. Use the SDK's normal region chain.
+            region ??= new AmazonS3Config().RegionEndpoint?.SystemName ??
+                throw new ArgumentException("Configure an AWS SDK region for the local S3 endpoint.", nameof(region));
+            var pinned = ControllerAwsClientConfiguration.Create<AmazonS3Config>(region, loopbackEndpoint);
+            pinned.ForcePathStyle = loopbackEndpoint is not null;
+            return new AmazonS3Client(pinned);
+        }
+
         var options = new AmazonS3Config
         {
             AllowAutoRedirect = false,
@@ -71,10 +83,6 @@ public static class RuntimeArtifactLoader
             MaxErrorRetry = 0,
             MaxStaleConnectionRetries = 0,
         };
-        if (region is not null)
-        {
-            options.RegionEndpoint = RegionEndpoint.GetBySystemName(region);
-        }
         return new AmazonS3Client(options);
     }
 }

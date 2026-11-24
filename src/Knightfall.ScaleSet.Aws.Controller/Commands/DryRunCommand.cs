@@ -62,14 +62,8 @@ public static class DryRunCommand
             var (configuration, telemetry) = await RuntimeInput.LoadAsync(
                 artifact, null, createS3Client, readEnvironment, cancellationToken);
             await using var pipeline = TelemetryPipeline.Start(telemetry, stderr);
-            var evidence = await ReadEvidenceAsync(configuration, artifact.LocalPath, createS3Client, cancellationToken);
-            IReadOnlyDictionary<string, InventorySample>? inventory = null;
-            if (inspectInventory is not null && configuration.DryRun.InspectAws &&
-                configuration.DryRun.Demand is NoDryRunDemandConfiguration)
-            {
-                inventory = await inspectInventory(configuration, cancellationToken);
-            }
-            var report = DryRunEngine.CreateReport(configuration, evidence, timeProvider, inventory);
+            var report = await CreateReportAsync(configuration, artifact, createS3Client, inspectInventory,
+                timeProvider, cancellationToken);
             string output = JsonSerializer.Serialize(report, ReportJson) + "\n";
             await stdout.WriteAsync(output.AsMemory(), cancellationToken);
             return 0;
@@ -91,6 +85,21 @@ public static class DryRunCommand
             await stderr.WriteLineAsync("The requested runtime or read-only evidence could not be loaded.".AsMemory(), cancellationToken);
             return 1;
         }
+    }
+
+    internal static async Task<DryRunReport> CreateReportAsync(
+        RuntimeConfiguration configuration, RuntimeArtifact artifact, Func<string?, IAmazonS3> createS3Client,
+        Func<RuntimeConfiguration, CancellationToken, Task<IReadOnlyDictionary<string, InventorySample>?>>? inspectInventory,
+        TimeProvider? timeProvider, CancellationToken cancellationToken)
+    {
+        var evidence = await ReadEvidenceAsync(configuration, artifact.LocalPath, createS3Client, cancellationToken);
+        IReadOnlyDictionary<string, InventorySample>? inventory = null;
+        if (inspectInventory is not null && configuration.DryRun.InspectAws &&
+            configuration.DryRun.Demand is NoDryRunDemandConfiguration)
+        {
+            inventory = await inspectInventory(configuration, cancellationToken);
+        }
+        return DryRunEngine.CreateReport(configuration, evidence, timeProvider, inventory);
     }
 
     private static async Task<ReadOnlyMemory<byte>?> ReadEvidenceAsync(

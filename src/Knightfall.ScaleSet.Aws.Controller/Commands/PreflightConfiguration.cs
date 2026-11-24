@@ -1,3 +1,4 @@
+using Knightfall.ScaleSet.Aws.Controller.Configuration;
 using Knightfall.ScaleSet.Aws.Core.Configuration;
 
 namespace Knightfall.ScaleSet.Aws.Controller.Commands;
@@ -23,6 +24,6 @@ internal sealed record PreflightConfiguration(string Path, string Digest)
             : null;
     }
 
-    internal async Task<RuntimeConfiguration> LoadAsync(CancellationToken cancellationToken) =>
-        RuntimeConfigurationLoader.Load(await File.ReadAllBytesAsync(Path, cancellationToken).ConfigureAwait(false), Digest);
+    internal Task<RuntimeConfiguration> LoadAsync(CancellationToken cancellationToken) =>
+        RuntimeArtifactLoader.LoadAsync(RuntimeArtifact.FromLocal(Path, Digest), cancellationToken);
 }
