@@ -16,15 +16,16 @@ internal sealed partial class MiniStackIamFixture : IDisposable
 
     private readonly Dictionary<string, MiniStackIamRole> _roles = new(StringComparer.Ordinal);
 
-    private MiniStackIamFixture(Uri endpoint)
+    private MiniStackIamFixture(Uri endpoint, string? tableName = null)
     {
         Endpoint = endpoint;
+        TableName = tableName ?? "authorized-integration-" + Guid.NewGuid().ToString("N");
         Controller = new MiniStackIamClients(endpoint, new BasicAWSCredentials(Account, "test-only-secret"));
     }
 
     internal Uri Endpoint { get; }
 
-    internal string TableName { get; } = "authorized-integration-" + Guid.NewGuid().ToString("N");
+    internal string TableName { get; }
 
     internal string TableArn => $"arn:aws:dynamodb:{Region}:{Account}:table/{TableName}";
 
@@ -126,14 +127,43 @@ internal sealed partial class MiniStackIamFixture : IDisposable
         }
 
         var role = new MiniStackIamRole(roleName, created.Arn, roleId, includeStatus);
+        await GrantBootstrapAccessAsync(role, cancellationToken).ConfigureAwait(false);
+        return role;
+    }
+
+    internal async Task<MiniStackIamFixture> OpenRestoredAsync(string tableName, MiniStackIamRole role, CancellationToken cancellationToken)
+    {
+        if (tableName != TableName + "-restored" || !_roles.TryGetValue(role.Name, out var original) || original != role)
+        {
+            throw new ArgumentException("The restored table and role must belong to this fixture.", nameof(tableName));
+        }
+        var restored = new MiniStackIamFixture(Endpoint, tableName);
+        try
+        {
+            var target = await restored.Controller.DynamoDb.DescribeTableAsync(tableName, cancellationToken).ConfigureAwait(false);
+            if (target.Table is not { } table || table.TableArn != restored.TableArn || table.TableStatus != TableStatus.ACTIVE)
+            {
+                throw new InvalidOperationException("The restored bootstrap table is not active in the fixture account and Region.");
+            }
+            await restored.GrantBootstrapAccessAsync(role, cancellationToken).ConfigureAwait(false);
+            return restored;
+        }
+        catch
+        {
+            restored.Dispose();
+            throw;
+        }
+    }
+
+    private async Task GrantBootstrapAccessAsync(MiniStackIamRole role, CancellationToken cancellationToken)
+    {
         await Controller.Iam.PutRolePolicyAsync(new PutRolePolicyRequest
         {
             RoleName = role.Name,
             PolicyName = "BootstrapTable",
-            PolicyDocument = BootstrapPolicy(role.RoleId + ":*", "ForAllValues:StringLike", includeStatus),
+            PolicyDocument = BootstrapPolicy(role.RoleId + ":*", "ForAllValues:StringLike", role.IncludeStatus),
         }, cancellationToken).ConfigureAwait(false);
         _roles.Add(role.Name, role);
-        return role;
     }
 
     internal async Task<MiniStackIamSession> AssumeRunnerAsync(MiniStackIamRole role, string shortInstanceOrTaskId,
