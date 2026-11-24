@@ -17,6 +17,10 @@ import type {
   RunnerProfile,
 } from "../config/types.ts";
 import {
+  controllerHealthAddress,
+  createControllerService,
+} from "./controller-service.ts";
+import {
   controllerStackName,
   deploymentIdentity,
   generationValue,
@@ -116,6 +120,8 @@ export class ControllerInfrastructure extends Stack {
       sha256,
       "--generation",
       props.generation,
+      "--health-addr",
+      controllerHealthAddress,
     ];
     if (active) {
       grantHostFence(this.controllerRole, this.hostingCluster);
@@ -162,6 +168,12 @@ export class ControllerInfrastructure extends Stack {
     }
 
     this.runtimeArguments = args;
+    createControllerService(this, {
+      spec,
+      clusterArn: this.hostingCluster.arn,
+      taskRole: this.controllerRole,
+      command: this.runtimeArguments,
+    });
     new CfnOutput(this, "DeploymentIdentity", {
       value: deploymentIdentity(runtime),
     });
