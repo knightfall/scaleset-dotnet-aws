@@ -85,6 +85,10 @@ public sealed partial class DynamoDbLifecycleStore
     private TransactionAction BuildRecordWrite(string leaseDeployment, Guid transitionId, LifecycleRecordWrite write)
     {
         RequireOrdinaryKey(write.Key);
+        if (write.Key.Kind == LifecycleItemKind.Claim && write.Key.PartitionKey.StartsWith(Ec2TokenClaimPrefix, StringComparison.Ordinal))
+        {
+            throw new ArgumentException("This claim requires the EC2 launch planning protocol.", nameof(write));
+        }
         if (write.Key.Deployment is string deployment && deployment != leaseDeployment)
         {
             throw new ArgumentException("A write must belong to its lease deployment.", nameof(write));
@@ -368,7 +372,7 @@ public sealed partial class DynamoDbLifecycleStore
         if (key.Kind is LifecycleItemKind.Lease or LifecycleItemKind.Operation or LifecycleItemKind.ActiveOperation or
             LifecycleItemKind.Effects or LifecycleItemKind.EffectRebuild or LifecycleItemKind.Hello or LifecycleItemKind.Offer or
             LifecycleItemKind.Status or LifecycleItemKind.Session or LifecycleItemKind.Drain or LifecycleItemKind.ActiveRunner or
-            LifecycleItemKind.Handoff or LifecycleItemKind.HandoffHead)
+            LifecycleItemKind.Handoff or LifecycleItemKind.HandoffHead or LifecycleItemKind.Ec2LaunchLineage)
         {
             throw new ArgumentException("This lifecycle key requires its dedicated protocol.", nameof(key));
         }

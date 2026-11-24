@@ -78,6 +78,31 @@ public sealed partial class DynamoDbLifecycleStore
         return LifecycleWriteOutcome.Conflict;
     }
 
+    private TransactionAction ExactExecutorClaimCondition(LifecycleKey key, LifecycleRecord claim, string deployment) =>
+        new(key, new TransactWriteItem
+        {
+            ConditionCheck = new ConditionCheck
+            {
+                TableName = _tableName,
+                Key = Key(key),
+                ConditionExpression = "#deployment = :deployment AND #revision = :revision AND #transition = :transition AND #payload = :payload",
+                ExpressionAttributeNames = new Dictionary<string, string>(StringComparer.Ordinal)
+                {
+                    ["#deployment"] = "deployment",
+                    ["#revision"] = "revision",
+                    ["#transition"] = "transitionId",
+                    ["#payload"] = "payload",
+                },
+                ExpressionAttributeValues = new Dictionary<string, AttributeValue>(StringComparer.Ordinal)
+                {
+                    [":deployment"] = StringValue(deployment),
+                    [":revision"] = NumberValue(claim.Revision),
+                    [":transition"] = StringValue(claim.TransitionId.ToString("D")),
+                    [":payload"] = StringValue(claim.Payload ?? throw InvalidRecord()),
+                },
+            },
+        });
+
     public Task<LifecycleWriteOutcome> BindExecutorRunnerAsync(
         DeploymentLeaseFence lease, ExecutorBinding binding, long runnerId, CancellationToken cancellationToken)
     {

@@ -44,6 +44,11 @@ public sealed class EffectEnvelope
         _ = LifecycleKey.Operation(profile, intentId);
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(generation);
         ArgumentNullException.ThrowIfNull(request);
+        var normalized = request.Normalize();
+        if (normalized is Ec2LaunchEffectRequest { OwnershipTags: not null } launch)
+        {
+            launch.ValidateOwnership(profile);
+        }
         if (earliestPossibleFirstSend == default)
         {
             throw new ArgumentException("The earliest send time is required.", nameof(earliestPossibleFirstSend));
@@ -57,7 +62,7 @@ public sealed class EffectEnvelope
         }
 
         var body = new EnvelopeBody(
-            SchemaVersion, profile.Deployment, profile.ProfileId, intentId, generation, request.Normalize(),
+            SchemaVersion, profile.Deployment, profile.ProfileId, intentId, generation, normalized,
             earliestPossibleFirstSend.ToUniversalTime(), providerReplayDeadline?.ToUniversalTime());
         return new EffectEnvelope(body, JsonSerializer.Serialize(body, Serializer));
     }

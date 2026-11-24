@@ -39,6 +39,15 @@
           "AWSSDK.Core": "[4.1.1.2, 5.0.0)"
         }
       },
+      "AWSSDK.SQS": {
+        "type": "Direct",
+        "requested": "[4.1.0.2, 4.1.0.2]",
+        "resolved": "4.1.0.2",
+        "contentHash": "clZzwfg/mOaW+q28fAcT92UO0XoFIdJiJ2DDfO1bGCC1UVm+aJTlSgpeE3W2tEvLnDNXXCp4O3JQAnXJ4/HefQ==",
+        "dependencies": {
+          "AWSSDK.Core": "[4.1.1.1, 5.0.0)"
+        }
+      },
       "Roslynator.Analyzers": {
         "type": "Direct",
         "requested": "[5.0.1, 5.0.1]",

@@ -41,7 +41,10 @@ public sealed record Ec2LaunchEffectRequest(
     string? InstanceType,
     ImmutableArray<string> SecurityGroupIds,
     string InstanceProfileArn,
-    Guid ClientToken) : EffectEnvelopeRequest
+    Guid ClientToken,
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)] int AttemptOrdinal = 0,
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] Ec2Tenancy? Tenancy = null,
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] Ec2LaunchOwnershipTags? OwnershipTags = null) : EffectEnvelopeRequest
 {
     public int MinCount { get; } = 1;
     public int MaxCount { get; } = 1;
@@ -55,6 +58,7 @@ public sealed record Ec2LaunchEffectRequest(
     {
         EffectRequestIdentifiers.Guid(AllocationId, nameof(AllocationId));
         EffectRequestIdentifiers.Guid(ClientToken, nameof(ClientToken));
+        ArgumentOutOfRangeException.ThrowIfNegative(AttemptOrdinal);
         EffectRequestIdentifiers.Match(Region, @"\A[a-z]{2}(?:-[a-z]+)+-[0-9]+\z", nameof(Region));
         EffectRequestIdentifiers.Match(SubnetId, EffectRequestIdentifiers.SubnetId, nameof(SubnetId));
         ArgumentNullException.ThrowIfNull(AvailabilityZone);
@@ -71,6 +75,14 @@ public sealed record Ec2LaunchEffectRequest(
             EffectRequestIdentifiers.Match(InstanceType, @"\A[a-z0-9-]+\.[a-z0-9-]+\z", nameof(InstanceType));
         }
         EffectRequestIdentifiers.Match(InstanceProfileArn, @"\Aarn:aws(?:-[a-z0-9-]+)?:iam::[0-9]{12}:instance-profile/[A-Za-z0-9+=,.@_/-]+\z", nameof(InstanceProfileArn));
+        if (Tenancy is { } tenancy && !Enum.IsDefined(tenancy))
+        {
+            throw new ArgumentException("An explicit supported EC2 tenancy is required.", nameof(Tenancy));
+        }
+        if ((AttemptOrdinal != 0 || Tenancy is not null) && OwnershipTags is null)
+        {
+            throw new ArgumentException("An EC2 placement requires exact ownership tags.", nameof(OwnershipTags));
+        }
         return this with { SecurityGroupIds = EffectRequestIdentifiers.OrderedIds(SecurityGroupIds, EffectRequestIdentifiers.SecurityGroupId, nameof(SecurityGroupIds)) };
     }
 }

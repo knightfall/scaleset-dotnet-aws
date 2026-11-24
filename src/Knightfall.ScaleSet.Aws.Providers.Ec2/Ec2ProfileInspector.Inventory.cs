@@ -1,5 +1,3 @@
-using System.Security.Cryptography;
-using System.Text;
 using Amazon.EC2.Model;
 using Knightfall.ScaleSet.Aws.Core.Configuration;
 using Knightfall.ScaleSet.Aws.Core.Lifecycle;
@@ -11,8 +9,13 @@ public sealed partial class Ec2ProfileInspector
     private const string NativeTemplateId = "aws:ec2launchtemplate:id";
     private const string NativeTemplateVersion = "aws:ec2launchtemplate:version";
 
-    public async Task<Ec2InventorySnapshot> ReadInventoryAsync(
-        RuntimeConfiguration configuration, string profileId, CancellationToken cancellationToken)
+    public Task<Ec2InventorySnapshot> ReadInventoryAsync(
+        RuntimeConfiguration configuration, string profileId, CancellationToken cancellationToken) =>
+        ReadInventoryAsync(configuration, profileId, [], null, cancellationToken);
+
+    internal async Task<Ec2InventorySnapshot> ReadInventoryAsync(
+        RuntimeConfiguration configuration, string profileId, IReadOnlyList<Filter> additionalFilters,
+        Func<Instance, bool>? verifiesIntent, CancellationToken cancellationToken)
     {
         var target = GetTarget(configuration, profileId);
         var filters = new List<Filter>
@@ -21,6 +24,7 @@ public sealed partial class Ec2ProfileInspector
             TagFilter(RunnerOwnershipTags.Deployment, target.Deployment),
             TagFilter(RunnerOwnershipTags.Profile, target.Profile.Id),
         };
+        filters.AddRange(additionalFilters);
         var seenTokens = new HashSet<string>(StringComparer.Ordinal);
         var seenAllocations = new HashSet<Guid>();
         var instances = new Dictionary<string, Ec2InventoryEntry>(StringComparer.Ordinal);
@@ -54,6 +58,7 @@ public sealed partial class Ec2ProfileInspector
                     foreach (var instance in reservation.Instances)
                     {
                         if (GetOwnedEntry(target, instance, observedAt) is not { } entry ||
+                            verifiesIntent?.Invoke(instance) == false ||
                             !instances.TryAdd(entry.InstanceId, entry) ||
                             (entry.AllocationId is Guid allocation && !seenAllocations.Add(allocation)))
                         {
@@ -104,7 +109,7 @@ public sealed partial class Ec2ProfileInspector
         var original = ReadOriginalLaunchTime(instance, observedAt);
         Guid? incarnation = allocation.HasValue && nativeTemplate == target.Provisioner.LaunchTemplateId &&
             version is long verifiedVersion && original is { } initial
-            ? ComputeIncarnation(target.Aws, instance.InstanceId, initial, verifiedVersion) : null;
+            ? Ec2ExecutorIncarnation.Compute(target.Aws.Account, target.Aws.Region, instance.InstanceId, initial, verifiedVersion) : null;
         return new Ec2InventoryEntry(instance.InstanceId, resourceArn, GetReportedState(instance.State),
             allocation, nativeTemplate, version, original, incarnation);
     }
@@ -138,13 +143,6 @@ public sealed partial class Ec2ProfileInspector
         }
         var original = raw.Kind == DateTimeKind.Unspecified ? DateTime.SpecifyKind(raw, DateTimeKind.Utc) : raw.ToUniversalTime();
         return original <= observedAt ? original : null;
-    }
-
-    private static Guid ComputeIncarnation(AwsEnvironment scope, string instanceId, DateTimeOffset launched, long version)
-    {
-        string tuple = FormattableString.Invariant($"{scope.Account}/{scope.Region}/{instanceId}/{launched.UtcTicks}/{version}");
-        byte[] hash = SHA256.HashData(Encoding.UTF8.GetBytes(tuple));
-        return new Guid(hash.AsSpan(0, 16), bigEndian: true);
     }
 
     private static Ec2InstanceState GetReportedState(InstanceState? state)

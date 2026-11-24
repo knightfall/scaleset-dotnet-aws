@@ -3,6 +3,7 @@ using System.Globalization;
 using System.Security.Cryptography;
 using System.Text;
 using Amazon.DynamoDBv2.Model;
+using Knightfall.ScaleSet.Aws.Core.Catalog;
 using Knightfall.ScaleSet.Aws.Core.Lifecycle;
 
 namespace Knightfall.ScaleSet.Aws.DynamoDb;
@@ -82,7 +83,7 @@ public sealed partial class DynamoDbLifecycleStore
         CancellationToken cancellationToken) =>
         WriteEffectAsync(profile, lease, transitionId, write, LeaseAccess.Active, cancellationToken, guard, attemptDeadline);
 
-    internal Task<LifecycleWriteOutcome> WriteExactRunnerEffectAsync(
+    internal Task<LifecycleWriteOutcome> WriteExactEffectAsync(
         DeploymentLeaseFence lease, Guid transitionId, EffectJournalSnapshot expected, EffectJournalEntry replacement,
         DateTimeOffset? leaseValidThrough, CancellationToken cancellationToken) =>
         WriteEffectAsync(replacement.Envelope.Profile, lease, transitionId,
@@ -98,7 +99,10 @@ public sealed partial class DynamoDbLifecycleStore
         CancellationToken cancellationToken,
         EffectDispatchGuard? guard = null,
         DateTimeOffset? leaseValidThrough = null,
-        EffectJournalSnapshot? exactPrevious = null)
+        EffectJournalSnapshot? exactPrevious = null,
+        CatalogProfile? requiredCatalog = null,
+        IReadOnlyList<TransactionAction>? accompanying = null,
+        Guid? requestToken = null)
     {
         RequireProfileLease(profile, lease);
         ArgumentNullException.ThrowIfNull(write);
@@ -184,6 +188,19 @@ public sealed partial class DynamoDbLifecycleStore
                 actions.Add(ExactJitHandoffCondition(removal));
                 actions.Add(OfferAbsentCondition(removal));
             }
+            if (guard.Ec2Lineage is { } lineage)
+            {
+                actions.Add(ExactEc2LineageCondition(lineage));
+            }
+        }
+        if (requiredCatalog is not null)
+        {
+            RequireAppliedCatalog(leaseCondition, requiredCatalog);
+            actions.Add(CatalogProfileCondition(requiredCatalog));
+        }
+        if (accompanying is not null)
+        {
+            actions.AddRange(accompanying);
         }
         if (delta > 0)
         {
@@ -193,8 +210,8 @@ public sealed partial class DynamoDbLifecycleStore
         {
             actions.Add(DeleteMarker(profile, head.Generation, write.IntentId));
         }
-        // An exact runner transition can reuse its durable proof with a newer index revision.
-        return await WriteAsync(actions, exactPrevious is null ? transitionId : Guid.NewGuid(), cancellationToken).ConfigureAwait(false);
+        // Reusing a durable transition can require a fresh transaction bound to the current index revision.
+        return await WriteAsync(actions, requestToken ?? (exactPrevious is null ? transitionId : Guid.NewGuid()), cancellationToken).ConfigureAwait(false);
     }
 
     public async Task<ActiveEffectPage?> ReadActiveOperationsAsync(

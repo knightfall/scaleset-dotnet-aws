@@ -182,20 +182,27 @@ public sealed partial class DynamoDbEffectDispatcher
 
     private async Task<LifecycleWriteOutcome> ResolveObservedAsync(
         ControllerLease lease, ControllerClockEvidence clockEvidence, EffectJournalSnapshot effect,
-        EffectEvidence evidence, DateTimeOffset started, CancellationToken cancellationToken)
+        EffectEvidence evidence, DateTimeOffset started, CancellationToken cancellationToken, EffectSendAuthorization? sent = null)
     {
         var current = await ReadCurrentLeaseAsync(lease, cancellationToken).ConfigureAwait(false);
         if (current is null || Window(current, clockEvidence) is null)
         {
             return LifecycleWriteOutcome.LeaseRejected;
         }
-        var exact = ValidateEvidence(effect, clockEvidence, evidence, started);
-        return exact is null ? LifecycleWriteOutcome.Indeterminate
-            : await _journal.ResolveAsync(current, effect, Guid.NewGuid(), exact, cancellationToken).ConfigureAwait(false);
+        var exact = ValidateEvidence(effect, clockEvidence, evidence, started, sent);
+        if (exact is null)
+        {
+            return LifecycleWriteOutcome.Indeterminate;
+        }
+        Guid transition = Guid.NewGuid();
+        return exact.Ec2LaunchRejection is null
+            ? await _journal.ResolveAsync(current, effect, transition, exact, cancellationToken).ConfigureAwait(false)
+            : await _journal.ResolveEc2ZonalRejectionAsync(current, effect, sent!, transition, exact, cancellationToken).ConfigureAwait(false);
     }
 
     private EffectEvidence? ValidateEvidence(
-        EffectJournalSnapshot effect, ControllerClockEvidence clockEvidence, EffectEvidence? evidence, DateTimeOffset started)
+        EffectJournalSnapshot effect, ControllerClockEvidence clockEvidence, EffectEvidence? evidence, DateTimeOffset started,
+        EffectSendAuthorization? sent = null)
     {
         if (evidence is null || !IsCurrentObservation(evidence.ObservedAt, started, _clock.GetUtcNow()))
         {
@@ -204,6 +211,17 @@ public sealed partial class DynamoDbEffectDispatcher
         if (evidence.Kind == EffectResolutionKind.Absent)
         {
             evidence = evidence with { EarliestObservedAt = evidence.ObservedAt - clockEvidence.MaximumAbsoluteSkew };
+        }
+        if (evidence.Ec2LaunchRejection is not null)
+        {
+            if (sent is not { HasStartedSending: true } || sent.Attempt != effect.Entry.Attempt)
+            {
+                return null;
+            }
+            // The exact send grant was consumed before the provider call. A fast receipt can arrive
+            // while the local UTC clock is still earlier than the conservative durable begin time.
+            var upper = evidence.ObservedAt + clockEvidence.MaximumAbsoluteSkew;
+            evidence = evidence with { LatestObservedAt = upper < sent.Attempt.BeganAt ? sent.Attempt.BeganAt : upper };
         }
         return effect.Entry.CanResolve(evidence) ? evidence : null;
     }
