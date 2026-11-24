@@ -1,11 +1,14 @@
 using System.Collections.Immutable;
+using System.Diagnostics;
 using Knightfall.ScaleSet.Aws.Core.Configuration;
+using Knightfall.ScaleSet.Aws.Core.Telemetry;
 
 namespace Knightfall.ScaleSet.Aws.Core.Planning;
 
 public static class CapacityPlanner
 {
     private static readonly TimeSpan ObservationFreshness = TimeSpan.FromMinutes(10);
+    private static readonly ActivitySource Activities = new(ProfileTelemetry.MeterName);
 
     public static CapacityPlan Plan(
         RunnerProfile profile,
@@ -15,6 +18,12 @@ public static class CapacityPlanner
     {
         ArgumentNullException.ThrowIfNull(profile);
         ArgumentNullException.ThrowIfNull(timeProvider);
+        using var activity = Activities.StartActivity("scaleset.aws.plan.capacity");
+        if (activity is { IsAllDataRequested: true })
+        {
+            TelemetryProfile.From(profile)?.SetTags(activity);
+            activity.SetTag("operation", "capacity_plan");
+        }
         var capacity = profile.Capacity;
         if (capacity.MaxRunners <= 0 || capacity.IdleReserve < 0 ||
             capacity.IdleReserve > capacity.MaxRunners || capacity.StartupTimeoutSeconds <= 0)
@@ -34,8 +43,8 @@ public static class CapacityPlanner
             _ => throw new ArgumentException("The runner profile has an invalid state.", nameof(profile)),
         };
         var now = timeProvider.GetUtcNow();
-        var demandStatus = Status(demand?.ObservedAt, now);
-        var inventoryStatus = Status(inventory?.ObservedAt, now);
+        var demandStatus = GetObservationStatus(demand?.ObservedAt, now);
+        var inventoryStatus = GetObservationStatus(inventory?.ObservedAt, now);
         if (inventoryStatus == ObservationStatus.Fresh && inventory is { IsComplete: false })
         {
             inventoryStatus = ObservationStatus.Incomplete;
@@ -64,7 +73,7 @@ public static class CapacityPlanner
             ? Math.Max(0, knownTarget - slots.Serving - slots.Pending)
             : null;
 
-        return new CapacityPlan(
+        var plan = new CapacityPlan(
             demandStatus,
             inventoryStatus,
             effectiveMax,
@@ -83,9 +92,37 @@ public static class CapacityPlanner
                 ? Math.Min(knownDeficit, knownAvailability)
                 : 0,
             slots?.Orphans ?? []);
+        if (activity is { IsAllDataRequested: true })
+        {
+            var (outcome, reason) = TelemetryOutcome(profile, plan);
+            activity.SetTag("outcome", outcome).SetTag("reason", reason);
+        }
+
+        return plan;
     }
 
-    private static ObservationStatus Status(DateTimeOffset? observedAt, DateTimeOffset now)
+    internal static (string Outcome, string Reason) TelemetryOutcome(RunnerProfile profile, CapacityPlan plan)
+    {
+        if (profile.State != RunnerProfileState.Active)
+        {
+            return ("deferred", profile.State == RunnerProfileState.Draining ? "profile_draining" : "profile_disabled");
+        }
+        if (plan.DemandStatus != ObservationStatus.Fresh)
+        {
+            return ("unknown", "demand_unavailable");
+        }
+        if (plan.InventoryStatus != ObservationStatus.Fresh)
+        {
+            return ("unknown", "inventory_unavailable");
+        }
+        if (plan.Deficit is > 0)
+        {
+            return plan.ProposedStarts > 0 ? ("success", "capacity_requested") : ("deferred", "headroom_unavailable");
+        }
+        return ("success", "target_met");
+    }
+
+    internal static ObservationStatus GetObservationStatus(DateTimeOffset? observedAt, DateTimeOffset now)
     {
         if (observedAt is not { } observation)
         {
