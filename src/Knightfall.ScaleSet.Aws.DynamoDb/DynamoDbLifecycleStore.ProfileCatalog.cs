@@ -28,16 +28,23 @@ public sealed partial class DynamoDbLifecycleStore
         return profiles;
     }
 
-    internal async Task<LifecycleWriteOutcome> EnsureEffectProfileAsync(
+    internal Task<LifecycleWriteOutcome> EnsureEffectProfileAsync(
         ControllerLease lease, LifecycleProfile profile, CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(lease);
         RequireProfileLease(profile, lease.Fence);
         if (lease.Mode != ControllerLeaseMode.Active)
         {
-            return LifecycleWriteOutcome.LeaseRejected;
+            return Task.FromResult(LifecycleWriteOutcome.LeaseRejected);
         }
 
+        return EnsureEffectProfileAsync(lease.Fence, profile, cancellationToken);
+    }
+
+    private async Task<LifecycleWriteOutcome> EnsureEffectProfileAsync(
+        DeploymentLeaseFence lease, LifecycleProfile profile, CancellationToken cancellationToken)
+    {
+        RequireProfileLease(profile, lease);
         var key = LifecycleKey.Profile(profile);
         if (await IsEffectProfilePresentAsync(key, profile, cancellationToken).ConfigureAwait(false))
         {
@@ -49,7 +56,7 @@ public sealed partial class DynamoDbLifecycleStore
         item.Add(CatalogProfileIdentity, StringValue(profile.ProfileId));
         item.Add("payload", StringValue("{}"));
         var outcome = await WriteAsync(
-            [LeaseCondition(lease.Fence), CompareAndPut(key, item, null, profile.Deployment)],
+            [LeaseCondition(lease), CompareAndPut(key, item, null, profile.Deployment)],
             transition, cancellationToken).ConfigureAwait(false);
 
         if (outcome is LifecycleWriteOutcome.Conflict or LifecycleWriteOutcome.Indeterminate &&

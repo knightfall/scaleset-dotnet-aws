@@ -51,7 +51,7 @@ public sealed class LifecycleStorageTests
         using var table = await MiniStackTable.CreateAsync(cancellation);
         var store = table.CreateStore();
         var profile = table.Profile("records");
-        var session = LifecycleKey.Session(profile);
+        var session = LifecycleKey.Admission(profile);
         var demand = LifecycleKey.Demand(profile);
         var token = Guid.NewGuid();
         LifecycleRecordWrite first = new(session, null, """{"session":"one"}""");
@@ -62,7 +62,7 @@ public sealed class LifecycleStorageTests
         var write = Assert.Single(table.Wire.Requests);
         Assert.Equal("TransactWriteItems", write.Operation);
         Assert.Equal(token.ToString("D"), write.Request.GetProperty("ClientRequestToken").GetString());
-        Assert.Equal(["LEASE", "SESSION", "DEMAND"], ActionKeys(write));
+        Assert.Equal(["LEASE", "ADMISSION", "DEMAND"], ActionKeys(write));
         Assert.Equal(new LifecycleRecord(session, 1, token, first.Payload, null), await store.ReadRecordAsync(session, cancellation));
         Assert.Equal(new LifecycleRecord(demand, 1, token, second.Payload, null), await store.ReadRecordAsync(demand, cancellation));
 
@@ -151,7 +151,7 @@ public sealed class LifecycleStorageTests
         var cancellation = TestContext.Current.CancellationToken;
         using var table = await MiniStackTable.CreateAsync(cancellation);
         var store = table.CreateStore();
-        var key = LifecycleKey.Session(table.Profile("uncertain"));
+        var key = LifecycleKey.Demand(table.Profile("uncertain"));
         var token = Guid.NewGuid();
         table.Wire.DropNextSuccessfulTransactionResponse();
         Assert.Equal(LifecycleWriteOutcome.Indeterminate,

@@ -49,7 +49,7 @@ public sealed class GitHubScaleSetClientFactory(
     }
 }
 
-public sealed class GitHubScaleSetConnection : IGitHubScaleSetRemote, IDisposable
+public sealed partial class GitHubScaleSetConnection : IGitHubScaleSetRemote, IDisposable
 {
     private readonly ScaleSetClient _client;
     private readonly TimeProvider _clock;
@@ -129,36 +129,13 @@ public sealed class GitHubScaleSetConnection : IGitHubScaleSetRemote, IDisposabl
             throw BindingMismatch();
         }
         RequireScope(request);
-        cancellationToken.ThrowIfCancellationRequested();
-        long starting = _clock.GetTimestamp();
-        if (!authorization.TryConsume(out TimeSpan remaining))
-        {
-            throw new GitHubOperationException(remaining > TimeSpan.Zero
-                ? GitHubOperationError.AuthorizationConsumed
-                : GitHubOperationError.DeadlineElapsed);
-        }
-        DateTimeOffset local = _clock.GetUtcNow();
-        remaining -= _clock.GetElapsedTime(starting);
-        if (remaining <= TimeSpan.Zero)
-        {
-            throw new GitHubOperationException(GitHubOperationError.DeadlineElapsed);
-        }
-        DateTimeOffset deadline = local + remaining;
-        using var timeout = new CancellationTokenSource(remaining, _clock);
-        using var bounded = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, timeout.Token);
-
-        using var singleAttempt = ScaleSetRequestRetry.Configure(options => options with
-        {
-            MaxRetries = 0,
-            Deadline = options.Deadline is { } existing && existing < deadline ? existing : deadline,
-        });
-        var set = await InvokeAsync(
-            () => _client.CreateScaleSetAsync(new RunnerScaleSet
+        var set = await RunBoundMutationAsync(authorization.TryConsume,
+            token => _client.CreateScaleSetAsync(new RunnerScaleSet
             {
                 Name = request.ScaleSetName,
                 RunnerGroupId = request.RunnerGroupId,
                 Labels = request.Labels.Select(label => new Label { Name = label, Type = "System" }).ToArray(),
-            }, bounded.Token),
+            }, token),
             cancellationToken).ConfigureAwait(false);
         return CheckBinding(set, request.RunnerGroupName, request.RunnerGroupId, request.ScaleSetName, request.Labels, null);
     }

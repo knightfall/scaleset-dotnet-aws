@@ -185,6 +185,7 @@ internal sealed record MiniStackCall(string Operation, JsonElement Request)
 internal sealed class MiniStackWire : DelegatingHandler
 {
     private readonly ConcurrentQueue<MiniStackCall> _requests = new();
+    private int _dropTransactionBeforeSend;
     private int _dropSuccessfulTransaction;
     private TransactionBarrier? _transactionBarrier;
     private PausedRead? _pausedRead;
@@ -199,6 +200,8 @@ internal sealed class MiniStackWire : DelegatingHandler
     }
 
     internal void Clear() => _requests.Clear();
+
+    internal void DropNextTransactionBeforeSend() => Interlocked.Exchange(ref _dropTransactionBeforeSend, 1);
 
     internal void DropNextSuccessfulTransactionResponse() => Interlocked.Exchange(ref _dropSuccessfulTransaction, 1);
 
@@ -223,6 +226,11 @@ internal sealed class MiniStackWire : DelegatingHandler
         var call = new MiniStackCall(operation, document.RootElement.Clone());
         _requests.Enqueue(call);
 
+        if (operation == "TransactWriteItems" && Interlocked.Exchange(ref _dropTransactionBeforeSend, 0) == 1)
+        {
+            throw new HttpRequestException("Lost request before MiniStack received the transaction.",
+                new SocketException((int)SocketError.ConnectionReset));
+        }
         if (operation == "TransactWriteItems" && _transactionBarrier is { } barrier)
         {
             await barrier.WaitAsync(cancellationToken);

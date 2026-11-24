@@ -70,41 +70,46 @@ public sealed partial class DynamoDbLifecycleStore
         var actions = new List<TransactionAction>(writes.Count + 1) { LeaseCondition(lease) };
         foreach (var write in writes)
         {
-            RequireOrdinaryKey(write.Key);
-            if (write.Key.Deployment is string deployment && deployment != lease.Deployment)
-            {
-                throw new ArgumentException("A write must belong to its lease deployment.", nameof(writes));
-            }
-            ArgumentNullException.ThrowIfNull(write.Payload);
-            var item = Record(write.Key, lease.Deployment, NextRevision(write.ExpectedRevision), transitionId);
-            item.Add("payload", StringValue(write.Payload));
-            if (write.Key.Kind == LifecycleItemKind.Profile)
-            {
-                item.Add(CatalogProfileIdentity, StringValue(write.Key.SortKey[CatalogProfilePrefix.Length..]));
-            }
-
-            if (write.HistoryRetention is { } retention)
-            {
-                if (!AllowsHistoryRetention(write.Key.Kind) || retention.Retention <= TimeSpan.Zero ||
-                    retention.SettledAt > _timeProvider.GetUtcNow())
-                {
-                    throw new ArgumentException("Only settled message, job, or acquisition history may have an expiration.", nameof(writes));
-                }
-
-                var expiresAt = retention.SettledAt + retention.Retention;
-                long seconds = expiresAt.ToUnixTimeSeconds();
-                if (DateTimeOffset.FromUnixTimeSeconds(seconds) < expiresAt)
-                {
-                    seconds++;
-                }
-                item.Add("expiresAt", NumberValue(seconds));
-            }
-
-            long? expirationCheck = AllowsHistoryRetention(write.Key.Kind) ? _timeProvider.GetUtcNow().ToUnixTimeSeconds() : null;
-            actions.Add(CompareAndPut(write.Key, item, write.ExpectedRevision, lease.Deployment, expirationCheck));
+            actions.Add(BuildRecordWrite(lease.Deployment, transitionId, write));
         }
 
         return await WriteAsync(actions, transitionId, cancellationToken).ConfigureAwait(false);
+    }
+
+    private TransactionAction BuildRecordWrite(string leaseDeployment, Guid transitionId, LifecycleRecordWrite write)
+    {
+        RequireOrdinaryKey(write.Key);
+        if (write.Key.Deployment is string deployment && deployment != leaseDeployment)
+        {
+            throw new ArgumentException("A write must belong to its lease deployment.", nameof(write));
+        }
+        ArgumentNullException.ThrowIfNull(write.Payload);
+        var item = Record(write.Key, leaseDeployment, NextRevision(write.ExpectedRevision), transitionId);
+        item.Add("payload", StringValue(write.Payload));
+        if (write.Key.Kind == LifecycleItemKind.Profile)
+        {
+            item.Add(CatalogProfileIdentity, StringValue(write.Key.SortKey[CatalogProfilePrefix.Length..]));
+        }
+
+        if (write.HistoryRetention is { } retention)
+        {
+            if (!AllowsHistoryRetention(write.Key.Kind) || retention.Retention <= TimeSpan.Zero ||
+                retention.SettledAt > _timeProvider.GetUtcNow())
+            {
+                throw new ArgumentException("Only settled message, job, or acquisition history may have an expiration.", nameof(write));
+            }
+
+            var expiresAt = retention.SettledAt + retention.Retention;
+            long seconds = expiresAt.ToUnixTimeSeconds();
+            if (DateTimeOffset.FromUnixTimeSeconds(seconds) < expiresAt)
+            {
+                seconds++;
+            }
+            item.Add("expiresAt", NumberValue(seconds));
+        }
+
+        long? expirationCheck = AllowsHistoryRetention(write.Key.Kind) ? _timeProvider.GetUtcNow().ToUnixTimeSeconds() : null;
+        return CompareAndPut(write.Key, item, write.ExpectedRevision, leaseDeployment, expirationCheck);
     }
 
     private async Task<Dictionary<string, AttributeValue>?> ReadItemAsync(LifecycleKey key, CancellationToken cancellationToken)
@@ -173,7 +178,8 @@ public sealed partial class DynamoDbLifecycleStore
         return new BasePage(reply.Items ?? [], next);
     }
 
-    private TransactionAction LeaseCondition(DeploymentLeaseFence lease, LeaseAccess access = LeaseAccess.Active)
+    private TransactionAction LeaseCondition(
+        DeploymentLeaseFence lease, LeaseAccess access = LeaseAccess.Active, DateTimeOffset? validThrough = null)
     {
         ArgumentNullException.ThrowIfNull(lease);
         ArgumentException.ThrowIfNullOrWhiteSpace(lease.OwnerId);
@@ -205,7 +211,7 @@ public sealed partial class DynamoDbLifecycleStore
                 [":task"] = StringValue(lease.OwnerTaskArn),
                 [":epoch"] = NumberValue(lease.Epoch),
                 [":protocol"] = NumberValue(lease.WriterProtocol),
-                [":now"] = NumberValue(ConservativeLatest(DateTimeOffset.MinValue).ToUnixTimeMilliseconds()),
+                [":now"] = NumberValue(ConservativeLatest(validThrough ?? DateTimeOffset.MinValue).ToUnixTimeMilliseconds()),
             },
         };
         if (access == LeaseAccess.ActiveOrRecovery)
@@ -220,7 +226,7 @@ public sealed partial class DynamoDbLifecycleStore
             var mode = access == LeaseAccess.Active ? ControllerLeaseMode.Active : ControllerLeaseMode.RecoveryOnly;
             check.ExpressionAttributeValues[":mode"] = StringValue(LeaseModeValue(mode));
         }
-        return new TransactionAction(key, new TransactWriteItem { ConditionCheck = check });
+        return new TransactionAction(key, new TransactWriteItem { ConditionCheck = check }, LifecycleWriteOutcome.LeaseRejected);
     }
 
     private TransactionAction CompareAndPut(
@@ -292,10 +298,12 @@ public sealed partial class DynamoDbLifecycleStore
             {
                 return LifecycleWriteOutcome.Indeterminate;
             }
-            if (actions[0].Write.ConditionCheck is not null && actions[0].Key.Kind == LifecycleItemKind.Lease &&
-                reasons[0].Code == "ConditionalCheckFailed")
+            for (int index = 0; index < actions.Count; index++)
             {
-                return LifecycleWriteOutcome.LeaseRejected;
+                if (reasons[index].Code == "ConditionalCheckFailed" && actions[index].ConditionFailure is { } failure)
+                {
+                    return failure;
+                }
             }
             if (reasons.Any(reason => reason.Code is "ConditionalCheckFailed" or "TransactionConflict") &&
                 reasons.All(reason => reason.Code is "None" or "ConditionalCheckFailed" or "TransactionConflict"))
@@ -324,7 +332,7 @@ public sealed partial class DynamoDbLifecycleStore
         ArgumentNullException.ThrowIfNull(key);
         if (key.Kind is LifecycleItemKind.Lease or LifecycleItemKind.Operation or LifecycleItemKind.ActiveOperation or
             LifecycleItemKind.Effects or LifecycleItemKind.EffectRebuild or LifecycleItemKind.Hello or LifecycleItemKind.Offer or
-            LifecycleItemKind.Status)
+            LifecycleItemKind.Status or LifecycleItemKind.Session)
         {
             throw new ArgumentException("This lifecycle key requires its dedicated protocol.", nameof(key));
         }
@@ -398,7 +406,8 @@ public sealed partial class DynamoDbLifecycleStore
 
     private static InvalidDataException InvalidRecord() => new("Invalid durable lifecycle record or continuation.");
 
-    private sealed record TransactionAction(LifecycleKey Key, TransactWriteItem Write);
+    private sealed record TransactionAction(
+        LifecycleKey Key, TransactWriteItem Write, LifecycleWriteOutcome? ConditionFailure = null);
 
     private sealed record BasePage(List<Dictionary<string, AttributeValue>> Items, string? Continuation);
 

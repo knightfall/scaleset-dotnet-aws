@@ -56,9 +56,9 @@ public sealed class LeaseStoreTests
         Assert.Equal(LifecycleWriteOutcome.LeaseRejected, await store.WriteEffectAsync(profile, lease.Fence, Guid.NewGuid(),
             new EffectWrite("forbidden", null, EffectState.Planned, "{}"), cancellation));
         Assert.Equal(LifecycleWriteOutcome.LeaseRejected, await store.WriteRecordsAsync(
-            lease.Fence, Guid.NewGuid(), [new(LifecycleKey.Session(profile), null, "{}")], cancellation));
+            lease.Fence, Guid.NewGuid(), [new(LifecycleKey.Demand(profile), null, "{}")], cancellation));
         Assert.Null(await store.ReadEffectAsync(profile, "forbidden", cancellation));
-        Assert.Null(await store.ReadRecordAsync(LifecycleKey.Session(profile), cancellation));
+        Assert.Null(await store.ReadRecordAsync(LifecycleKey.Demand(profile), cancellation));
     }
 
     [Fact]
@@ -71,7 +71,7 @@ public sealed class LeaseStoreTests
         var active = Assert.IsType<ControllerLease>(await store.ReadLeaseAsync(table.Lease.Deployment, cancellation));
         Assert.Equal(ControllerLeaseMode.Active, active.Mode);
         Assert.Equal(table.Lease, active.Fence);
-        var session = LifecycleKey.Session(table.Profile("active"));
+        var session = LifecycleKey.Demand(table.Profile("active"));
 
         var incorrectTask = active.Fence with { OwnerTaskArn = TaskTwo };
         Assert.Equal(LifecycleWriteOutcome.LeaseRejected, await store.WriteRecordsAsync(
@@ -147,7 +147,7 @@ public sealed class LeaseStoreTests
         Assert.Equal(current, await later.ReadLeaseAsync(active.Deployment, cancellation));
 
         var stale = await originalStore.WriteRecordsAsync(active.Fence, Guid.NewGuid(),
-            [new(LifecycleKey.Session(table.Profile("stale-owner")), null, "{}")], cancellation);
+            [new(LifecycleKey.Demand(table.Profile("stale-owner")), null, "{}")], cancellation);
         Assert.Equal(LifecycleWriteOutcome.LeaseRejected, stale);
     }
 
