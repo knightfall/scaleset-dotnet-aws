@@ -1,6 +1,7 @@
 using System.Collections.Immutable;
 using System.Security.Cryptography;
 using System.Text.Json;
+using Knightfall.ScaleSet.Aws.Core.Catalog;
 using Knightfall.ScaleSet.Aws.Core.Lifecycle;
 using Knightfall.ScaleSet.Aws.DynamoDb;
 using ScaleSet.Client;
@@ -180,7 +181,15 @@ public sealed class GitHubListenerDeliveryHandler : IScaleSetListenerDeliveryHan
         }
 
         var demand = await _ledger.ReadDemandAsync(cancellationToken).ConfigureAwait(false);
-        var capacity = await _readCapacity(cancellationToken).ConfigureAwait(false);
+        var catalog = await _store.ReadCatalogProfileAsync(profile, cancellationToken).ConfigureAwait(false);
+        if (catalog is not null && (catalog.State == CatalogProfileState.Tombstoned ||
+            catalog.Binding.ScopeIdentity != _owned.Identity.ScopeIdentity || catalog.Binding.ScaleSetId != _owned.Identity.ScaleSetId))
+        {
+            return null;
+        }
+        var capacity = catalog is { State: CatalogProfileState.Draining or CatalogProfileState.ClosureHeld }
+            ? new ListenerCapacity(0, 0)
+            : await _readCapacity(cancellationToken).ConfigureAwait(false);
         if (capacity.Maximum < 0 || capacity.OutsideAssigned < 0)
         {
             throw new InvalidDataException("Listener capacity values must be nonnegative.");

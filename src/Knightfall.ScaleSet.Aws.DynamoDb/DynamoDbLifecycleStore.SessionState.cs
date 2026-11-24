@@ -1,4 +1,5 @@
 using Amazon.DynamoDBv2.Model;
+using Knightfall.ScaleSet.Aws.Core.Catalog;
 using Knightfall.ScaleSet.Aws.Core.Lifecycle;
 
 namespace Knightfall.ScaleSet.Aws.DynamoDb;
@@ -57,9 +58,10 @@ public sealed partial class DynamoDbLifecycleStore
 
         LifecycleRecordCondition? indexGuard = null;
         var profile = fence.Identity.Profile;
+        var ownership = LeaseCondition(fence.Lease);
         var actions = new List<TransactionAction>
         {
-            LeaseCondition(fence.Lease),
+            ownership,
             ActiveSessionCondition(fence),
         };
 
@@ -90,11 +92,26 @@ public sealed partial class DynamoDbLifecycleStore
             RequireSessionRecordKey(fence, write.Key, readOnly: false);
             actions.Add(BuildRecordWrite(fence.Lease.Deployment, transitionId, write));
         }
+        if (writes.Any(write => write is { Key.Kind: LifecycleItemKind.Acquisition, ExpectedRevision: null }))
+        {
+            var catalog = await ReadCatalogProfileAsync(profile, cancellationToken).ConfigureAwait(false);
+            if (catalog is not null && (catalog.State != CatalogProfileState.Active ||
+                catalog.Binding.ScopeIdentity != fence.Identity.ScopeIdentity || catalog.Binding.ScaleSetId != fence.Identity.ScaleSetId))
+            {
+                return LifecycleWriteOutcome.Conflict;
+            }
+            RequireCatalogSessionOpen(ownership, catalog);
+            actions.Add(CatalogAllowsSessionOpenCondition(profile, catalog));
+        }
         if (executorActions is not null)
         {
             actions.AddRange(executorActions);
         }
 
+        if (actions.Count > MaximumTransactionItems)
+        {
+            return LifecycleWriteOutcome.Conflict;
+        }
         var outcome = await WriteAsync(actions, Guid.NewGuid(), cancellationToken).ConfigureAwait(false);
         if (outcome == LifecycleWriteOutcome.RebuildRequired && indexGuard is not null)
         {

@@ -255,7 +255,7 @@ public sealed class ListenerDeliveryTests
         {
             ReadGuards =
             [
-                .. runners.Take(92), runners[0],
+                .. runners.Take(91), runners[0],
                 new(receiptKey, receipt.Revision),
                 new(LifecycleKey.Admission(profile), null),
                 new(LifecycleKey.Acquisition(profile, FirstRequest), null),

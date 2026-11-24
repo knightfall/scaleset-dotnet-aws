@@ -19,6 +19,7 @@ public sealed class ControllerLifecycleTests
 {
     private const string SecondTask = "arn:aws:ecs:us-east-1:000000000000:task/controller/00000000000000000000000000000002";
     private const string ThirdTask = "arn:aws:ecs:us-east-1:000000000000:task/controller/00000000000000000000000000000003";
+    private const string FourthTask = "arn:aws:ecs:us-east-1:000000000000:task/controller/00000000000000000000000000000004";
     private const string ProfileId = "linux-shell";
     private const string Scope = "https://github.com/enterprises/engineering";
     private static readonly string[] CurrentStage = ["AWSCURRENT"];
@@ -94,8 +95,22 @@ public sealed class ControllerLifecycleTests
             clock.Now.AddSeconds(1), clock.Now.AddSeconds(30), cancellation);
         Assert.Equal(LifecycleWriteOutcome.Conflict, unguarded.Outcome);
         Assert.Null(unguarded.Permission);
+
+        clock.Now += RetirementTiming.Freshness + TimeSpan.FromSeconds(1);
+        var closingOwner = await AcquireAsync(store, configuration, clock, ThirdTask, cancellation, SecondTask);
+        await ApplyCatalogAsync(store, closingOwner, configuration, cancellation);
+        restarted = new ProfileRetirementCoordinator(store, clock, RetirementTiming, Handoffs);
+        var staleProof = await restarted.BeginSessionRetirementAsync(profile, Authority(closingOwner, clock), opened,
+            TimeSpan.FromSeconds(30), cancellation);
+        Assert.Null(staleProof.Permission);
+        var precloseCoverage = await store.ReadExecutorInventoryAsync(profile, cancellation);
+        Assert.Equal(LifecycleWriteOutcome.Committed, await store.PublishExecutorInventoryAsync(profile, closingOwner.Fence, precloseCoverage.Revision,
+            new ExecutorInventoryObservation(clock.Now, IsComplete: true), cancellation));
+        Assert.Equal(new ProfileRetirementResult(ProfileRetirementStatus.SessionRetirementRequired, identity),
+            await restarted.AdvanceAsync(profile, Authority(closingOwner, clock), cancellation));
+
         offers = 1;
-        var denied = await restarted.BeginSessionRetirementAsync(profile, Authority(successor, clock), opened, TimeSpan.FromSeconds(30), cancellation);
+        var denied = await restarted.BeginSessionRetirementAsync(profile, Authority(closingOwner, clock), opened, TimeSpan.FromSeconds(30), cancellation);
         Assert.Null(denied.Permission);
         offers = 0;
         string retirePath = $"{GitHubWire.ServicePath}/_apis/runtime/runnerscalesets/84/sessions/{identity.SessionId:D}";
@@ -108,8 +123,8 @@ public sealed class ControllerLifecycleTests
         var remote = await ConnectAsync(configuration, clock, http, cancellation);
         var routing = Assert.Single(configuration.Profiles).GitHub;
         var laneInput = new GitHubListenerProfile(configuration, ProfileId, new GitHubScaleSetBinding(Scope, routing.RunnerGroup,
-            42, routing.ScaleSet, 84, routing.Labels), remote, successor.Fence,
-            _ => Task.FromResult<GitHubRegistrationLease?>(new GitHubRegistrationLease(successor, 1, ClockProof(clock))),
+            42, routing.ScaleSet, 84, routing.Labels), remote, closingOwner.Fence,
+            _ => Task.FromResult<GitHubRegistrationLease?>(new GitHubRegistrationLease(closingOwner, 1, ClockProof(clock))),
             _ => Task.FromResult(new ListenerCapacity(0, 0)), (_, _) => Task.FromResult(true), CancellationToken.None);
         var supervisor = new GitHubListenerSupervisor(store, clock, new GitHubListenerTiming(Reserve, TimeSpan.FromSeconds(30), TimeSpan.FromSeconds(15)));
         using var retirementLane = supervisor.Register(laneInput);
@@ -119,7 +134,7 @@ public sealed class ControllerLifecycleTests
         Assert.Single(wire.Requests, request => request.Method == HttpMethod.Delete && request.Uri.AbsolutePath == retirePath);
 
         table.Wire.Clear();
-        var rotation = await store.BeginSessionOpenAsync(binding, successor.Fence, retiredSession, "replacement-fixture",
+        var rotation = await store.BeginSessionOpenAsync(binding, closingOwner.Fence, retiredSession, "replacement-fixture",
             clock.Now.AddSeconds(1), clock.Now.AddSeconds(30), cancellation);
         Assert.Equal(LifecycleWriteOutcome.Conflict, rotation.Outcome);
         Assert.Null(rotation.Permission);
@@ -127,7 +142,7 @@ public sealed class ControllerLifecycleTests
 
         // Restart after the retired session's final demand observation has expired.
         clock.Now += RetirementTiming.Freshness + TimeSpan.FromSeconds(1);
-        var closer = await AcquireAsync(store, configuration, clock, ThirdTask, cancellation, SecondTask);
+        var closer = await AcquireAsync(store, configuration, clock, FourthTask, cancellation, ThirdTask);
         await ApplyCatalogAsync(store, closer, configuration, cancellation);
         var resumed = new ProfileRetirementCoordinator(store, clock, RetirementTiming, Handoffs);
         Assert.Equal(ProfileRetirementStatus.ReconciliationPending,

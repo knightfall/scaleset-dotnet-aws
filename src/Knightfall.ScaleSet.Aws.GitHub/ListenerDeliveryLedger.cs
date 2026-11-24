@@ -199,7 +199,8 @@ internal sealed class ListenerDeliveryLedger(DynamoDbLifecycleStore store, Owned
             var acquisitionKey = LifecycleKey.Acquisition(profile, requestId);
             bool hasJobGuard = guards.TryGetValue(jobKey, out long? jobRevision);
             bool hasAcquisitionGuard = guards.TryGetValue(acquisitionKey, out long? acquisitionRevision);
-            int additionalActions = (chosen.Count == 0 && !hasBalanceGuard ? 1 : 0) +
+            // A nonempty reservation also fences the applied profile catalog.
+            int additionalActions = (chosen.Count == 0 ? 1 + (hasBalanceGuard ? 0 : 1) : 0) +
                 (hasJobGuard ? 0 : 1) + (hasAcquisitionGuard ? 0 : 1);
             if (actions + additionalActions > MaximumTransactionActions)
             {

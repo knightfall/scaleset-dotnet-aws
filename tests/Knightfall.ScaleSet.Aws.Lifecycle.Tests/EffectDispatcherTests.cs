@@ -149,7 +149,7 @@ public sealed class EffectDispatcherTests
         var fixture = await CreateFixtureAsync(table, cancellation);
         var envelope = Launch(fixture.Profile);
         await PlanAsync(fixture, envelope, cancellation);
-        var pause = new TaskCompletionSource<MiniStackWire.PausedRead>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var pause = new TaskCompletionSource<MiniStackWire.PausedRequest>(TaskCreationOptions.RunContinuationsAsynchronously);
         var provider = new FakeProvider(fixture.Clock)
         {
             BeforeCheck = (_, _) =>

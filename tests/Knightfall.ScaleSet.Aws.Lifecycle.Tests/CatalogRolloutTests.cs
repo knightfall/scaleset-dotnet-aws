@@ -4,6 +4,10 @@ using Knightfall.ScaleSet.Aws.Core.Catalog;
 using Knightfall.ScaleSet.Aws.Core.Configuration;
 using Knightfall.ScaleSet.Aws.Core.Lifecycle;
 using Knightfall.ScaleSet.Aws.DynamoDb;
+using Knightfall.ScaleSet.Aws.GitHub;
+using Knightfall.ScaleSet.Aws.SdkContract.Tests.GitHub;
+using ScaleSet.Client;
+using ScaleSet.Listener;
 using Xunit;
 
 namespace Knightfall.ScaleSet.Aws.Lifecycle.Tests;
@@ -306,6 +310,113 @@ public sealed class CatalogRolloutTests
         Assert.NotNull(close.Permission);
         Assert.Equal(LifecycleWriteOutcome.LeaseRejected, await store.WriteSessionRecordsAsync(owned, Guid.NewGuid(),
             [new(checkpoint, 3, "{\"pending\":true}")], cancellation));
+    }
+
+    [Fact]
+    public async Task CatalogRevisionChangeFencesAnInFlightAcquisition()
+    {
+        var cancellation = TestContext.Current.CancellationToken;
+        using var table = await MiniStackTable.CreateAsync(cancellation);
+        var clock = new ContractClock { Now = MiniStackTable.Now };
+        var store = new DynamoDbLifecycleStore(table.Client, table.Name, clock);
+        var active = await ConfigurationAsync("catalog-retirement-admission", cancellation, PinListenerScaleSet);
+        var (catalog, owned) = await OpenCatalogListenerAsync(store, active, clock.Now, cancellation);
+        var profile = catalog.Profile;
+        var session = new ListenerDeliveryTests.TestSession(owned.Identity.SessionId);
+        var handler = new GitHubListenerDeliveryHandler(store, owned, session, _ => Task.FromResult(new ListenerCapacity(5, 0)), clock);
+        await ListenerDeliveryTests.InitializeAsync(handler, owned, clock.Now, 0, cancellation);
+        Assert.Equal(5, await handler.ReadPollCapacityAsync(cancellation));
+
+        const long requestId = 1;
+        var acquisition = LifecycleKey.Acquisition(profile, requestId);
+        var delivery = JobOffer(owned, clock.Now, requestId);
+        var pause = table.Wire.PauseNextTransactionWrite(acquisition);
+        var reserving = handler.HandleAsync(delivery, cancellation);
+        try
+        {
+            await pause.Captured.WaitAsync(TimeSpan.FromSeconds(5), cancellation);
+            Assert.Null(catalog.Binding.RunnerGroupId);
+            Assert.Equal(LifecycleWriteOutcome.Committed, await store.BindCatalogScaleSetAsync(owned.Lease, catalog, 42, 84, cancellation));
+        }
+        finally
+        {
+            pause.Resume();
+        }
+
+        Assert.Equal(ScaleSetListenerDeliveryDisposition.Deferred, await reserving);
+        Assert.Empty(session.Acquisitions);
+        Assert.Null(await store.ReadRecordAsync(acquisition, cancellation));
+        Assert.Null(await store.ReadRecordAsync(LifecycleKey.Admission(profile), cancellation));
+        Assert.Equal(ScaleSetListenerDeliveryDisposition.Completed, await handler.HandleAsync(delivery, cancellation));
+        Assert.Equal(requestId, Assert.Single(Assert.Single(session.Acquisitions)));
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task DrainingOrHeldCatalogAdvertisesZeroAndProcessesOffersWithoutAcquisition(bool held)
+    {
+        var cancellation = TestContext.Current.CancellationToken;
+        using var table = await MiniStackTable.CreateAsync(cancellation);
+        var clock = new ContractClock { Now = MiniStackTable.Now };
+        var store = new DynamoDbLifecycleStore(table.Client, table.Name, clock);
+        var draining = await ConfigurationAsync("catalog-retirement-drain", cancellation, profile =>
+        {
+            profile["state"] = "draining";
+            PinListenerScaleSet(profile);
+        });
+        var (catalog, owned) = await OpenCatalogListenerAsync(store, draining, clock.Now, cancellation);
+        var profile = catalog.Profile;
+        var admission = LifecycleKey.Admission(profile);
+        if (held)
+        {
+            Assert.Equal(LifecycleWriteOutcome.Committed, await store.TryHoldCatalogClosureAsync(owned.Lease, catalog,
+                [new(admission, null)], cancellation));
+        }
+        var session = new ListenerDeliveryTests.TestSession(owned.Identity.SessionId);
+        var handler = new GitHubListenerDeliveryHandler(store, owned, session, _ => Task.FromResult(new ListenerCapacity(5, 0)), clock);
+        await ListenerDeliveryTests.InitializeAsync(handler, owned, clock.Now, 0, cancellation);
+        const long requestId = 1;
+        var acquisition = LifecycleKey.Acquisition(profile, requestId);
+        Assert.Equal(LifecycleWriteOutcome.Conflict, await store.WriteSessionRecordsAsync(owned, Guid.NewGuid(),
+            [new(acquisition, null, "{}")], cancellation));
+        Assert.Equal(0, await handler.ReadPollCapacityAsync(cancellation));
+        Assert.Equal(ScaleSetListenerDeliveryDisposition.Completed, await handler.HandleAsync(JobOffer(owned, clock.Now, requestId), cancellation));
+        Assert.Empty(session.Acquisitions);
+        Assert.Null(await store.ReadRecordAsync(acquisition, cancellation));
+        Assert.Null(await store.ReadRecordAsync(admission, cancellation));
+    }
+
+    private static ScaleSetListenerDelivery JobOffer(OwnedSessionFence owned, DateTimeOffset now, long requestId) =>
+        ListenerDeliveryTests.Delivery(owned, now, new RunnerScaleSetMessage
+        {
+            MessageId = 1,
+            Statistics = new RunnerScaleSetStatistic { TotalAssignedJobs = 0 },
+            JobAvailableMessages = [new JobAvailableMessage { RunnerRequestId = requestId }],
+        });
+
+    private static void PinListenerScaleSet(JsonNode profile)
+    {
+        var routing = profile["github"]!;
+        routing["registration"] = "existing";
+        routing["scaleSetId"] = "84";
+    }
+
+    private static async Task<(CatalogProfile Catalog, OwnedSessionFence Session)> OpenCatalogListenerAsync(
+        DynamoDbLifecycleStore store, RuntimeConfiguration configuration, DateTimeOffset now, CancellationToken cancellationToken)
+    {
+        var lease = await AcquireAsync(store, configuration, MiniStackTable.FirstTask, cancellationToken);
+        await ApplyAsync(store, lease.Fence, configuration, 1, cancellationToken);
+        var profile = new LifecycleProfile(lease.Deployment, ProfileId);
+        var catalog = Assert.IsType<CatalogProfile>(await store.ReadCatalogProfileAsync(profile, cancellationToken));
+        var rebuilt = await store.AdvanceEffectRebuildAsync(profile, lease.Fence, cancellationToken);
+        Assert.Equal(EffectIndexState.Ready, rebuilt.Head?.State);
+        var binding = new SessionBinding(profile, catalog.Binding.ScopeIdentity, 84);
+        var begin = await store.BeginSessionOpenAsync(binding, lease.Fence, null, "fixture-session", now, now.AddMinutes(1), cancellationToken);
+        var opening = Assert.IsType<SessionSendAuthorization>(begin.Permission);
+        Assert.True(opening.TryConsume(out _));
+        var opened = await store.ConfirmSessionOpenedAsync(opening, Guid.NewGuid(), cancellationToken);
+        return (catalog, Assert.IsType<OwnedSessionFence>(opened.Session?.Fence));
     }
 
     private static async Task<RuntimeConfiguration> ConfigurationAsync(
