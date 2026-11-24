@@ -153,28 +153,30 @@ public sealed partial class GitHubJitHandoff
             return new GitHubJitResult(GitHubJitStatus.RecoveryRequired);
         }
 
+        GitHubOperationException? failure = null;
         try
         {
             var result = await connection.GenerateJitAsync(permission, cancellationToken).ConfigureAwait(false);
             var offer = Seal(result.EncodedJitConfig, handoff);
             var published = await _store.PublishJitHandoffAsync(live, current, staged, attempt!, result.Runner!.Id, offer, cancellationToken)
                 .ConfigureAwait(false);
-            if (published is not { Outcome: LifecycleWriteOutcome.Committed, Handoff.State: JitHandoffState.Offered })
+            if (published is { Outcome: LifecycleWriteOutcome.Committed, Handoff.State: JitHandoffState.Offered })
             {
-                return new GitHubJitResult(GitHubJitStatus.RecoveryRequired);
+                return await SettlePublishedAsync(clock, live, attempt!, published.Handoff, cancellationToken).ConfigureAwait(false);
             }
-            return await SettlePublishedAsync(clock, live, attempt!, published.Handoff, cancellationToken).ConfigureAwait(false);
         }
-        catch (GitHubOperationException failure)
+        catch (GitHubOperationException error)
         {
-            _ = await _journal.MarkUncertainAsync(live, attempt!, Guid.NewGuid(), permission.Attempt.Id, cancellationToken)
-                .ConfigureAwait(false);
-            return new GitHubJitResult(GitHubJitStatus.RecoveryRequired, Failure: failure);
+            failure = error;
         }
-        catch (Exception failure) when (failure is CryptographicException or ArgumentException)
+        catch (Exception error) when (error is CryptographicException or ArgumentException)
         {
-            return new GitHubJitResult(GitHubJitStatus.RecoveryRequired);
+            // Retain the exact attempt if a response cannot be sealed.
         }
+        // Only the caller that finished the send and all publication attempts may end the active send phase.
+        _ = await _journal.MarkUncertainAsync(live, attempt!, Guid.NewGuid(), permission.Attempt.Id, cancellationToken)
+            .ConfigureAwait(false);
+        return new GitHubJitResult(GitHubJitStatus.RecoveryRequired, Failure: failure);
     }
 
     private JitOfferEnvelope Seal(string encoded, JitHandoffSnapshot handoff)

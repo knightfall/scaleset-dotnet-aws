@@ -186,7 +186,7 @@ public sealed class JitHandoffStoreTests
     }
 
     [Fact]
-    public async Task RediscoveredRegistrationWithoutPlaintextRemainsUnissuedAndCannotBeMintedAgain()
+    public async Task ActiveRecoveryWaitsForUncertaintyBeforeRecordingAnUnissuedRegistration()
     {
         var cancellation = TestContext.Current.CancellationToken;
         using var table = await MiniStackTable.CreateAsync(cancellation);
@@ -194,7 +194,24 @@ public sealed class JitHandoffStoreTests
         var fixture = await CreateFixtureAsync(table, cancellation);
         var (staged, attempt) = await StageAndBeginAsync(fixture, recipient, cancellation);
 
-        var reconciled = await fixture.Store.RecordUnissuedJitAsync(fixture.Lease, staged, attempt, RunnerId, cancellation);
+        table.Wire.Clear();
+        var overlap = await fixture.Store.RecordUnissuedJitAsync(fixture.Lease, staged, attempt, RunnerId, cancellation);
+        Assert.Equal(LifecycleWriteOutcome.Conflict, overlap.Outcome);
+        Assert.Null(overlap.Handoff);
+        Assert.DoesNotContain(table.Wire.Requests, call => call.Operation == "TransactWriteItems");
+        var unchanged = Assert.IsType<JitHandoffSnapshot>(
+            await fixture.Store.ReadJitHandoffAsync(fixture.Catalog.Profile, fixture.Identity.AllocationId, cancellation));
+        Assert.Equal(staged.TransitionId, unchanged.TransitionId);
+        Assert.Equal(JitHandoffState.Staged, unchanged.State);
+        Assert.Equal(fixture.Executor, await fixture.Store.ReadExecutorAsync(fixture.Catalog.Profile,
+            fixture.Executor.Binding.AllocationId, cancellation));
+
+        Assert.Equal(LifecycleWriteOutcome.Committed, await fixture.Journal.MarkUncertainAsync(fixture.Lease, attempt,
+            Guid.NewGuid(), Assert.IsType<EffectAttempt>(attempt.Entry.Attempt).Id, cancellation));
+        var uncertain = Assert.IsType<EffectJournalSnapshot>(
+            await fixture.Journal.ReadAsync(fixture.Catalog.Profile, staged.IntentId, cancellation));
+        Assert.Equal(EffectState.Uncertain, uncertain.Entry.State);
+        var reconciled = await fixture.Store.RecordUnissuedJitAsync(fixture.Lease, staged, uncertain, RunnerId, cancellation);
         Assert.Equal(LifecycleWriteOutcome.Committed, reconciled.Outcome);
         Assert.Equal(JitHandoffState.RegisteredWithoutOffer, reconciled.Handoff?.State);
         Assert.Equal(RunnerId, reconciled.Handoff?.RunnerId);

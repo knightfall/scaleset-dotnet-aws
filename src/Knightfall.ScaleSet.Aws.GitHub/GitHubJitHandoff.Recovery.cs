@@ -70,7 +70,8 @@ public sealed partial class GitHubJitHandoff
         {
             return Applied(envelope);
         }
-        if (handoff.State != JitHandoffState.Staged)
+        if (handoff.State != JitHandoffState.Staged ||
+            (lease.Mode == ControllerLeaseMode.Active && attempt.Entry.State != EffectState.Uncertain))
         {
             return null;
         }

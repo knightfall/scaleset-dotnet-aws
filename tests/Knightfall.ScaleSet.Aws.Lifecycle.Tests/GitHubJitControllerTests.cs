@@ -180,6 +180,60 @@ public sealed class GitHubJitControllerTests
         Assert.DoesNotContain(table.Wire.Requests, request => request.Request.GetRawText().Contains(EncodedJit, StringComparison.Ordinal));
     }
 
+    [Fact]
+    public async Task ConcurrentRecoveryLeavesAStillExecutingSendFreeToPublishItsOffer()
+    {
+        var token = TestContext.Current.CancellationToken;
+        using var table = await MiniStackTable.CreateAsync(token);
+        var configuration = await ControllerLifecycleTests.ConfigurationAsync(draining: false, token);
+        var fixture = await JitHandoffStoreTests.CreateFixtureAsync(table, token, configuration);
+        using var recipient = JitRecipientKey.Create();
+        Assert.Equal(LifecycleWriteOutcome.Committed, await fixture.Bootstrap.RegisterHelloAsync(recipient.Hello, token));
+        var name = "ss-" + JitOfferBinding.GetOfferId(fixture.Identity)[..48];
+        string runner = RunnerJson(fixture.Identity.ScaleSetId, name);
+        var created = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        using var wire = new GitHubWire(async (request, cancellation) =>
+        {
+            if (request.Method == HttpMethod.Post)
+            {
+                Assert.Equal(JitPath(fixture.Identity.ScaleSetId), request.Uri.AbsolutePath);
+                AssertJitCommand(request, name);
+                created.TrySetResult();
+                await release.Task.WaitAsync(cancellation);
+                return GitHubWire.Json(HttpStatusCode.OK, $$"""{"runner":{{runner}},"encodedJITConfig":"{{EncodedJit}}"}""");
+            }
+            Assert.Equal(HttpMethod.Get, request.Method);
+            return request.Uri.AbsolutePath == RunnersPath
+                ? GitHubWire.Json(HttpStatusCode.OK, $$"""{"count":1,"value":[{{runner}}]}""")
+                : GitHubWire.Json(HttpStatusCode.OK, runner);
+        });
+        using var http = new HttpClient(wire, disposeHandler: false);
+        using var connection = await ControllerLifecycleTests.ConnectAsync(configuration, fixture.Clock, http, token);
+        var authority = new ActiveControllerAuthority(fixture.Lease, Proof(fixture.Clock));
+        var sender = new GitHubJitHandoff(fixture.Store, fixture.Clock, Timing);
+        var issuing = sender.IssueAsync(authority, fixture.Identity, fixture.Clock.Now, connection, CancellationToken.None, token);
+        try
+        {
+            await created.Task.WaitAsync(TimeSpan.FromSeconds(5), token);
+            var concurrent = new GitHubJitHandoff(fixture.Store, fixture.Clock, Timing);
+            Assert.Equal(GitHubJitStatus.RecoveryRequired,
+                (await concurrent.IssueAsync(authority, fixture.Identity, fixture.Clock.Now, connection, CancellationToken.None, token)).Status);
+            var pending = await fixture.Store.ReadJitHandoffAsync(fixture.Catalog.Profile, fixture.Identity.AllocationId, token);
+            Assert.Equal(JitHandoffState.Staged, pending?.State);
+            Assert.Single(ServiceRequests(wire), request => request.Method == HttpMethod.Post);
+            Assert.DoesNotContain(ServiceRequests(wire), request => request.Method == HttpMethod.Get);
+        }
+        finally
+        {
+            release.TrySetResult();
+        }
+        Assert.Equal(new GitHubJitResult(GitHubJitStatus.Offered, RunnerId), await issuing);
+        var receipt = await fixture.Bootstrap.TryConsumeOfferAsync(recipient.Hello, token);
+        using var plaintext = recipient.Open(Assert.IsType<JitOfferEnvelope>(receipt.Offer), fixture.Identity, fixture.Clock);
+        Assert.Equal(EncodedJit, Encoding.UTF8.GetString(plaintext.Bytes));
+    }
+
     [Theory]
     [InlineData(true)]
     [InlineData(false)]

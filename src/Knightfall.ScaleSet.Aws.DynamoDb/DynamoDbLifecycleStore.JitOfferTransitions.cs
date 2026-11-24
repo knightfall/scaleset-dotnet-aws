@@ -89,7 +89,9 @@ public sealed partial class DynamoDbLifecycleStore
         }
         if (!MatchesJitRequest(attempt.Entry.Envelope, handoff) ||
             attempt.Entry.State is not (EffectState.Executing or EffectState.Uncertain) || attempt.Entry.Attempt is not { } send ||
-            (lease.Mode == ControllerLeaseMode.Active ? send.LeaseEpoch != lease.Epoch : send.LeaseEpoch >= lease.Epoch))
+            (lease.Mode == ControllerLeaseMode.Active
+                ? send.LeaseEpoch != lease.Epoch || attempt.Entry.State != EffectState.Uncertain
+                : send.LeaseEpoch >= lease.Epoch))
         {
             return new JitHandoffChange(LifecycleWriteOutcome.Conflict);
         }
