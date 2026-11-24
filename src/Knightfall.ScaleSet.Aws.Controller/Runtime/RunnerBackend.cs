@@ -15,6 +15,8 @@ internal interface IRunnerBackend
 {
     IReconciliationEffectProvider Effects { get; }
 
+    IReconciliationEffectProvider ObservationEffects => Effects;
+
     Task<RunnerBackendInventory> ReadAsync(ControllerLease lease, CancellationToken cancellationToken);
 
     Task ReconcileLaunchesAsync(ActiveControllerAuthority authority, CatalogProfile catalog, bool allowPreparedLaunches,

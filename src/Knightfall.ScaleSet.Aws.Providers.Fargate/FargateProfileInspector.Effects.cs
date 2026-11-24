@@ -46,9 +46,18 @@ public sealed partial class FargateProfileInspector
     public IFargateReplayEffectProvider CreateEffectProvider(RuntimeConfiguration configuration, LifecycleProfile profile,
         FargateContainerApproval approval)
     {
+        ArgumentNullException.ThrowIfNull(approval);
+        return CreateEffects(configuration, profile, approval);
+    }
+
+    /// <summary>Exposes exact readback and independently fenced cleanup while launch approval is unavailable.</summary>
+    public IReconciliationEffectProvider CreateEffectObserver(RuntimeConfiguration configuration, LifecycleProfile profile) =>
+        CreateEffects(configuration, profile, null);
+
+    private EffectProvider CreateEffects(RuntimeConfiguration configuration, LifecycleProfile profile, FargateContainerApproval? approval)
+    {
         ArgumentNullException.ThrowIfNull(configuration);
         ArgumentNullException.ThrowIfNull(profile);
-        ArgumentNullException.ThrowIfNull(approval);
         if (configuration.Mode != ControllerMode.Active || profile.Deployment != RunnerOwnershipTags.DeploymentIdentity(configuration))
         {
             throw new ArgumentException("Fargate effects require the exact deployment of an active controller.", nameof(profile));
@@ -108,7 +117,7 @@ public sealed partial class FargateProfileInspector
     }
 
     private sealed class EffectProvider(FargateProfileInspector inspector, RuntimeConfiguration configuration,
-        LifecycleProfile profile, InspectionTarget target, FargateContainerApproval approval) : IFargateReplayEffectProvider
+        LifecycleProfile profile, InspectionTarget target, FargateContainerApproval? approval) : IFargateReplayEffectProvider
     {
         private readonly TelemetryProfile? _telemetryProfile = TelemetryProfile.From(target.Profile);
 
@@ -162,7 +171,7 @@ public sealed partial class FargateProfileInspector
             {
                 return envelope.Request switch
                 {
-                    FargateLaunchEffectRequest launch when IsScopedLaunch(launch) &&
+                    FargateLaunchEffectRequest launch when approval is not null && IsScopedLaunch(launch) &&
                         envelope.ProviderReplayDeadline is { } cutoff && now < cutoff && attempt.Deadline <= cutoff =>
                         await SendLaunchAsync(envelope, launch, cancellationToken).ConfigureAwait(false),
                     // The dispatcher has checked the AWS identity and consumed the cleanup attempt at its final durable fence.
@@ -239,6 +248,10 @@ public sealed partial class FargateProfileInspector
 
         private async Task<bool> CheckLaunchAsync(FargateLaunchEffectRequest request, CancellationToken cancellationToken)
         {
+            if (approval is null)
+            {
+                return false;
+            }
             var preflight = await inspector.ResolvePreflightAsync(configuration, profile.ProfileId, approval, cancellationToken).ConfigureAwait(false);
             return preflight is { IsReady: true, Task: { } verified } && verified.CpuUnits == request.CpuUnits &&
                 request.SecurityGroupIds.SequenceEqual(verified.SecurityGroupIds.Order(StringComparer.Ordinal)) &&

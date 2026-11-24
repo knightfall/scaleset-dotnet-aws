@@ -5,7 +5,12 @@ public sealed partial class FargateProfileInspector
     private static readonly TimeSpan ObservationFreshness = TimeSpan.FromMinutes(10);
 
     public FargateHeadroom EstimateHeadroom(FargateResolvedTask task,
-        FargateInventorySnapshot inventory, FargateQuotaEvidence? quota, IReadOnlyCollection<FargateLaunchReservation>? outstanding)
+        FargateInventorySnapshot inventory, FargateQuotaEvidence? quota, IReadOnlyCollection<FargateLaunchReservation>? outstanding) =>
+        EstimateHeadroom(task, inventory, quota, outstanding, []);
+
+    public FargateHeadroom EstimateHeadroom(FargateResolvedTask task,
+        FargateInventorySnapshot inventory, FargateQuotaEvidence? quota, IReadOnlyCollection<FargateLaunchReservation>? outstanding,
+        IReadOnlyCollection<FargateInventorySnapshot> otherProfiles)
     {
         ArgumentNullException.ThrowIfNull(task);
         ArgumentNullException.ThrowIfNull(inventory);
@@ -17,12 +22,22 @@ public sealed partial class FargateProfileInspector
         }
 
         var requested = new HashSet<Guid>();
-        var attached = new Dictionary<Guid, FargateTaskObservation>();
-        foreach (var observation in inventory.Tasks.Where(observation => observation.IsOwned && !observation.AttachedSubnetIds.IsDefaultOrEmpty))
+        var attached = new Dictionary<Guid, (FargateTaskObservation Task, DateTimeOffset InventoryAt)>();
+        var snapshots = otherProfiles.Where(sample => sample.IsProfileComplete && !sample.Tasks.IsDefault &&
+            sample.Scope.Account == task.Scope.Account && sample.Scope.Region == task.Scope.Region && sample.Scope.ProfileId != task.Scope.ProfileId &&
+            Fresh(sample.ObservedAt, now)).Prepend(inventory);
+        foreach (var sample in snapshots)
         {
-            if (observation.AllocationId is not { } allocation || !attached.TryAdd(allocation, observation))
+            foreach (var observation in sample.Tasks)
             {
-                return new FargateHeadroom(null, null, null);
+                if (!observation.IsOwned || observation.AttachedSubnetIds.IsDefaultOrEmpty || observation.State == FargateTaskState.Stopped)
+                {
+                    continue;
+                }
+                if (observation.AllocationId is not { } allocation || !attached.TryAdd(allocation, (observation, sample.ObservedAt)))
+                {
+                    return new FargateHeadroom(null, null, null);
+                }
             }
         }
         var scopeSubnets = task.Subnets.Select(subnet => subnet.SubnetId).ToHashSet(StringComparer.Ordinal);
@@ -37,10 +52,10 @@ public sealed partial class FargateProfileInspector
             }
 
             bool observedAttached = attached.TryGetValue(launch.AllocationId, out var resource) &&
-                (launch.TaskArn is null || launch.TaskArn == resource.ResourceArn) &&
-                resource.AttachedSubnetIds.All(launch.EligibleSubnetIds.Contains);
-            DateTimeOffset? attachment = observedAttached && resource!.AttachmentObservedAt is { } observed &&
-                observed >= inventory.ObservedAt && Fresh(observed, now) ? observed : null;
+                (launch.TaskArn is null || launch.TaskArn == resource.Task.ResourceArn) &&
+                resource.Task.AttachedSubnetIds.All(launch.EligibleSubnetIds.Contains);
+            DateTimeOffset? attachment = observedAttached && resource.Task.AttachmentObservedAt is { } observed &&
+                observed >= resource.InventoryAt && Fresh(observed, now) ? observed : null;
             // Only an attachment observed before sampling is already represented in that sample.
             if (launch.EligibleSubnetIds.Any(scopeSubnets.Contains) &&
                 (attachment is not { } attachedForIp || attachedForIp >= task.SubnetSampleStartedAt))
