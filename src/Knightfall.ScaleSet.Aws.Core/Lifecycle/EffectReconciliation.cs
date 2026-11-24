@@ -19,7 +19,7 @@ public static class EffectIntentIdentity
 }
 
 public sealed record EffectDispatchPrecondition(
-    string EnvelopeSha256, EffectTargetBinding Target, DateTimeOffset ObservedAt, bool Eligible)
+    string EnvelopeSha256, EffectTargetBinding Target, DateTimeOffset ObservedAt, bool Eligible, EffectEvidence? AlreadyApplied = null)
 {
     public bool DefinitivelyObsolete { get; init; }
 }
@@ -32,4 +32,14 @@ public interface IReconciliationEffectProvider
     Task<EffectEvidence?> SendAsync(EffectEnvelope envelope, EffectAttempt attempt, CancellationToken cancellationToken);
 
     Task<EffectEvidence?> ObserveAsync(EffectEnvelope envelope, EffectAttempt attempt, CancellationToken cancellationToken);
+}
+
+/// <summary>A complete answer from exact allocation correlation, with optional positive resource evidence.</summary>
+public sealed record FargateReplayObservation(string EnvelopeSha256, EffectTargetBinding Target, DateTimeOffset ObservedAt,
+    bool IsComplete, EffectEvidence? Evidence = null);
+
+public interface IFargateReplayEffectProvider : IReconciliationEffectProvider
+{
+    Task<FargateReplayObservation?> ObserveForReplayAsync(EffectEnvelope envelope, EffectAttempt attempt,
+        CancellationToken cancellationToken);
 }

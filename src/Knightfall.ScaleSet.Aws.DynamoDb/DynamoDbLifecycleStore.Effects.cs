@@ -80,15 +80,17 @@ public sealed partial class DynamoDbLifecycleStore
         EffectWrite write,
         EffectDispatchGuard guard,
         DateTimeOffset attemptDeadline,
-        CancellationToken cancellationToken) =>
-        WriteEffectAsync(profile, lease, transitionId, write, LeaseAccess.Active, cancellationToken, guard, attemptDeadline);
+        CancellationToken cancellationToken,
+        EffectJournalSnapshot? replayOf = null) =>
+        WriteEffectAsync(profile, lease, transitionId, write, LeaseAccess.Active, cancellationToken, guard, attemptDeadline,
+            exactPrevious: replayOf);
 
     internal Task<LifecycleWriteOutcome> WriteExactEffectAsync(
         DeploymentLeaseFence lease, Guid transitionId, EffectJournalSnapshot expected, EffectJournalEntry replacement,
-        DateTimeOffset? leaseValidThrough, CancellationToken cancellationToken) =>
+        DateTimeOffset? leaseValidThrough, CancellationToken cancellationToken, EffectDispatchGuard? guard = null) =>
         WriteEffectAsync(replacement.Envelope.Profile, lease, transitionId,
             new EffectWrite(replacement.Envelope.IntentId, expected.Revision, replacement.State, replacement.WritePayload()),
-            LeaseAccess.Active, cancellationToken, leaseValidThrough: leaseValidThrough, exactPrevious: expected);
+            LeaseAccess.Active, cancellationToken, guard, leaseValidThrough, exactPrevious: expected);
 
     private async Task<LifecycleWriteOutcome> WriteEffectAsync(
         LifecycleProfile profile,
@@ -124,7 +126,7 @@ public sealed partial class DynamoDbLifecycleStore
         {
             return LifecycleWriteOutcome.Conflict;
         }
-        if (guard is not null && (head != guard.Index || existing?.State != EffectState.Planned))
+        if (guard is not null && (head != guard.Index || existing?.State != (exactPrevious?.Entry.State ?? EffectState.Planned)))
         {
             return LifecycleWriteOutcome.Conflict;
         }
@@ -191,6 +193,10 @@ public sealed partial class DynamoDbLifecycleStore
             if (guard.Ec2Lineage is { } lineage)
             {
                 actions.Add(ExactEc2LineageCondition(lineage));
+            }
+            if (guard.FargateStopAdmission is { } admission)
+            {
+                actions.Add(RecordRevisionCondition(admission));
             }
         }
         if (requiredCatalog is not null)

@@ -27,7 +27,7 @@ public static class ExecutorClassifier
         {
             return Gone;
         }
-        if (!IsFresh(resource.ObservedAt, now, freshness))
+        if (executor.AdmissionClosure is not null || !IsFresh(resource.ObservedAt, now, freshness))
         {
             return Unknown;
         }

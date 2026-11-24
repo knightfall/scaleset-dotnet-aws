@@ -96,7 +96,9 @@ public sealed record FargateLaunchEffectRequest(
     string TaskRoleArn,
     string ExecutionRoleArn,
     string RunnerContainer,
-    Guid ClientToken) : EffectEnvelopeRequest
+    Guid ClientToken,
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] FargateLaunchOwnershipTags? OwnershipTags = null,
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] int? CpuUnits = null) : EffectEnvelopeRequest
 {
     public int Count { get; } = 1;
     public string LaunchType { get; } = "FARGATE";
@@ -121,6 +123,11 @@ public sealed record FargateLaunchEffectRequest(
         EffectRequestIdentifiers.RequireSameAccount(ClusterArn, TaskDefinitionArn, nameof(TaskDefinitionArn), matchRegion: true);
         EffectRequestIdentifiers.RequireSameAccount(ClusterArn, TaskRoleArn, nameof(TaskRoleArn), matchRegion: false);
         EffectRequestIdentifiers.RequireSameAccount(ClusterArn, ExecutionRoleArn, nameof(ExecutionRoleArn), matchRegion: false);
+        if ((OwnershipTags is null) != (CpuUnits is null) || CpuUnits is <= 0 ||
+            (OwnershipTags is not null && (SubnetIds.Length > 16 || SecurityGroupIds.Length > 5)))
+        {
+            throw new ArgumentException("A tracked Fargate launch requires exact ownership and verified CPU and network inputs.");
+        }
         return this with
         {
             SubnetIds = EffectRequestIdentifiers.OrderedIds(SubnetIds, EffectRequestIdentifiers.SubnetId, nameof(SubnetIds)),
@@ -158,10 +165,12 @@ public sealed record FargateStopEffectRequest(
     Guid AllocationId,
     string ClusterArn,
     string TaskArn,
-    string TaskDefinitionArn) : EffectEnvelopeRequest
+    string TaskDefinitionArn,
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] Guid? Incarnation = null) : EffectEnvelopeRequest
 {
     [JsonIgnore]
-    public override EffectTargetBinding Target => new(TaskArn, AllocationId.ToString("D") + "/" + TaskDefinitionArn);
+    public override EffectTargetBinding Target => new(TaskArn, AllocationId.ToString("D") + "/" + TaskDefinitionArn +
+        (Incarnation is Guid incarnation ? "/" + incarnation.ToString("D") : string.Empty));
 
     internal override EffectEnvelopeRequest Normalize()
     {
@@ -176,6 +185,10 @@ public sealed record FargateStopEffectRequest(
         if (!StringComparer.Ordinal.Equals(cluster, taskCluster))
         {
             throw new ArgumentException("The task target must belong to the selected cluster.", nameof(TaskArn));
+        }
+        if (Incarnation is Guid incarnation && incarnation != FargateExecutorIncarnation.Compute(TaskArn, TaskDefinitionArn, AllocationId))
+        {
+            throw new ArgumentException("The task target must use its exact provider incarnation.", nameof(Incarnation));
         }
         return this;
     }

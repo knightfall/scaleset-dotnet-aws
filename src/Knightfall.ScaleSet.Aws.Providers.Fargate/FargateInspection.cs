@@ -73,7 +73,8 @@ public sealed record FargateTaskObservation(
     ImmutableArray<string> AttachedSubnetIds,
     DateTimeOffset? AttachmentObservedAt,
     bool InConfiguredSubnet,
-    bool? ExecuteCommandEnabled)
+    bool? ExecuteCommandEnabled,
+    long? ProviderVersion = null)
 {
     public bool IsOwned => Incarnation.HasValue;
 }

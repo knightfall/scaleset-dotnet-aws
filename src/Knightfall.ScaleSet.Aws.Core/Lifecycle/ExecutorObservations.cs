@@ -9,9 +9,17 @@ public static class ExecutorObservations
         ArgumentNullException.ThrowIfNull(observation);
         if (!Enum.IsDefined(observation.State) || observation.EvidenceId == Guid.Empty ||
             !IsLocalObservation(observation.ObservedAt, now) || observation.StartedAt > observation.ObservedAt ||
-            observation.StartedAt == default(DateTimeOffset))
+            observation.StartedAt == default(DateTimeOffset) || observation.ProviderVersion is < 0 ||
+            (observation.ProviderVersion.HasValue && executor.Binding.Provider is not FargateExecutorIdentity))
         {
             throw new ArgumentException("A valid resource observation is required.", nameof(observation));
+        }
+
+        var current = executor.Resource;
+        if (current?.ProviderVersion is long version && (observation.ProviderVersion is null || observation.ProviderVersion < version))
+        {
+            // ECS can return an older task version when an event is redelivered after process restart.
+            return executor;
         }
 
         var startedAt = executor.StartedAt ?? observation.StartedAt;
@@ -25,14 +33,21 @@ public static class ExecutorObservations
             presentAt = observation.ObservedAt;
         }
 
-        var current = executor.Resource;
         bool conflict = executor.HasConflict ||
             (executor.StartedAt is not null && observation.StartedAt is not null && executor.StartedAt != observation.StartedAt);
         if (current?.State == ExecutorResourceState.IrreversiblyTerminated)
         {
-            if (observation.State == ExecutorResourceState.IrreversiblyTerminated && observation.ObservedAt < current.ObservedAt)
+            if (observation.State == ExecutorResourceState.IrreversiblyTerminated)
             {
-                current = observation;
+                if (observation.ObservedAt < current.ObservedAt)
+                {
+                    current = observation;
+                }
+                else if (observation.ProviderVersion is long stoppedVersion &&
+                    (current.ProviderVersion is null || stoppedVersion > current.ProviderVersion))
+                {
+                    current = current with { ProviderVersion = stoppedVersion };
+                }
             }
             conflict |= presentAt >= current.ObservedAt || executor.LastProcessReadyAt >= current.ObservedAt;
         }
@@ -41,7 +56,8 @@ public static class ExecutorObservations
             current = observation;
             conflict |= presentAt >= observation.ObservedAt || executor.LastProcessReadyAt >= observation.ObservedAt;
         }
-        else if (current is null || observation.ObservedAt > current.ObservedAt)
+        else if (current is null || observation.ObservedAt > current.ObservedAt ||
+            (observation.ProviderVersion is long newer && (current.ProviderVersion is null || newer > current.ProviderVersion)))
         {
             current = observation;
         }

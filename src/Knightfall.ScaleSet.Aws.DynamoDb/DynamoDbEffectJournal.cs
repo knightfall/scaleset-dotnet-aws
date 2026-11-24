@@ -12,7 +12,8 @@ public sealed record EffectBeginOutcome(LifecycleWriteOutcome Outcome, EffectSen
 
 internal sealed record EffectDispatchGuard(
     CatalogProfile Catalog, EffectIndexHead Index, string AllocationId, long? AllocationRevision,
-    JitHandoffSnapshot? Handoff = null, JitHandoffSnapshot? Removal = null, Ec2LaunchLineageSnapshot? Ec2Lineage = null);
+    JitHandoffSnapshot? Handoff = null, JitHandoffSnapshot? Removal = null, Ec2LaunchLineageSnapshot? Ec2Lineage = null,
+    LifecycleRecordCondition? FargateStopAdmission = null);
 
 /// <summary>Evidence that an attempt was durably begun under its recorded lease epoch.</summary>
 /// <remarks>A caller must retain current ownership and respect the attempt deadline when sending.</remarks>
@@ -123,12 +124,17 @@ public sealed partial class DynamoDbEffectJournal
             return registration;
         }
 
-        if (envelope.Request is Ec2LaunchEffectRequest { OwnershipTags: not null } launch)
+        if (envelope.Request is Ec2LaunchEffectRequest { OwnershipTags: not null } ec2)
         {
-            return launch.AttemptOrdinal == 0
+            return ec2.AttemptOrdinal == 0
                 ? await _store.PlanTrackedEc2LaunchAsync(lease, envelope, null, transitionId, cancellationToken).ConfigureAwait(false)
                 : LifecycleWriteOutcome.Conflict;
         }
+        if (envelope.Request is FargateLaunchEffectRequest { OwnershipTags: not null } fargate)
+        {
+            return await _store.PlanTrackedFargateLaunchAsync(lease, envelope, fargate, transitionId, cancellationToken).ConfigureAwait(false);
+        }
+
         return await WriteAsync(lease, EffectJournalEntry.Plan(envelope), null, transitionId, cancellationToken)
             .ConfigureAwait(false);
     }
@@ -164,6 +170,12 @@ public sealed partial class DynamoDbEffectJournal
         CancellationToken cancellationToken) =>
         BeginCoreAsync(lease, expected, Guid.NewGuid(), Guid.NewGuid(), upperUtcNow, requestedDeadline, leaseReserve, guard, cancellationToken);
 
+    internal Task<EffectBeginOutcome> BeginFargateReplayAsync(ControllerLease lease, EffectJournalSnapshot previous,
+        DateTimeOffset lowerUtcNow, DateTimeOffset upperUtcNow, DateTimeOffset requestedDeadline, TimeSpan leaseReserve,
+        EffectDispatchGuard guard, CancellationToken cancellationToken) =>
+        BeginCoreAsync(lease, previous, Guid.NewGuid(), Guid.NewGuid(), upperUtcNow, requestedDeadline, leaseReserve,
+            guard, cancellationToken, lowerUtcNow);
+
     private async Task<EffectBeginOutcome> BeginCoreAsync(
         ControllerLease lease,
         EffectJournalSnapshot expected,
@@ -173,7 +185,8 @@ public sealed partial class DynamoDbEffectJournal
         DateTimeOffset requestedDeadline,
         TimeSpan leaseReserve,
         EffectDispatchGuard? guard,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        DateTimeOffset? replayLowerBound = null)
     {
         long beganAt = _timeProvider.GetTimestamp();
         var current = await ReadCurrentAsync(lease, expected, transitionId, cancellationToken).ConfigureAwait(false);
@@ -189,14 +202,23 @@ public sealed partial class DynamoDbEffectJournal
             return new EffectBeginOutcome(LifecycleWriteOutcome.Conflict, null);
         }
 
+        if (guard is null && current.Entry.Envelope.Request is
+            (FargateLaunchEffectRequest { OwnershipTags: not null } or FargateStopEffectRequest { Incarnation: not null }))
+        {
+            return new EffectBeginOutcome(LifecycleWriteOutcome.Conflict, null);
+        }
+
         var now = UpperNow(upperUtcNow, beganAt);
-        if (guard is not null && (current.Entry.State != EffectState.Planned || now >= requestedDeadline ||
+        if (guard is not null && ((replayLowerBound is null && current.Entry.State != EffectState.Planned) || now >= requestedDeadline ||
             lease.ValidUntil - now <= leaseReserve || now >= current.Entry.Envelope.ProviderReplayDeadline ||
             now < current.Entry.Envelope.EarliestPossibleFirstSend))
         {
             return new EffectBeginOutcome(LifecycleWriteOutcome.Conflict, null);
         }
-        var entry = current.Entry.Begin(attemptId, lease.Fence.Epoch, now, requestedDeadline, LeaseDeadline(lease, now, leaseReserve));
+        var leaseDeadline = LeaseDeadline(lease, now, leaseReserve);
+        var entry = replayLowerBound is { } lower
+            ? current.Entry.BeginFargateReplay(attemptId, lease.Epoch, lower, now, requestedDeadline, leaseDeadline)
+            : current.Entry.Begin(attemptId, lease.Epoch, now, requestedDeadline, leaseDeadline);
         var attempt = entry.Attempt!;
         var permission = new EffectSendAuthorization(entry.Envelope, attempt, checked(current.Revision + 1), transitionId, lease.Fence,
             _timeProvider, beganAt, upperUtcNow);
@@ -207,10 +229,10 @@ public sealed partial class DynamoDbEffectJournal
                 ? await WriteAsync(lease, entry, current.Revision, transitionId, cancellationToken).ConfigureAwait(false)
                 : await _store.WriteDispatchedEffectAsync(entry.Envelope.Profile, lease.Fence, transitionId,
                     new EffectWrite(entry.Envelope.IntentId, current.Revision, entry.State, entry.WritePayload()),
-                    guard, attempt.Deadline, cancellationToken).ConfigureAwait(false);
+                    guard, attempt.Deadline, cancellationToken, replayLowerBound is null ? null : current).ConfigureAwait(false);
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested &&
-            entry.Envelope.Request is Ec2LaunchEffectRequest { OwnershipTags: not null })
+            entry.Envelope.Request is Ec2LaunchEffectRequest { OwnershipTags: not null } or FargateStopEffectRequest { Incarnation: not null })
         {
             // An exact committed Begin can be discarded because no authorization reached the caller.
             _ = await FinalizeInterruptedEffectAsync(lease, permission, leaseReserve).ConfigureAwait(false);
@@ -246,6 +268,11 @@ public sealed partial class DynamoDbEffectJournal
         long beganAt = _timeProvider.GetTimestamp();
         var current = await ReadCurrentAsync(lease, expected, transitionId, cancellationToken).ConfigureAwait(false);
         if (current is null)
+        {
+            return LifecycleWriteOutcome.Conflict;
+        }
+
+        if (current.Entry.Envelope.Request is FargateLaunchEffectRequest { OwnershipTags: not null })
         {
             return LifecycleWriteOutcome.Conflict;
         }
@@ -331,8 +358,9 @@ public sealed partial class DynamoDbEffectJournal
         var entry = current.Entry.Resolve(evidence);
         if (evidence.ExecutorBinding is not null)
         {
-            return await _store.WriteEc2ResourceSettlementAsync(lease, current, entry, transitionId, cancellationToken)
-                .ConfigureAwait(false);
+            return current.Entry.Envelope.Request is FargateLaunchEffectRequest or FargateStopEffectRequest
+                ? await _store.WriteFargateResourceSettlementAsync(lease, current, entry, transitionId, cancellationToken).ConfigureAwait(false)
+                : await _store.WriteEc2ResourceSettlementAsync(lease, current, entry, transitionId, cancellationToken).ConfigureAwait(false);
         }
         if (lease.Mode == ControllerLeaseMode.RecoveryOnly)
         {

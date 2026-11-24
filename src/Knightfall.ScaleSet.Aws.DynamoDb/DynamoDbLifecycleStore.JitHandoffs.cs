@@ -54,7 +54,7 @@ public sealed partial class DynamoDbLifecycleStore
             return new JitHandoffChange(LifecycleWriteOutcome.LeaseRejected);
         }
         if (!MatchesJitCatalog(catalog, identity) || !MatchesJitExecutor(executor, identity) || !MatchesJitProvider(catalog, executor) ||
-            executor.State is not { RunnerId: null, HasConflict: false, Resource.State: ExecutorResourceState.Running } ||
+            executor.State is not { RunnerId: null, AdmissionClosure: null, HasConflict: false, Resource.State: ExecutorResourceState.Running } ||
             runnerName != "ss-" + JitOfferBinding.GetOfferId(identity)[..48])
         {
             return new JitHandoffChange(LifecycleWriteOutcome.Conflict);
