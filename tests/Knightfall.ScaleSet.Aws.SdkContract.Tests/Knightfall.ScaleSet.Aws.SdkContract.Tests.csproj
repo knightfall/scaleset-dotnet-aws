@@ -7,6 +7,7 @@
     <UseMicrosoftTestingPlatformRunner>true</UseMicrosoftTestingPlatformRunner>
   </PropertyGroup>
   <ItemGroup>
+    <ProjectReference Include="../../src/Knightfall.ScaleSet.Aws.GitHub/Knightfall.ScaleSet.Aws.GitHub.csproj" />
     <ProjectReference Include="../Knightfall.ScaleSet.Aws.ListenerConsumer/Knightfall.ScaleSet.Aws.ListenerConsumer.csproj" />
     <PackageReference Include="AWSSDK.Core" />
     <PackageReference Include="AWSSDK.DynamoDBv2" />
@@ -20,5 +21,6 @@
     <PackageReference Include="Knightfall.ScaleSet.Client" />
     <PackageReference Include="Knightfall.ScaleSet.Listener" />
     <PackageReference Include="xunit.v3" />
+    <None Include="../../testdata/config/runtime/fargate-only.json" Link="fargate-only.json" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 </Project>
