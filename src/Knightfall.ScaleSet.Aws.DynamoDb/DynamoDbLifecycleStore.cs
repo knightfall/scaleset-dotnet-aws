@@ -187,24 +187,24 @@ public sealed partial class DynamoDbLifecycleStore
         {
             return await read(cancellationToken).ConfigureAwait(false);
         }
-        catch (Exception error) when (IsReadOutage(error))
+        catch (Exception error) when (IsStorageOutage(error))
         {
             cancellationToken.ThrowIfCancellationRequested();
             throw new IOException("The lifecycle DynamoDB read is temporarily unavailable.");
         }
     }
 
-    private static bool IsReadOutage(Exception error) => error switch
+    private static bool IsStorageOutage(Exception error) => error switch
     {
-        AmazonServiceException service => IsTransientReadStatus(service.StatusCode) || service.Retryable is { Throttling: true } ||
+        AmazonServiceException service => IsTransientStorageStatus(service.StatusCode) || service.Retryable is { Throttling: true } ||
             service.ErrorCode is "ProvisionedThroughputExceededException" or "ProvisionedThroughputExceeded" or
                 "RequestLimitExceeded" or "RequestLimitExceededException" or "ThrottlingException",
         HttpRequestException { StatusCode: null } => true,
-        HttpRequestException { StatusCode: { } status } => IsTransientReadStatus(status),
+        HttpRequestException { StatusCode: { } status } => IsTransientStorageStatus(status),
         _ => false,
     };
 
-    private static bool IsTransientReadStatus(HttpStatusCode status) => (int)status is 429 or >= 500 and <= 599;
+    private static bool IsTransientStorageStatus(HttpStatusCode status) => (int)status is 408 or 429 or >= 500 and <= 599;
 
     private TransactionAction LeaseCondition(
         DeploymentLeaseFence lease, LeaseAccess access = LeaseAccess.Active, DateTimeOffset? validThrough = null)
@@ -340,12 +340,12 @@ public sealed partial class DynamoDbLifecycleStore
             }
             return LifecycleWriteOutcome.Indeterminate;
         }
-        catch (AmazonDynamoDBException error) when (error.StatusCode >= HttpStatusCode.InternalServerError ||
-                                                   error.ErrorCode is "TransactionInProgressException" or "IdempotentParameterMismatchException")
+        catch (AmazonServiceException error) when (IsStorageOutage(error) ||
+            error.ErrorCode is "TransactionInProgressException" or "IdempotentParameterMismatchException")
         {
             return LifecycleWriteOutcome.Indeterminate;
         }
-        catch (HttpRequestException)
+        catch (Exception error) when (error is HttpRequestException or IOException or TimeoutException)
         {
             return LifecycleWriteOutcome.Indeterminate;
         }

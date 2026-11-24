@@ -189,7 +189,8 @@ internal sealed class MiniStackWire : DelegatingHandler
     private int _dropSuccessfulTransaction;
     private TransactionBarrier? _transactionBarrier;
     private PausedRead? _pausedRead;
-    private FailedGetItem? _failedGetItem;
+    private StorageFailure? _failedGetItem;
+    private StorageFailure? _failedTransactWrite;
 
     internal IReadOnlyList<MiniStackCall> Requests => _requests.ToArray();
 
@@ -209,7 +210,10 @@ internal sealed class MiniStackWire : DelegatingHandler
     internal void HoldNextTwoTransactions() => _transactionBarrier = new TransactionBarrier();
 
     internal void FailNextGetItem(LifecycleKey key, HttpStatusCode? status, string? errorCode) =>
-        Interlocked.Exchange(ref _failedGetItem, new FailedGetItem(key, status, errorCode));
+        Interlocked.Exchange(ref _failedGetItem, new StorageFailure(key, status, errorCode));
+
+    internal void FailNextTransactWrite(LifecycleKey key, string errorCode) =>
+        Interlocked.Exchange(ref _failedTransactWrite, new StorageFailure(key, HttpStatusCode.BadRequest, errorCode));
 
     internal PausedRead PauseNextRead(LifecycleKey key)
     {
@@ -234,20 +238,14 @@ internal sealed class MiniStackWire : DelegatingHandler
             MatchesKey(call.Request.GetProperty("Key"), fault.Key) &&
             ReferenceEquals(Interlocked.CompareExchange(ref _failedGetItem, null, fault), fault))
         {
-            if (fault.Status is not { } status)
-            {
-                throw new HttpRequestException(HttpRequestError.ConnectionError, "synthetic storage diagnostic",
-                    new SocketException((int)SocketError.ConnectionReset));
-            }
-            string failurePayload = JsonSerializer.Serialize(new
-            {
-                __type = "com.amazonaws.dynamodb.v20120810#" + fault.ErrorCode,
-                message = "synthetic storage diagnostic",
-            });
-            return new HttpResponseMessage(status)
-            {
-                Content = new StringContent(failurePayload, Encoding.UTF8, "application/x-amz-json-1.0"),
-            };
+            return FailureResponse(fault);
+        }
+        if (operation == "TransactWriteItems" && _failedTransactWrite is { } writeFault &&
+            call.Request.GetProperty("TransactItems").EnumerateArray().Any(action =>
+                action.TryGetProperty("Put", out var put) && MatchesKey(put.GetProperty("Item"), writeFault.Key)) &&
+            ReferenceEquals(Interlocked.CompareExchange(ref _failedTransactWrite, null, writeFault), writeFault))
+        {
+            return FailureResponse(writeFault);
         }
         if (operation == "TransactWriteItems" && Interlocked.Exchange(ref _dropTransactionBeforeSend, 0) == 1)
         {
@@ -288,7 +286,25 @@ internal sealed class MiniStackWire : DelegatingHandler
         item.GetProperty("PK").GetProperty("S").GetString() == key.PartitionKey &&
         item.GetProperty("SK").GetProperty("S").GetString() == key.SortKey;
 
-    private sealed record FailedGetItem(LifecycleKey Key, HttpStatusCode? Status, string? ErrorCode);
+    private static HttpResponseMessage FailureResponse(StorageFailure fault)
+    {
+        if (fault.Status is not { } status)
+        {
+            throw new HttpRequestException(HttpRequestError.ConnectionError, "synthetic storage diagnostic",
+                new SocketException((int)SocketError.ConnectionReset));
+        }
+        string failurePayload = JsonSerializer.Serialize(new
+        {
+            __type = "com.amazonaws.dynamodb.v20120810#" + fault.ErrorCode,
+            message = "synthetic storage diagnostic",
+        });
+        return new HttpResponseMessage(status)
+        {
+            Content = new StringContent(failurePayload, Encoding.UTF8, "application/x-amz-json-1.0"),
+        };
+    }
+
+    private sealed record StorageFailure(LifecycleKey Key, HttpStatusCode? Status, string? ErrorCode);
 
     internal sealed class PausedRead(LifecycleKey key)
     {

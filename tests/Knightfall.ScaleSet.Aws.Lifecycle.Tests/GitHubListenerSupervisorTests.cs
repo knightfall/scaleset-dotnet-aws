@@ -133,10 +133,13 @@ public sealed class GitHubListenerSupervisorTests
     }
 
     [Theory]
-    [InlineData(HttpStatusCode.BadRequest, "ProvisionedThroughputExceededException")]
-    [InlineData(HttpStatusCode.InternalServerError, "InternalServerError")]
-    [InlineData(null, null)]
-    public async Task StorageOutageAfterSuccessfulAckResumesTheSamePumpWithoutRepeatingDelete(HttpStatusCode? status, string? code)
+    [InlineData(HttpStatusCode.BadRequest, "ProvisionedThroughputExceededException", false)]
+    [InlineData(HttpStatusCode.InternalServerError, "InternalServerError", false)]
+    [InlineData(null, null, false)]
+    [InlineData(HttpStatusCode.BadRequest, "ProvisionedThroughputExceededException", true)]
+    [InlineData(HttpStatusCode.BadRequest, "RequestLimitExceeded", true)]
+    public async Task StorageOutageAfterSuccessfulAckResumesTheSamePumpWithoutRepeatingDelete(
+        HttpStatusCode? status, string? code, bool failWrite)
     {
         var cancellation = TestContext.Current.CancellationToken;
         using var table = await MiniStackTable.CreateAsync(cancellation);
@@ -145,6 +148,7 @@ public sealed class GitHubListenerSupervisorTests
         var configuration = await ConfigurationAsync(cancellation);
         var lease = await AcquireActiveAsync(store, configuration, clock, MiniStackTable.FirstTask, cancellation);
         var profile = new LifecycleProfile(lease.Deployment, FirstProfile);
+        var checkpointKey = LifecycleKey.Checkpoint(profile, FirstSession);
         using var wire = new GitHubWire((request, _) =>
         {
             if (request.Method == HttpMethod.Post && request.Uri.AbsolutePath == SessionsPath(GitHubWire.SetId))
@@ -157,7 +161,14 @@ public sealed class GitHubListenerSupervisorTests
             }
             if (request.Method == HttpMethod.Delete && request.Uri.AbsolutePath == FirstQueue + "/0")
             {
-                table.Wire.FailNextGetItem(LifecycleKey.Lease(lease.Deployment), status, code);
+                if (failWrite)
+                {
+                    table.Wire.FailNextTransactWrite(checkpointKey, code!);
+                }
+                else
+                {
+                    table.Wire.FailNextGetItem(LifecycleKey.Lease(lease.Deployment), status, code);
+                }
                 return Task.FromResult(new HttpResponseMessage(HttpStatusCode.NoContent));
             }
             throw new InvalidOperationException("Unexpected fixture operation.");
@@ -187,6 +198,15 @@ public sealed class GitHubListenerSupervisorTests
         Assert.Null(settled.Pending);
         Assert.Equal(0, settled.LastAcknowledgedMessageId);
         Assert.Equal(active, await store.ReadSessionAsync(profile, cancellation));
+        var settlementAttempts = table.Wire.Requests.Where(call => call.Operation == "TransactWriteItems" &&
+            call.Request.GetProperty("TransactItems").EnumerateArray().Any(action =>
+                action.TryGetProperty("Put", out var put) &&
+                put.GetProperty("Item").GetProperty("SK").GetProperty("S").GetString() == checkpointKey.SortKey &&
+                put.GetProperty("Item").GetProperty("transitionId").GetProperty("S").GetString() == settled.TransitionId.ToString("D")))
+            .Select(call => call.Request.GetProperty("ClientRequestToken").GetString())
+            .ToArray();
+        Assert.Equal(failWrite ? 2 : 1, settlementAttempts.Length);
+        Assert.Equal(settlementAttempts.Length, settlementAttempts.Distinct().Count());
         Assert.Single(wire.Requests, request => request.Method == HttpMethod.Post && request.Uri.AbsolutePath == SessionsPath(GitHubWire.SetId));
         Assert.Single(wire.Requests, request => request.Method == HttpMethod.Get && request.Uri.AbsolutePath == FirstQueue);
         Assert.Single(wire.Requests, request => request.Method == HttpMethod.Delete && request.Uri.AbsolutePath == FirstQueue + "/0");
