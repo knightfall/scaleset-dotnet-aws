@@ -1,3 +1,5 @@
+using System.Text;
+using System.Text.Json.Nodes;
 using Amazon.DynamoDBv2.Model;
 using Knightfall.ScaleSet.Aws.Core.Catalog;
 using Knightfall.ScaleSet.Aws.Core.Configuration;
@@ -142,6 +144,76 @@ public sealed class JitHandoffStoreTests
             null, cancellation));
         Assert.Equal(envelope.IntentId, Assert.Single(active.IntentIds));
         Assert.Null(active.Continuation);
+    }
+
+    [Fact]
+    public async Task MalformedRetainedHelloHoldsOnlyItsOwnHandoffAcrossStoreRestart()
+    {
+        var token = TestContext.Current.CancellationToken;
+        using var table = await MiniStackTable.CreateAsync(token);
+        using var recipient = JitRecipientKey.Create();
+        using var healthyRecipient = JitRecipientKey.Create();
+        string configurationPath = Path.Combine(AppContext.BaseDirectory, "fargate-only.json");
+        var document = JsonNode.Parse(await File.ReadAllTextAsync(configurationPath, token))!;
+        var profiles = document["spec"]!["profiles"]!.AsArray();
+        var healthy = profiles[0]!.DeepClone();
+        const string healthyProfileId = "linux-healthy";
+        healthy["id"] = healthyProfileId;
+        healthy["github"]!["scaleSet"] = healthyProfileId;
+        healthy["github"]!["labels"] = new JsonArray(healthyProfileId);
+        healthy["provisioner"]!["taskDefinitionArn"] = "arn:aws:ecs:ap-southeast-2:111122223333:task-definition/healthy:1";
+        profiles.Add(healthy);
+        var fixture = await CreateFixtureAsync(table, token, RuntimeConfigurationLoader.Load(Encoding.UTF8.GetBytes(document.ToJsonString())));
+        Assert.Equal(LifecycleWriteOutcome.Committed, await fixture.Bootstrap.RegisterHelloAsync(recipient.Hello, token));
+        var malformedKey = LifecycleKey.Hello(fixture.Identity.AwsUserId);
+        var malformed = await table.ReadAsync(malformedKey, token);
+        malformed["payload"] = new AttributeValue { S = "[]" };
+        await table.Client.PutItemAsync(table.Name, malformed, token);
+        await AssertHeldAsync(fixture.Store);
+
+        var restartedStore = new DynamoDbLifecycleStore(table.Client, table.Name, fixture.Clock);
+        await AssertHeldAsync(restartedStore);
+        var profile = new LifecycleProfile(fixture.Identity.Deployment, healthyProfileId);
+        var unbound = Assert.IsType<CatalogProfile>(await restartedStore.ReadCatalogProfileAsync(profile, token));
+        Assert.Equal(LifecycleWriteOutcome.Committed, await restartedStore.BindCatalogScaleSetAsync(fixture.Lease.Fence, unbound, 43, 85, token));
+        var catalog = Assert.IsType<CatalogProfile>(await restartedStore.ReadCatalogProfileAsync(profile, token));
+        Assert.Equal(EffectIndexState.Ready, (await restartedStore.AdvanceEffectRebuildAsync(profile, fixture.Lease.Fence, token)).Head?.State);
+        const string shortId = "00000000000000000000000000000010";
+        string arn = FargateArn[..^FargateShortId.Length] + shortId;
+        string userId = FargateUserId[..^FargateShortId.Length] + shortId;
+        var allocation = Guid.NewGuid();
+        var incarnation = Guid.NewGuid();
+        var binding = new ExecutorBinding(profile, allocation.ToString("D"), arn, incarnation,
+            new FargateExecutorIdentity(ClusterArn, catalog.Binding.ProviderDefinition));
+        Assert.Equal(LifecycleWriteOutcome.Committed, await restartedStore.BindExecutorAsync(fixture.Lease.Fence, binding, token));
+        Assert.Equal(LifecycleWriteOutcome.Committed, await restartedStore.ObserveResourceAsync(fixture.Lease.Fence, binding,
+            new ExecutorResourceObservation(ExecutorResourceState.Running, fixture.Clock.Now, fixture.Clock.Now.AddMinutes(-1), Guid.NewGuid()), token));
+        var executor = Assert.IsType<ExecutorSnapshot>(await restartedStore.ReadExecutorAsync(profile, binding.AllocationId, token));
+        var identity = new JitHandoffIdentity(profile.Deployment, profile.ProfileId, catalog.Binding.ScopeIdentity, 85,
+            allocation, arn, incarnation, userId);
+        var bootstrap = new DynamoDbBootstrapOfferClient(table.Client, table.Name, userId, arn, fixture.Clock);
+        Assert.Equal(LifecycleWriteOutcome.Committed, await bootstrap.RegisterHelloAsync(healthyRecipient.Hello, token));
+        var healthyFixture = new TestContextFixture(restartedStore, new DynamoDbEffectJournal(restartedStore, fixture.Clock),
+            fixture.Lease, catalog, executor, identity, bootstrap, fixture.Clock);
+        var staged = await StageAsync(healthyFixture, token);
+        var planned = await PlanAsync(healthyFixture, staged, token);
+        var begun = await healthyFixture.Journal.BeginJitAsync(fixture.Lease, catalog, executor, staged, planned,
+            fixture.Clock.Now, fixture.Clock.Now.AddSeconds(40), TimeSpan.FromSeconds(1), token);
+        Assert.True(Assert.IsType<EffectSendAuthorization>(begun.Permission).TryConsume(out _));
+        var attempt = Assert.IsType<EffectJournalSnapshot>(await healthyFixture.Journal.ReadAsync(profile, staged.IntentId, token));
+        _ = await PublishAsync(healthyFixture, staged, attempt, token);
+        Assert.Equal(BootstrapOfferStatus.Consumed, (await bootstrap.TryConsumeOfferAsync(healthyRecipient.Hello, token)).Status);
+        Assert.Equal("[]", (await table.ReadAsync(malformedKey, token))["payload"].S);
+
+        async Task AssertHeldAsync(DynamoDbLifecycleStore store)
+        {
+            var held = await store.StageJitHandoffAsync(fixture.Lease, fixture.Catalog, fixture.Executor, fixture.Identity,
+                RunnerName(fixture.Identity), token);
+            Assert.Equal(LifecycleWriteOutcome.Conflict, held.Outcome);
+            Assert.Null(held.Handoff);
+            Assert.Null(await store.ReadJitHandoffAsync(fixture.Catalog.Profile, fixture.Identity.AllocationId, token));
+            Assert.Empty(await table.ReadAsync(LifecycleKey.Offer(fixture.Identity.AwsUserId), token));
+        }
     }
 
     [Fact]

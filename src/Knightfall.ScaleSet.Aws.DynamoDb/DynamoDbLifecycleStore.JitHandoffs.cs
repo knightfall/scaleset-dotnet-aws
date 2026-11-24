@@ -136,18 +136,15 @@ public sealed partial class DynamoDbLifecycleStore
     private async Task<JitHello?> ReadJitHelloAsync(JitHandoffIdentity identity, CancellationToken cancellationToken)
     {
         var key = LifecycleKey.Hello(identity.AwsUserId);
-        var item = await ReadItemAsync(key, cancellationToken).ConfigureAwait(false);
-        if (item is null)
-        {
-            return null;
-        }
         try
         {
-            return BootstrapItems.DecodeHello(key, item);
+            var item = await ReadItemAsync(key, cancellationToken).ConfigureAwait(false);
+            return item is null ? null : BootstrapItems.DecodeHello(key, item);
         }
-        catch (Exception error) when (error is CryptographicException or JsonException or ArgumentException)
+        catch (Exception error) when (error is InvalidDataException or CryptographicException or JsonException or ArgumentException)
         {
-            throw InvalidRecord();
+            // Runner-authored input holds this handoff. Controller-owned records still fail closed at their own decoders.
+            return null;
         }
     }
 
