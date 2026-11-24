@@ -6,12 +6,12 @@
 
 ### Deliverable
 
-Build the `tests/Knightfall.ScaleSet.Aws.IntegrationTests` harness running deterministically in CI (no live cloud or GitHub credentials required) against a **loopback GitHub Scale Set Protocol Simulator** (`actions/scaleset` `716908e5` wire contract) and a single unified local AWS endpoint (`AWS_ENDPOINT_URL`) backed by **MiniStack** (`ministackorg/ministack`, HTTP `http://127.0.0.1:4566`) or **AWS Emulator** (`aws/aws-emulator`, HTTPS `https://127.0.0.1:9297` with test-harness TLS trust).
+Build the `tests/Knightfall.ScaleSet.Aws.IntegrationTests` harness running deterministically in CI (no live cloud or GitHub credentials required) against a **loopback GitHub Scale Set Protocol Simulator** (`actions/scaleset` `716908e5` wire contract) and a single unified local AWS endpoint (`AWS_ENDPOINT_URL`) backed by pinned **MiniStack** on a dynamically allocated loopback port, plus a separate IAM-enforcing process where required.
 
 ### Requirements
 
 - Implement a stateful loopback HTTP/2-capable ASP.NET Core simulator modeling GitHub.com and `*.ghe.com` App token exchange, enterprise classic PAT (`manage_runners:enterprise`) registration-token exchange, runner groups, scale set creation/lookup, message sessions, HTTP `202` empty polls, cursor `0` and monotonic message IDs, `429`/`403` rate-limit responses with `Retry-After`, dropped HTTP responses after server-side commit, and delayed job-start races.
-- Exercise against MiniStack / AWS Emulator (Secrets Manager + DynamoDB) + the simulator:
+- Exercise against MiniStack (Secrets Manager + DynamoDB) + the simulator:
   1. App (org/repo) and classic enterprise PAT auth, `create-if-missing` single-attempt registration recovery after dropped response, and `AWSCURRENT` secret rotation validating candidate credentials without opening an overlapping acquiring session.
   2. Session exclusivity, initial stats, cursor advancement, lost `DeleteMessageAsync` / `CreateMessageSessionAsync` / `GenerateJitConfigAsync` response recovery asserting exact single-attempt wire counts.
   3. Multiple concurrent `JobAvailable` offers against unchanged `TotalAssignedJobs` with controller restart between offers, validating that conservative admission reservation stays locked unless exact request attribution is present.
@@ -32,7 +32,7 @@ Run `make check-integration` to start pinned MiniStack and execute the Integrati
 
 ### Deliverable
 
-Verify full Direct EC2 provisioning, Launch Template version resolution, `HELLO#`/`OFFER#`/`STATUS#` handoff, zonal failover, and targeted termination end to end against **MiniStack** or **AWS Emulator** (`AWS_ENDPOINT_URL` for EC2, IAM, STS, EventBridge/SQS, and DynamoDB), a **loopback IMDSv2 stub**, and the **GitHub Scale Set Simulator**.
+Verify full Direct EC2 provisioning, Launch Template version resolution, `HELLO#`/`OFFER#`/`STATUS#` handoff, zonal failover, and targeted termination end to end against **MiniStack** (`AWS_ENDPOINT_URL` for EC2, IAM, STS, EventBridge/SQS, and DynamoDB), a **loopback IMDSv2 stub**, and the **GitHub Scale Set Simulator**.
 
 ### Test scenarios
 
@@ -42,7 +42,7 @@ Verify full Direct EC2 provisioning, Launch Template version resolution, `HELLO#
 
 ### Acceptance
 
-1. `T23` Direct EC2 emulated integration suite passes cleanly against MiniStack / AWS Emulator in CI without live AWS accounts or a local Docker daemon.
+1. `T23` Direct EC2 emulated integration suite passes cleanly against MiniStack in CI without live AWS accounts or a local Docker daemon.
 
 ---
 
@@ -52,7 +52,7 @@ Verify full Direct EC2 provisioning, Launch Template version resolution, `HELLO#
 
 ### Deliverable
 
-Verify standalone ECS Fargate task launch, `RoleId:ShortTaskId` handoff without `STATUS#` writes, `RunTask` replay recovery, and `STOPPED` reconciliation end to end against **MiniStack** or **AWS Emulator** (`AWS_ENDPOINT_URL` for ECS, IAM, STS, EventBridge/SQS, and DynamoDB), a **loopback ECS Task Metadata v4 stub**, and the **GitHub Scale Set Simulator**.
+Verify standalone ECS Fargate task launch, `RoleId:ShortTaskId` handoff without `STATUS#` writes, `RunTask` replay recovery, and `STOPPED` reconciliation end to end against **MiniStack** (`AWS_ENDPOINT_URL` for ECS, IAM, STS, EventBridge/SQS, and DynamoDB), a **loopback ECS Task Metadata v4 stub**, and the **GitHub Scale Set Simulator**.
 
 ### Test scenarios
 
@@ -62,7 +62,7 @@ Verify standalone ECS Fargate task launch, `RoleId:ShortTaskId` handoff without 
 
 ### Acceptance
 
-1. `T24` Fargate emulated integration suite passes cleanly against MiniStack / AWS Emulator in CI, documenting any emulator-specific control-plane stubbing gaps explicitly in `T26`.
+1. `T24` Fargate emulated integration suite passes cleanly against MiniStack in CI, documenting any emulator-specific control-plane stubbing gaps explicitly in `T26`.
 
 ---
 
@@ -79,7 +79,7 @@ Exercise mixed EC2 + Fargate profiles, read-only dry-run request auditing, uncle
 - **Capability independence**: Exercise EC2-only, Fargate-only, and mixed profiles using the same `dotnet publish /t:PublishContainer` configuration contract; verify degrading one backend leaves healthy profiles progressing.
 - **Read-only dry-run audit**: Run `reconcile --dry-run --once` against emulated S3 versioned runtime configs/snapshots and emulated DynamoDB/EC2/ECS through a recording HTTP proxy asserting **zero** DynamoDB writes, Secrets Manager reads, GitHub session calls, SQS reads, or `RunInstances`/`RunTask`/`TerminateInstances`/`StopTask` calls.
 - **Unclean ECS controller failover**: Abruptly terminate one controller worker mid-effect while simulated EC2 and Fargate jobs remain active; verify the successor stays in read-only recovery until emulated `ecs:DescribeTasks` reports the exact prior controller task ARN `STOPPED` + `preflight clock` margin passes + outstanding effects settle.
-- **DynamoDB restore drill**: Export/restore table state in MiniStack / AWS Emulator DynamoDB, purge all restored `HELLO#`/`OFFER#`/untrusted `STATUS#` records before reopening bootstrap access, and reconcile post-backup operations without duplicate launches.
+- **DynamoDB restore drill**: Export/restore table state in MiniStack DynamoDB, purge all restored `HELLO#`/`OFFER#`/untrusted `STATUS#` records before reopening bootstrap access, and reconcile post-backup operations without duplicate launches.
 - **OTLP telemetry & redaction**: Apply the [OpenTelemetry acceptance suite](../opentelemetry-integration.md#delivery-slices-and-acceptance-evidence) to at least two EC2 profiles with distinct Launch Templates and two Fargate profiles with distinct task definitions/clusters. Verify signal/resource/profile correlation, zero secret leakage, bounded series, fresh ownership/retirement observations, and continued acknowledgement/lease progress through receiver outage and recovery.
 - **YAML add/drain/rollback**: Add a profile via YAML emission + emulated S3 upload, drain and verify `preflight retire` passes only after two-pass clear and closure hold, and exercise compatible rollback plus blocked stale-generation rollback.
 

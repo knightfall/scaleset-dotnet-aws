@@ -4,6 +4,11 @@ Use one AWS account and Region per deployment. Start with the [profile binding t
 
 ## Prepare the artifacts
 
+Start with a [verified release archive](releases/VERIFYING.md) or build an
+archive from the reviewed source as shown below.
+The [maintainer release process](releases/PUBLISHING.md) records how the
+archives, image SBOMs and provenance are generated.
+
 1. Check out the reviewed commit. Use the pinned .NET 10 SDK, Node, and npm versions, then install the locked dependencies. Keep the authored YAML, runtime JSON, image archive, and CDK assembly together in the deployment record. Store GitHub credentials and collector headers in the approved Secrets Manager secrets.
 2. Copy the binding template into your operator workspace and fill in the AWS and GitHub bindings. Use a dry-run configuration for the first qualification pass. Emit the preliminary runtime and check its schema and digest. Repeat these commands with the final image digest after registry publication.
 
@@ -28,6 +33,7 @@ Run the same Release build and package the CPU architecture selected in the YAML
 rid=linux-arm64
 arch=arm64
 image_tag="controller-$(git rev-parse --short=12 HEAD)-$rid"
+local_image="scaleset-aws-controller:$image_tag"
 archive="$PWD/operator-staging/controller-$rid.tar.gz"
 
 dotnet publish "$controller_project" --configuration Release /t:PublishContainer \
@@ -36,6 +42,16 @@ dotnet publish "$controller_project" --configuration Release /t:PublishContainer
 
 python3 tests/oci/verify_controller_image.py "$archive" "$arch" --assembly \
   src/Knightfall.ScaleSet.Aws.Controller/bin/Release/net10.0/Knightfall.ScaleSet.Aws.Controller.dll
+```
+
+For a downloaded release, use `download_dir` and `commit` from the verification
+steps. Select the architecture configured in your YAML.
+
+```sh
+rid=linux-arm64
+archive="$download_dir/scaleset-aws-controller-$rid.tar.gz"
+local_image="scaleset-aws-controller:git-$commit-$rid"
+image_tag="controller-$commit-$rid"
 ```
 
 ## Pin the registry manifest
@@ -51,7 +67,7 @@ registry="$account.dkr.ecr.$region.amazonaws.com"
 test "$(aws sts get-caller-identity --region "$region" --query Account --output text)" = "$account" || exit 1
 aws ecr get-login-password --region "$region" | docker login --username AWS --password-stdin "$registry"
 docker image load --input "$archive"
-docker image tag "scaleset-aws-controller:$image_tag" "$registry/$repository:$image_tag"
+docker image tag "$local_image" "$registry/$repository:$image_tag"
 docker image push "$registry/$repository:$image_tag"
 
 registry_digest=$(aws ecr describe-images --region "$region" --registry-id "$account" \

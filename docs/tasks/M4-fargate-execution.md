@@ -74,4 +74,4 @@ Implement Fargate mode in `Knightfall.ScaleSet.Aws.RunnerBootstrap` and document
 ### Acceptance
 
 1. Fixtures test invalid metadata URI, mismatched task ARN/revision/role, duplicate startup consume failure, expired/tampered `OFFER#`, and zero plaintext JIT in environment, files, overrides, or logs.
-2. End-to-end container/emulated tests verify non-privileged single-job exit and zero `STATUS#` write permissions on the Fargate runner identity (`T24` verifies the full MiniStack / AWS Emulator ECS, IAM, and DynamoDB flow alongside `T21` IAM assertions).
+2. End-to-end container/emulated tests verify non-privileged single-job exit and zero `STATUS#` write permissions on the Fargate runner identity (`T24` verifies the full MiniStack ECS, IAM, and DynamoDB flow alongside `T21` IAM assertions).

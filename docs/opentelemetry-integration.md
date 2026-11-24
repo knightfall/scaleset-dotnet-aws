@@ -1,6 +1,6 @@
 # OpenTelemetry integration plan
 
-Implementation specification for [T19 / #20](https://github.com/knightfall/scaleset-dotnet-aws/issues/20), with host, deployment, and qualification work in T20, T21, T25, and T26. This document expands the [T19 task](tasks/M5-cdk-packaging-matrix.md#t19-implement-opentelemetry-tracing-metrics-and-otlp-logging). The linked issues record task status and verification evidence.
+Implementation specification for [T19 / #20](https://github.com/knightfall/scaleset-dotnet-aws/issues/20), with host, deployment, and qualification work in T20, T21, T25, and T26. This document expands the [T19 task](tasks/M5-cdk-packaging-matrix.md#t19-implement-opentelemetry-tracing-metrics-and-otlp-logging). The linked issues record completed delivery and verification. Current exporter settings and query recipes are in [telemetry operations](operator-telemetry.md).
 
 ## Outcomes and scope
 

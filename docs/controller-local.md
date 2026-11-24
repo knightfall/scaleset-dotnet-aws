@@ -87,7 +87,7 @@ dotnet publish "$project" --configuration Release /t:PublishContainer \
 python3 tests/oci/verify_controller_image.py /tmp/scaleset-controller-linux-arm64.tar.gz arm64 --assembly "$assembly"
 ```
 
-The verifier prints the architecture-specific OCI manifest digest. It also checks the non-root UID, shellless entry point, and the application assembly against the local build. The tests compare the embedded schema resources with their canonical source files. The image uses `dotnet /app/Knightfall.ScaleSet.Aws.Controller.dll healthcheck` for the probe, and ECS enforces the read-only root filesystem at runtime.
+The [release candidate workflow](../.github/workflows/release-candidate.yml) builds and smoke-tests both architectures on native Linux runners. The verifier prints the architecture-specific OCI manifest digest. It also checks the non-root UID, shellless entry point, and the application assembly against the local build. The tests compare the embedded schema resources with their canonical source files. The image uses `dotnet /app/Knightfall.ScaleSet.Aws.Controller.dll healthcheck` for the probe, and ECS enforces the read-only root filesystem at runtime.
 
 To exercise the packaged health command with a local Linux engine, load the archive and run the same acceptance tests with a read-only root filesystem. The tests start a loopback listener, then invoke the controller assembly packaged in the image. Set `rid=linux-x64` and `platform=linux/amd64` to repeat the test for x64.
 
