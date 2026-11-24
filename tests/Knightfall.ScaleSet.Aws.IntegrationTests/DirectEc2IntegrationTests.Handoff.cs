@@ -99,15 +99,16 @@ public sealed partial class DirectEc2IntegrationTests
         var handoff = new GitHubJitHandoff(store, clock,
             new GitHubJitTiming(WriteReserve, TimeSpan.FromSeconds(20), TimeSpan.FromMinutes(5), TimeSpan.FromMinutes(1)));
         var coordinator = new ControllerJitCoordinator(store, new AwsBootstrapPrincipalResolver(cloud.Controller.Iam), handoff);
-        long firstRunner = await IssueAsync(resources[0], firstRole.AwsUserId, token);
-        long secondRunner = await IssueAsync(resources[1], secondRole.AwsUserId, token);
+        var (firstRunner, firstRunnerName) = await IssueAsync(resources[0], firstRole.AwsUserId, token);
+        var (secondRunner, secondRunnerName) = await IssueAsync(resources[1], secondRole.AwsUserId, token);
         Assert.NotEqual(firstRunner, secondRunner);
+        Assert.NotEqual(firstRunnerName, secondRunnerName);
         Assert.Equal(2, simulator.Requests.Count(request => request.Method == "POST" && request.Path.EndsWith("/generatejitconfig", StringComparison.Ordinal)));
 
         await RejectPeerOfferAsync(firstRole.Clients.DynamoDb, secondRole.AwsUserId, token);
         await RejectPeerOfferAsync(secondRole.Clients.DynamoDb, firstRole.AwsUserId, token);
-        firstBootstrap.StartReceipt(firstRunner);
-        secondBootstrap.StartReceipt(secondRunner);
+        firstBootstrap.StartReceipt(firstRunner, firstRunnerName);
+        secondBootstrap.StartReceipt(secondRunner, secondRunnerName);
         await ObserveStatusAsync(first, firstRunner, exited: false, token);
         await ObserveStatusAsync(second, secondRunner, exited: false, token);
         Assert.Empty(await ReadOfferAsync(firstRole.AwsUserId, token));
@@ -184,7 +185,8 @@ public sealed partial class DirectEc2IntegrationTests
         AssertImdsReads(firstBootstrap.Imds, role.Name, 3);
         AssertImdsReads(secondBootstrap.Imds, role.Name, 3);
 
-        async Task<long> IssueAsync(RunnerBackendResource resource, string userId, CancellationToken cancellationToken)
+        async Task<(long RunnerId, string RunnerName)> IssueAsync(
+            RunnerBackendResource resource, string userId, CancellationToken cancellationToken)
         {
             var executor = Assert.IsType<ExecutorBinding>(resource.Binding);
             var issued = await coordinator.AdvanceAsync(configuration, ownership,
@@ -198,7 +200,7 @@ public sealed partial class DirectEc2IntegrationTests
             var offer = await ReadOfferAsync(userId, cancellationToken);
             Assert.NotEmpty(offer);
             Assert.DoesNotContain(offer.Values, value => value.S?.Contains(GitHubSimulator.Jit, StringComparison.Ordinal) == true);
-            return Assert.IsType<long>(issued.RunnerId);
+            return (Assert.IsType<long>(issued.RunnerId), row.RunnerName);
         }
 
         async Task ObserveStatusAsync(ExecutorBinding binding, long runnerId, bool exited, CancellationToken cancellationToken)

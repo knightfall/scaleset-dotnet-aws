@@ -93,9 +93,9 @@ internal sealed class DirectEc2BootstrapExecution(
         await attempted;
     }
 
-    internal void StartReceipt(long runnerId)
+    internal void StartReceipt(long runnerId, string runnerName)
     {
-        job.Register(runnerId);
+        job.Register(runnerId, runnerName);
         gate.Open();
     }
 
@@ -123,11 +123,11 @@ internal sealed class DirectEc2BootstrapExecution(
 
     internal sealed class SimulatedJob : IOneJobRunner
     {
-        private readonly TaskCompletionSource<long> _registration = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private readonly TaskCompletionSource<(long Id, string Name)> _registration = new(TaskCreationOptions.RunContinuationsAsynchronously);
         private readonly TaskCompletionSource _finished = new(TaskCreationOptions.RunContinuationsAsynchronously);
         private int _starts;
 
-        internal void Register(long runnerId) => _registration.SetResult(runnerId);
+        internal void Register(long runnerId, string runnerName) => _registration.SetResult((runnerId, runnerName));
 
         internal void Finish() => _finished.SetResult();
 
@@ -135,12 +135,12 @@ internal sealed class DirectEc2BootstrapExecution(
             Func<long, CancellationToken, Task> ready, CancellationToken cancellationToken)
         {
             Assert.Equal(1, Interlocked.Increment(ref _starts));
-            Assert.StartsWith("ss-", expectedName, StringComparison.Ordinal);
             Assert.True(configuration.Bytes.SequenceEqual(Encoding.UTF8.GetBytes(GitHubSimulator.Jit)));
-            long id = await _registration.Task.WaitAsync(cancellationToken);
-            await ready(id, cancellationToken);
+            var registration = await _registration.Task.WaitAsync(cancellationToken);
+            Assert.Equal(registration.Name, expectedName);
+            await ready(registration.Id, cancellationToken);
             await _finished.Task.WaitAsync(cancellationToken);
-            return new OneJobCompletion(id, 0);
+            return new OneJobCompletion(registration.Id, 0);
         }
     }
 
