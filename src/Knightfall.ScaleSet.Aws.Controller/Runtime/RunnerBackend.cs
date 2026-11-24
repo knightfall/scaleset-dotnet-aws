@@ -25,3 +25,16 @@ internal interface IRunnerBackend
     Task CleanupAsync(ActiveControllerAuthority authority, CatalogProfile catalog, ExecutorSnapshot executor,
         CancellationToken ownershipLost, CancellationToken cancellationToken);
 }
+
+/// <summary>Limits background effect reconciliation to reads. Eligible Fargate resends use the launch lane.</summary>
+internal sealed class RunnerEffectReadback(IReconciliationEffectProvider provider) : IReconciliationEffectProvider
+{
+    public Task<EffectDispatchPrecondition?> CheckAsync(EffectEnvelope envelope, CatalogBinding binding, CancellationToken cancellationToken) =>
+        Task.FromResult<EffectDispatchPrecondition?>(null);
+
+    public Task<EffectEvidence?> SendAsync(EffectEnvelope envelope, EffectAttempt attempt, CancellationToken cancellationToken) =>
+        Task.FromResult<EffectEvidence?>(null);
+
+    public Task<EffectEvidence?> ObserveAsync(EffectEnvelope envelope, EffectAttempt attempt, CancellationToken cancellationToken) =>
+        provider.ObserveAsync(envelope, attempt, cancellationToken);
+}

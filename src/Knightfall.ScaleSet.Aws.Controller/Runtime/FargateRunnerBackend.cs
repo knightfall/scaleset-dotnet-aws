@@ -22,7 +22,7 @@ internal sealed class FargateRunnerBackend(
         ? inspector.CreateEffectProvider(configuration, key, approval)
         : inspector.CreateEffectObserver(configuration, key);
 
-    public IReconciliationEffectProvider ObservationEffects { get; } = inspector.CreateEffectObserver(configuration, key);
+    public IReconciliationEffectProvider ObservationEffects { get; } = new RunnerEffectReadback(inspector.CreateEffectObserver(configuration, key));
 
     public async Task<RunnerBackendInventory> ReadAsync(ControllerLease lease, CancellationToken cancellationToken)
     {

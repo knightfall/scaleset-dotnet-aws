@@ -163,9 +163,14 @@ internal static class ActiveControllerRuntime
             return;
         }
         using var heartbeatsStop = new CancellationTokenSource();
-        using var workStop = CancellationTokenSource.CreateLinkedTokenSource(owner.OwnershipLost);
+        using var workStop = CancellationTokenSource.CreateLinkedTokenSource(owner.OwnershipLost, context.Stopping);
         var health = new ActiveHealth(context, owner, profiles, clock);
-        var heartbeat = owner.RunHeartbeatsAsync(HeartbeatInterval, token => metadata.ReadClockAsync(taskArn, token), heartbeatsStop.Token);
+        var heartbeat = owner.RunHeartbeatsAsync(HeartbeatInterval, async token =>
+        {
+            var proof = await metadata.ReadClockAsync(taskArn, token).ConfigureAwait(false);
+            health.Pulse();
+            return proof;
+        }, heartbeatsStop.Token);
         var workers = RunProfilesAsync(context, owner, store, profiles, queuePump, metrics, health, clock, workStop.Token);
         using var stopSignal = CancellationTokenSource.CreateLinkedTokenSource(context.Stopping, owner.OwnershipLost);
         var quitting = Task.Delay(Timeout.InfiniteTimeSpan, stopSignal.Token);
@@ -200,10 +205,16 @@ internal static class ActiveControllerRuntime
                 metrics.EndOwnership(initial.Lease.Fence);
                 await workStop.CancelAsync().ConfigureAwait(false);
                 await heartbeatsStop.CancelAsync().ConfigureAwait(false);
-                await JoinCancelledAsync(heartbeat, cleanup.Token).ConfigureAwait(false);
-                foreach (var profile in profiles)
+                try
                 {
-                    profile.Session.Dispose();
+                    await JoinCancelledAsync(heartbeat, cleanup.Token).ConfigureAwait(false);
+                }
+                finally
+                {
+                    foreach (var profile in profiles)
+                    {
+                        profile.Session.Dispose();
+                    }
                 }
             }
         }
@@ -301,27 +312,40 @@ internal static class ActiveControllerRuntime
     private sealed class ActiveHealth(ControllerRunContext context, ControllerLeaseOwnership owner,
         ControllerProfileReconciler[] profiles, TimeProvider clock)
     {
+        private readonly object _gate = new();
         private readonly Dictionary<string, DateTimeOffset> _readyUntil = new(StringComparer.Ordinal);
-        private int _stopped;
+        private bool _stopped;
 
         internal void Observe(string profile, bool ready)
         {
-            if (Volatile.Read(ref _stopped) == 0)
+            lock (_gate)
             {
                 var now = clock.GetUtcNow();
                 _readyUntil[profile] = ready ? now + EffectTiming.ObservationFreshness : now;
-                context.PublishHealth(new ControllerHealthSnapshot(true, true, true,
-                    owner.ReadAuthority() is not null, profiles.Select(entry => new ControllerProfileHealth(entry.Key.ProfileId,
-                        _readyUntil.GetValueOrDefault(entry.Key.ProfileId) > now)).ToImmutableArray()));
+                Publish(now);
+            }
+        }
+
+        internal void Pulse()
+        {
+            lock (_gate)
+            {
+                Publish(clock.GetUtcNow());
             }
         }
 
         internal void Stop()
         {
-            Volatile.Write(ref _stopped, 1);
-            context.PublishHealth(new ControllerHealthSnapshot(true, true, true, false,
-                profiles.Select(profile => new ControllerProfileHealth(profile.Key.ProfileId, Ready: false)).ToImmutableArray()));
+            lock (_gate)
+            {
+                _stopped = true;
+                Publish(clock.GetUtcNow());
+            }
         }
+
+        private void Publish(DateTimeOffset now) => context.PublishHealth(new ControllerHealthSnapshot(true, true, true,
+            !_stopped && owner.ReadAuthority() is not null, profiles.Select(entry => new ControllerProfileHealth(entry.Key.ProfileId,
+                !_stopped && _readyUntil.GetValueOrDefault(entry.Key.ProfileId) > now)).ToImmutableArray()));
     }
 
     private sealed class ActiveControllerShutdownWork(ControllerProfileReconciler[] profiles, Task workers,
@@ -338,7 +362,14 @@ internal static class ActiveControllerRuntime
 
         public async Task JoinMutatorsAsync(CancellationToken cancellationToken)
         {
-            await JoinCancelledAsync(workers, cancellationToken).ConfigureAwait(false);
+            try
+            {
+                await JoinCancelledAsync(workers, cancellationToken).ConfigureAwait(false);
+            }
+            catch (Exception) when (workers.IsFaulted)
+            {
+                // A terminal worker fault is observed by the supervisor and cannot leave that worker in flight.
+            }
             await Task.WhenAll(profiles.Select(profile => profile.Session.JoinMutatorsAsync(cancellationToken))).ConfigureAwait(false);
         }
 
