@@ -21,6 +21,15 @@
           "AWSSDK.Core": "[4.1.1.2, 5.0.0)"
         }
       },
+      "AWSSDK.EC2": {
+        "type": "Direct",
+        "requested": "[4.1.5, 4.1.5]",
+        "resolved": "4.1.5",
+        "contentHash": "Wi3rfC4N7RU5dFb1sVa/KBezcPk1iSWpad2N6HHl2sA40OHDY/7z9Qxi1fAwsED0zkcKjZsMAUIQ49RQdwfPUw==",
+        "dependencies": {
+          "AWSSDK.Core": "[4.1.1.2, 5.0.0)"
+        }
+      },
       "AWSSDK.ECS": {
         "type": "Direct",
         "requested": "[4.1.1.1, 4.1.1.1]",
@@ -44,6 +53,15 @@
         "requested": "[4.1.2, 4.1.2]",
         "resolved": "4.1.2",
         "contentHash": "vGRpeXIxK7uRRHzVIrp2dYDri4wwlerUutG8TG7jHMolb3hX6Zu6VVDZpmwB8AlTIZ9BKLIV+V4Oi4xEsamZsQ==",
+        "dependencies": {
+          "AWSSDK.Core": "[4.1.1.1, 5.0.0)"
+        }
+      },
+      "AWSSDK.SecretsManager": {
+        "type": "Direct",
+        "requested": "[4.1.1.2, 4.1.1.2]",
+        "resolved": "4.1.1.2",
+        "contentHash": "UJUSKF7V70OAGBnmYQhWndBblpTgk8mCgKuMHKbOMxAsbf1WFbMcuoQFtky7BLQ0D4zhtLkv0AKFciyUQUVHbA==",
         "dependencies": {
           "AWSSDK.Core": "[4.1.1.1, 5.0.0)"
         }
@@ -566,13 +584,26 @@
       "knightfall.scaleset.aws.handoff": {
         "type": "Project"
       },
-      "AWSSDK.SecretsManager": {
-        "type": "CentralTransitive",
-        "requested": "[4.1.1.2, 4.1.1.2]",
-        "resolved": "4.1.1.2",
-        "contentHash": "UJUSKF7V70OAGBnmYQhWndBblpTgk8mCgKuMHKbOMxAsbf1WFbMcuoQFtky7BLQ0D4zhtLkv0AKFciyUQUVHbA==",
+      "knightfall.scaleset.aws.providers.ec2": {
+        "type": "Project",
         "dependencies": {
-          "AWSSDK.Core": "[4.1.1.1, 5.0.0)"
+          "AWSSDK.Core": "[4.1.1.2, 4.1.1.2]",
+          "AWSSDK.EC2": "[4.1.5, 4.1.5]",
+          "AWSSDK.IdentityManagement": "[4.1.3, 4.1.3]",
+          "AWSSDK.SQS": "[4.1.0.2, 4.1.0.2]",
+          "AWSSDK.SecurityToken": "[4.1.1.1, 4.1.1.1]",
+          "Knightfall.ScaleSet.Aws.Core": "[1.0.0, )"
+        }
+      },
+      "knightfall.scaleset.aws.providers.fargate": {
+        "type": "Project",
+        "dependencies": {
+          "AWSSDK.Core": "[4.1.1.2, 4.1.1.2]",
+          "AWSSDK.EC2": "[4.1.5, 4.1.5]",
+          "AWSSDK.ECS": "[4.1.1.1, 4.1.1.1]",
+          "AWSSDK.IdentityManagement": "[4.1.3, 4.1.3]",
+          "AWSSDK.SQS": "[4.1.0.2, 4.1.0.2]",
+          "Knightfall.ScaleSet.Aws.Core": "[1.0.0, )"
         }
       },
       "JsonSchema.Net": {

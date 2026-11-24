@@ -207,13 +207,7 @@ public sealed partial class DynamoDbLifecycleStore
     public async Task<ListenerCapacity> ReadListenerCapacityAsync(
         LifecycleProfile profile, int maximum, TimeSpan freshness, TimeSpan logFlushGrace, CancellationToken cancellationToken)
     {
-        var demandRecord = await ReadRecordAsync(LifecycleKey.Demand(profile), cancellationToken).ConfigureAwait(false);
-        var demand = demandRecord is null ? null : ParseExecutorRecord<SessionDemandObservation>(demandRecord);
-        var session = await ReadSessionAsync(profile, cancellationToken).ConfigureAwait(false);
-        if (session?.Phase != SessionPhase.Active || session.SessionId != demand?.SessionId)
-        {
-            demand = null;
-        }
+        var (demandRecord, demand) = await ReadDemandEnvelopeAsync(profile, cancellationToken).ConfigureAwait(false);
         var inventory = await ReadExecutorInventoryAsync(profile, cancellationToken).ConfigureAwait(false);
         var capacity = ExecutorClassifier.ProjectListenerCapacity(
             inventory, demand, maximum, _timeProvider.GetUtcNow(), freshness, logFlushGrace);
@@ -225,6 +219,22 @@ public sealed partial class DynamoDbLifecycleStore
                 new LifecycleRecordCondition(LifecycleKey.RunnerInventory(profile), inventory.Revision),
             ],
         };
+    }
+
+    /// <summary>Returns the demand observation only while its exact session is active.</summary>
+    public async Task<SessionDemandObservation?> ReadCurrentSessionDemandAsync(LifecycleProfile profile, CancellationToken cancellationToken)
+    {
+        var (_, demand) = await ReadDemandEnvelopeAsync(profile, cancellationToken).ConfigureAwait(false);
+        return demand;
+    }
+
+    private async Task<(LifecycleRecord? Record, SessionDemandObservation? Demand)> ReadDemandEnvelopeAsync(
+        LifecycleProfile profile, CancellationToken cancellationToken)
+    {
+        var record = await ReadRecordAsync(LifecycleKey.Demand(profile), cancellationToken).ConfigureAwait(false);
+        var demand = record is null ? null : ParseExecutorRecord<SessionDemandObservation>(record);
+        var session = await ReadSessionAsync(profile, cancellationToken).ConfigureAwait(false);
+        return (record, session?.Phase == SessionPhase.Active && session.SessionId == demand?.SessionId ? demand : null);
     }
 
     private async Task<LifecycleWriteOutcome> UpdateExecutorAsync(
