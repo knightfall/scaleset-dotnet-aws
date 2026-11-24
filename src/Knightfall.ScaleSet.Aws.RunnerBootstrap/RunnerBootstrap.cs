@@ -1,4 +1,5 @@
 using System.Security.Cryptography;
+using Knightfall.ScaleSet.Aws.Core.Configuration;
 using Knightfall.ScaleSet.Aws.Core.Lifecycle;
 using Knightfall.ScaleSet.Aws.DynamoDb;
 using Knightfall.ScaleSet.Aws.Handoff;
@@ -44,7 +45,8 @@ public sealed class RunnerBootstrap(
     TimeSpan offerWait,
     TimeSpan pollDelay,
     Func<BootstrapRunnerObservation, CancellationToken, Task>? observe = null,
-    Func<JitHandoffIdentity, bool>? validateProviderBinding = null)
+    Func<JitHandoffIdentity, bool>? validateProviderBinding = null,
+    RunnerProvisionerType? telemetryProvider = null)
 {
     public async Task<RunnerBootstrapOutcome> RunAsync(CancellationToken cancellationToken)
     {
@@ -52,28 +54,37 @@ public sealed class RunnerBootstrap(
         {
             throw new InvalidOperationException("The bootstrap offer wait is invalid.");
         }
+        using var diagnostics = new RunnerBootstrapDiagnostics.Handoff(clock, telemetryProvider, cancellationToken);
         cancellationToken.ThrowIfCancellationRequested();
         if (!reserveSpent())
         {
-            return RunnerBootstrapOutcome.AlreadySpent;
+            return diagnostics.Complete(RunnerBootstrapOutcome.AlreadySpent, "deferred", "already_spent");
         }
 
         using var recipient = JitRecipientKey.Create();
         var hello = recipient.Hello;
-        if (await offers.RegisterHelloAsync(hello, cancellationToken).ConfigureAwait(false) != LifecycleWriteOutcome.Committed)
+        var registered = await offers.RegisterHelloAsync(hello, cancellationToken).ConfigureAwait(false);
+        if (registered != LifecycleWriteOutcome.Committed)
         {
-            return RunnerBootstrapOutcome.HelloRejected;
+            return registered == LifecycleWriteOutcome.Indeterminate
+                ? diagnostics.Complete(RunnerBootstrapOutcome.HelloRejected, "unknown", "hello_unconfirmed")
+                : diagnostics.Complete(RunnerBootstrapOutcome.HelloRejected, "rejected", "hello_rejected");
         }
 
         var receipt = await WaitForOfferAsync(hello, cancellationToken).ConfigureAwait(false);
         if (receipt.Status == BootstrapOfferStatus.NotAvailable)
         {
-            return RunnerBootstrapOutcome.OfferUnavailable;
+            return diagnostics.Complete(RunnerBootstrapOutcome.OfferUnavailable, "unavailable", "no_offer_before_deadline");
         }
-        if (receipt is not { Status: BootstrapOfferStatus.Consumed, Offer: { } offer } || !target.Matches(offer.Binding.Identity) ||
-            validateProviderBinding?.Invoke(offer.Binding.Identity) == false)
+        if (receipt is not { Status: BootstrapOfferStatus.Consumed, Offer: { } offer })
         {
-            return RunnerBootstrapOutcome.OfferRejected;
+            return receipt.Expired
+                ? diagnostics.Complete(RunnerBootstrapOutcome.OfferRejected, "expired", "receipt_expired")
+                : diagnostics.Complete(RunnerBootstrapOutcome.OfferRejected, "unknown", "receipt_unknown");
+        }
+        if (!target.Matches(offer.Binding.Identity) || validateProviderBinding?.Invoke(offer.Binding.Identity) == false)
+        {
+            return diagnostics.Complete(RunnerBootstrapOutcome.OfferRejected, "rejected", "binding_mismatch");
         }
 
         JitPlaintext plaintext;
@@ -83,21 +94,23 @@ public sealed class RunnerBootstrap(
         }
         catch (CryptographicException)
         {
-            return RunnerBootstrapOutcome.OfferRejected;
+            return diagnostics.Complete(RunnerBootstrapOutcome.OfferRejected, "rejected", "authentication_failed");
         }
         using (plaintext)
         {
-            var result = await RunOneJobAsync(runner, plaintext, hello, offer.Binding.OfferId, observe, clock, cancellationToken)
-                .ConfigureAwait(false);
+            diagnostics.Authenticated();
+            var result = await RunOneJobAsync(runner, plaintext, hello, offer.Binding.OfferId, observe, clock, cancellationToken,
+                telemetryProvider).ConfigureAwait(false);
             return result.ExitCode == 0 ? RunnerBootstrapOutcome.Completed : RunnerBootstrapOutcome.RunnerFailed;
         }
     }
 
     internal static async Task<OneJobCompletion> RunOneJobAsync(IOneJobRunner runner, JitPlaintext plaintext, JitHello hello,
         string offerId, Func<BootstrapRunnerObservation, CancellationToken, Task>? observe, TimeProvider clock,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken, RunnerProvisionerType? telemetryProvider = null)
     {
-        var ready = new TaskCompletionSource<long?>(TaskCreationOptions.RunContinuationsAsynchronously);
+        long startedAt = clock.GetTimestamp();
+        var ready = new TaskCompletionSource<(long Id, long At)?>(TaskCreationOptions.RunContinuationsAsynchronously);
         using var runnerLifetime = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         Task readiness = ReportReadinessAsync();
         OneJobCompletion? completion = null;
@@ -106,7 +119,7 @@ public sealed class RunnerBootstrap(
             completion = await runner.RunAsync(plaintext, "ss-" + offerId[..48], (id, _) =>
             {
                 // The output drain only signals readiness. Status I/O has its own lifetime.
-                ready.TrySetResult(id);
+                ready.TrySetResult((id, clock.GetTimestamp()));
                 return Task.CompletedTask;
             }, cancellationToken).ConfigureAwait(false);
         }
@@ -118,6 +131,17 @@ public sealed class RunnerBootstrap(
                 await runnerLifetime.CancelAsync().ConfigureAwait(false);
             }
             await readiness.ConfigureAwait(false);
+            if (await ready.Task.ConfigureAwait(false) is null)
+            {
+                string outcome = completion switch
+                {
+                    null when cancellationToken.IsCancellationRequested => "cancelled",
+                    { ExitCode: not 0 } => "failed",
+                    _ => "unknown",
+                };
+                RunnerBootstrapDiagnostics.RecordStartup(clock.GetElapsedTime(startedAt), telemetryProvider, outcome,
+                    completion is null ? "interrupted" : "runner_exit_without_readiness");
+            }
         }
 
         await ReportAsync(completion.RunnerId, exited: true, cancellationToken).ConfigureAwait(false);
@@ -125,9 +149,11 @@ public sealed class RunnerBootstrap(
 
         async Task ReportReadinessAsync()
         {
-            if (await ready.Task.ConfigureAwait(false) is { } id)
+            if (await ready.Task.ConfigureAwait(false) is { } signal)
             {
-                await ReportAsync(id, exited: false, runnerLifetime.Token).ConfigureAwait(false);
+                RunnerBootstrapDiagnostics.RecordStartup(clock.GetElapsedTime(startedAt, signal.At), telemetryProvider,
+                    "success", "listener_connected");
+                await ReportAsync(signal.Id, exited: false, runnerLifetime.Token).ConfigureAwait(false);
             }
         }
 
