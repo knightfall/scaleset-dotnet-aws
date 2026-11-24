@@ -70,9 +70,10 @@ printf '%s\n' "$candidate_manifest_sha256"
 
 `release.json` records each archive's transport SHA-256 and OCI manifest
 digest. Choose `linux-x64` for ECS x86-64 or `linux-arm64` for ECS Arm.
-The corresponding `.spdx.json` inventories that image. After importing the
+The corresponding `.spdx.json` inventories that image. Use Docker with the
+containerd image store to load the verified OCI archive. After importing the
 archive into ECR, bind the confirmed ECR manifest digest in the controller
 YAML. Each `.grype.json` records the architecture's scan and database evidence
-at build time. Follow the [registry and runtime verification steps](../operator-runbook.md#pin-the-registry-manifest).
+at build time. Follow the [registry and runtime verification steps](../operator-runbook.md#pin-the-registry-manifest). [Docker containerd image store](https://docs.docker.com/engine/storage/containerd/)
 
 [GitHub CLI build provenance verification](https://cli.github.com/manual/gh_attestation_verify)

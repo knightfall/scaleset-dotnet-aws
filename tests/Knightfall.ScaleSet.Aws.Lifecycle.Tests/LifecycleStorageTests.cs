@@ -33,7 +33,7 @@ public sealed class LifecycleStorageTests
             (LifecycleKey.Runner(profile, "allocation-1"), "PROFILE#d#p", "RUNNER#allocation-1"),
             (LifecycleKey.RunnerIdentity(profile, long.MaxValue), "PROFILE#d#p", "RUNNER-ID#9223372036854775807"),
             (LifecycleKey.Operation(profile, "scope#intent"), "PROFILE#d#p", "OP#scope#intent"),
-            (LifecycleKey.Hello("AROA:session"), "HELLO#AROA:session", "BOOTSTRAP"),
+            (LifecycleKey.Hello("AROA:session"), "HELLO#BROKER#AROA:session", "BOOTSTRAP"),
             (LifecycleKey.Offer("AROA:session"), "OFFER#AROA:session", "BOOTSTRAP"),
             (LifecycleKey.Status("AROA:session"), "STATUS#AROA:session", "BOOTSTRAP"),
             (LifecycleKey.RunnerInventory(profile), "PROFILE#d#p", "RUNNER-INVENTORY"),
