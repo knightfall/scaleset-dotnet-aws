@@ -33,7 +33,7 @@ public sealed partial class GitHubLifecycleIntegrationTests
     {
         var token = TestContext.Current.CancellationToken;
         await using var receiver = await OtlpLoopback.StartAsync(grpc: false, respond: null, token);
-        var result = await RunTelemetryScenarioAsync(receiver.Url,
+        var result = await RunTelemetryScenarioAsync(receiver,
             sampleTraces ? ExportMode.Sampled : ExportMode.Unsampled, token);
 
         AssertDecision(result.Decision);
@@ -101,9 +101,9 @@ public sealed partial class GitHubLifecycleIntegrationTests
     {
         var token = TestContext.Current.CancellationToken;
         await using var receiver = await OtlpLoopback.StartAsync(grpc: false, static _ => ReceiverReply.Rejected, token);
-        var disabled = await RunTelemetryScenarioAsync(receiver.Url, ExportMode.Disabled, token);
+        var disabled = await RunTelemetryScenarioAsync(receiver, ExportMode.Disabled, token);
         Assert.Empty(receiver.Requests);
-        var rejected = await RunTelemetryScenarioAsync(receiver.Url, ExportMode.Rejected, token);
+        var rejected = await RunTelemetryScenarioAsync(receiver, ExportMode.Rejected, token);
 
         AssertDecision(disabled.Decision);
         Assert.Equal(disabled.Decision, rejected.Decision);
@@ -114,15 +114,35 @@ public sealed partial class GitHubLifecycleIntegrationTests
         AssertSafePayloads(receiver.Requests, rejected.SessionId);
     }
 
+    [Fact]
+    public async Task ExportStallPreservesAdmissionCheckpointAndOwnershipComparedToDisabledExport()
+    {
+        var token = TestContext.Current.CancellationToken;
+        int traceRequests = 0;
+        await using var receiver = await OtlpLoopback.StartAsync(grpc: false,
+            request => request.Path == "/v1/traces" && Interlocked.Increment(ref traceRequests) == 1
+                ? ReceiverReply.StalledBody : ReceiverReply.Accepted, token);
+        var disabled = await RunTelemetryScenarioAsync(receiver, ExportMode.Disabled, token);
+        Assert.Empty(receiver.Requests);
+        var stalled = await RunTelemetryScenarioAsync(receiver, ExportMode.Stalled, token);
+
+        AssertDecision(disabled.Decision);
+        Assert.Equal(disabled.Decision, stalled.Decision);
+        Assert.Contains(receiver.Requests, request => request.Path == "/v1/traces");
+        Assert.Contains(receiver.Requests, request => request.Path == "/v1/metrics");
+        AssertSafePayloads(receiver.Requests, stalled.SessionId);
+    }
+
     private static async Task<(ListenerDecision Decision, Guid SessionId, string Diagnostics)> RunTelemetryScenarioAsync(
-        string endpoint, ExportMode exportMode, CancellationToken cancellationToken)
+        OtlpLoopback receiver, ExportMode exportMode, CancellationToken cancellationToken)
     {
         await using var rig = await SessionRig.CreateAsync(cancellationToken);
         var settings = TelemetrySettings.Load(runtime: rig.Configuration, readEnvironment: name => name switch
         {
             "OTEL_SDK_DISABLED" => exportMode == ExportMode.Disabled ? "true" : "false",
-            "OTEL_EXPORTER_OTLP_ENDPOINT" => endpoint,
+            "OTEL_EXPORTER_OTLP_ENDPOINT" => receiver.Url,
             "OTEL_EXPORTER_OTLP_PROTOCOL" => "http/protobuf",
+            "OTEL_EXPORTER_OTLP_TRACES_TIMEOUT" => exportMode == ExportMode.Stalled ? "5000" : null,
             "OTEL_TRACES_SAMPLER" => "parentbased_traceidratio",
             "OTEL_TRACES_SAMPLER_ARG" => exportMode == ExportMode.Unsampled ? "0" : "1",
             _ => null,
@@ -142,6 +162,11 @@ public sealed partial class GitHubLifecycleIntegrationTests
         var cooldown = await lane.StepAsync(cancellationToken);
         Assert.Equal(ScaleSetListenerStepStatus.Deferred, cooldown.Step?.Status);
         rig.Clock.Now = retryAt;
+        if (exportMode == ExportMode.Stalled)
+        {
+            await receiver.StalledBodyStarted.WaitAsync(TimeSpan.FromSeconds(5), cancellationToken);
+            Assert.False(receiver.StalledBodyEnded.IsCompleted);
+        }
         Assert.Equal(0, rig.Simulator.Offer(CapturedJob, HeldBackJob));
         var accepted = await lane.StepAsync(cancellationToken);
         int held = await rig.ReadHeldAsync(cancellationToken);
@@ -176,6 +201,12 @@ public sealed partial class GitHubLifecycleIntegrationTests
         Assert.Equal(new[] { ("GET", messages), ("GET", messages), ("DELETE", messages + "/0"), ("GET", messages), ("DELETE", messages + "/1") },
             queue.Select(request => (request.Method, request.Path)));
         int released = await rig.ReadHeldAsync(cancellationToken);
+        if (exportMode == ExportMode.Stalled)
+        {
+            Assert.False(receiver.StalledBodyEnded.IsCompleted);
+            Assert.False(diagnostics.FirstLine.IsCompleted);
+            receiver.ReleaseStalledBody();
+        }
         _ = await pipeline.StopAsync().WaitAsync(cancellationToken);
         var decision = new ListenerDecision(accepted.Step?.Status, held, firstReserved, secondReserved, lost.Status,
             pending.LastAcknowledgedMessageId, pending.Pending?.Phase, pending.Pending?.Delivery.Message?.MessageId,
@@ -345,5 +376,6 @@ public sealed partial class GitHubLifecycleIntegrationTests
         Unsampled = 1,
         Disabled = 2,
         Rejected = 3,
+        Stalled = 4,
     }
 }

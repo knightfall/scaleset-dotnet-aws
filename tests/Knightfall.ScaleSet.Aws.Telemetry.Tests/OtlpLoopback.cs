@@ -40,12 +40,19 @@ internal sealed class OtlpLoopback : IAsyncDisposable
     private readonly WebApplication _app;
     private readonly ConcurrentQueue<OtlpCapture> _requests = new();
     private readonly TaskCompletionSource _received = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private readonly TaskCompletionSource _stallStarted = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private readonly TaskCompletionSource _stallEnded = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private readonly TaskCompletionSource _releaseStalledBody = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
     private OtlpLoopback(WebApplication app) => _app = app;
 
     internal string Url => _app.Urls.Single();
     internal IReadOnlyList<OtlpCapture> Requests => _requests.ToArray();
     internal Task FirstRequest => _received.Task;
+    internal Task StalledBodyStarted => _stallStarted.Task;
+    internal Task StalledBodyEnded => _stallEnded.Task;
+
+    internal void ReleaseStalledBody() => _releaseStalledBody.TrySetResult();
 
     internal static async Task<OtlpLoopback> StartAsync(bool grpc, Func<OtlpCapture, ReceiverReply>? respond, CancellationToken cancellationToken)
     {
@@ -84,12 +91,17 @@ internal sealed class OtlpLoopback : IAsyncDisposable
         if (reply == ReceiverReply.StalledBody)
         {
             await context.Response.StartAsync(cancellationToken);
+            _stallStarted.TrySetResult();
             try
             {
-                await Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken);
+                await _releaseStalledBody.Task.WaitAsync(cancellationToken);
             }
             catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
             {
+            }
+            finally
+            {
+                _stallEnded.TrySetResult();
             }
             return;
         }
