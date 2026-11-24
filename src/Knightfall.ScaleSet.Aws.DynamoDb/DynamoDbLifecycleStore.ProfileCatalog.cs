@@ -8,8 +8,7 @@ public sealed partial class DynamoDbLifecycleStore
     private const string CatalogProfilePrefix = "PROFILE#";
     private const string CatalogProfileIdentity = "effectProfileId";
 
-    /// <summary>Returns the durable profiles that may retain reconciliation work for this deployment.</summary>
-    public async Task<IReadOnlyList<LifecycleProfile>> ReadEffectProfilesAsync(
+    internal async Task<IReadOnlyList<LifecycleProfile>> ReadEffectProfilesAsync(
         string deployment, CancellationToken cancellationToken)
     {
         string partition = LifecycleKey.Lease(deployment).PartitionKey;
