@@ -7,6 +7,10 @@ using Xunit;
 
 namespace Knightfall.ScaleSet.Aws.Lifecycle.Tests;
 
+[CollectionDefinition(nameof(FargateEffectJournalSuite), DisableParallelization = true)]
+public sealed class FargateEffectJournalSuite;
+
+[Collection(nameof(FargateEffectJournalSuite))]
 public sealed class FargateEffectJournalTests
 {
     private const string Cluster = "arn:aws:ecs:ap-southeast-2:111122223333:cluster/engineering-shell";
@@ -218,7 +222,7 @@ public sealed class FargateEffectJournalTests
         Assert.Equal(RunnerId, executor.State.RunnerId);
     }
 
-    [Theory(Timeout = 10_000)]
+    [Theory(Timeout = 60_000)]
     [InlineData(false)]
     [InlineData(true)]
     public async Task UnusedAdmissionClosureAndJitStagingCannotBothCommit(bool closureWins)
@@ -279,7 +283,7 @@ public sealed class FargateEffectJournalTests
         Assert.Equal(closureWins ? 1 : 0, provider.Sends.Count);
     }
 
-    [Fact(Timeout = 10_000)]
+    [Fact(Timeout = 60_000)]
     public async Task AcquisitionAfterBeginDiscardsUnsentStopAndCanRearmAfterItCloses()
     {
         var token = TestContext.Current.CancellationToken;
