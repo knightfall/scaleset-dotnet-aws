@@ -1,8 +1,14 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
     <TargetFramework>net10.0</TargetFramework>
+    <OutputType>Exe</OutputType>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
   </PropertyGroup>
   <ItemGroup>
+    <InternalsVisibleTo Include="Knightfall.ScaleSet.Aws.Lifecycle.Tests" />
+    <InternalsVisibleTo Include="Knightfall.ScaleSet.Aws.Bootstrap.LinuxChecks" />
+    <ProjectReference Include="../Knightfall.ScaleSet.Aws.DynamoDb/Knightfall.ScaleSet.Aws.DynamoDb.csproj" />
+    <ProjectReference Include="../Knightfall.ScaleSet.Aws.Handoff/Knightfall.ScaleSet.Aws.Handoff.csproj" />
     <PackageReference Include="AWSSDK.Core" />
     <PackageReference Include="AWSSDK.DynamoDBv2" />
     <PackageReference Include="AWSSDK.SecurityToken" />

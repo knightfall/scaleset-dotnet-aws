@@ -1,0 +1,68 @@
+# Direct EC2 runner bootstrap
+
+The EC2 supervisor verifies its attached instance role, reserves one bootstrap attempt per instance, and starts a single ephemeral GitHub Actions runner. It uses STS and only the instance's item-scoped DynamoDB permissions. Windows is outside the supported bootstrap contract.
+
+## Install and configure the AMI
+
+Install the Linux build of `Knightfall.ScaleSet.Aws.RunnerBootstrap` and provision a root-owned system service. Run `RunnerBootstrap ec2 /etc/scaleset/bootstrap.json` as the supervisor. Use a restrictive umask, disable core dumps and hibernation, close inherited service descriptors, and do not restart the supervisor or runner to recover a job. Run only one supervisor service for the instance.
+
+The settings file is root-owned, mode `0600`, with root-owned parent directories. It contains the table name, account, Region, bootstrap role ARN and its immutable IAM role ID, and the nonsecret controller deployment/profile/scope. Use the exact scale-set ID when the profile is pinned. For a controller-created set, leave it null and the scoped DynamoDB offer supplies the assigned ID.
+
+```json
+{
+  "tableName": "scale-set-lifecycle",
+  "authority": {
+    "account": "111122223333",
+    "region": "ap-southeast-2",
+    "roleArn": "arn:aws:iam::111122223333:role/scaleset-ec2-bootstrap",
+    "roleId": "AROAFIXTUREBOOTSTRAP01"
+  },
+  "target": {
+    "deployment": "111122223333:ap-southeast-2:production",
+    "profileId": "ec2-general",
+    "scopeIdentity": "github.com/example/project",
+    "scaleSetId": null
+  },
+  "spentDirectory": "/var/lib/scaleset-bootstrap",
+  "runner": {
+    "runtimeRoot": "/run/scaleset-runner",
+    "boundaryProof": "/run/scaleset-bootstrap/verified-boundary.json",
+    "listenerSha256": "<actual lowercase SHA-256 of the installed Runner.Listener>",
+    "userId": 1500,
+    "groupId": 1500
+  },
+  "publishStatus": false
+}
+```
+
+Provision the spent directory on the instance's encrypted persistent `xfs` or `ext4` volume at mode `0700`. The supervisor creates and flushes the per-instance marker and its parent before HELLO. Retain that marker through reboot, update and failure. An unavailable offer can be polled with the same in-process key and nonce for up to five minutes. A lost DELETE response, invalid envelope or supervisor restart ends the attempt without re-registering.
+
+Install the architecture-matched GitHub Actions runner from the checksum-verified release package. The locally inspected Linux artifact was version `2.338.2` at commit `d1eb12d4b115c301201de27d667284e1a80f2ab5`. Mount the whole mutable runner root as a private executable `tmpfs` with `nosuid,nodev`, root ownership and the dedicated runner group, and set mode `1770`. Ensure that swap is off, or use an explicitly `noswap` mount and a cgroup v2 swap limit of zero for the supervisor and descendants. Follow the filesystem layout in the archive and protect packaged programs and libraries from modification by the runner UID. Create the mount anew at boot and unmount it at shutdown. [GitHub Actions runner release](https://github.com/actions/runner/releases/tag/v2.338.2), [Linux tmpfs documentation](https://docs.kernel.org/filesystems/tmpfs.html), [cgroup v2 swap limits](https://docs.kernel.org/admin-guide/cgroup-v2.html#memory-interface-files).
+
+The bootstrap materializes only supported decoded members of the authenticated JIT payload at the volatile root and erases its plaintext buffers before starting the listener. It invokes the pinned `Runner.Listener run --once` directly under the configured non-root UID/GID, clears inherited environment and supplementary groups, drops capabilities and sets no-new-privileges. Keep the whole runner diagnostic directory volatile as well. The one-job runner can read its own short-lived GitHub runner credentials. It receives no supervisor role credentials, raw JIT config, PAT or App secrets. [Upstream JIT and one-job runner code](https://github.com/actions/runner/blob/d1eb12d4b115c301201de27d667284e1a80f2ab5/src/Runner.Listener/Runner.cs#L234-L331).
+
+## Qualify the isolation boundary before enabling status
+
+At boot, a trusted privileged provisioning service must validate the deployed AMI's isolation and attest to that boot. The supervisor requires a root-owned, mode `0600` proof under root-owned directories. The proof contains these fields.
+
+| Field | Required value |
+| --- | --- |
+| `protocolVersion` | `1` |
+| `bootId` | Exact current `/proc/sys/kernel/random/boot_id` |
+| `runtimeRoot`, `listenerSha256`, `userId`, `groupId` | Exact validated launcher settings |
+| `processIsolationVerified` | Positive process-isolation checks from the workflow UID and Docker job |
+| `ipv4MetadataDenied`, `ipv6MetadataDenied` | Installed address deny rules and matching connectivity probes |
+| `dockerBoundaryVerified` | Positive verification of the local rootless Docker boundary |
+
+The qualification service must fail the boot gate when any of these checks fails:
+
+- Hide privileged processes from the workflow user and its containers. Check that job code cannot read protected process arguments or environment, attach with ptrace, or access the supervisor's credential and state directories. Keep the proof and service tools outside paths writable by the runner user.
+- Enforce IMDSv2 at the Launch Template. Apply the installed host and container network policy to both `169.254.169.254` and `fd00:ec2::254`. Cover the unprivileged runner and all local rootless Docker network helpers, including any permitted host-network mode. Check the installed rules as well as negative probes from real job processes. A timeout or currently disabled endpoint alone does not establish a deny rule.
+- Use a rootless local Docker daemon under the dedicated runner account. The bootstrap points Docker at that account's socket. Qualify the socket ownership and daemon mode, plus each supported job network and container mode. The runner account must have no sudo, rootful Docker socket, privileged supervisor namespace access, or credential relay. [Docker rootless mode](https://docs.docker.com/engine/security/rootless/).
+- Verify the supervisor alone can retrieve its attached role, and within the trusted test setup verify an attempted status write from workflow code is denied. Recheck after AMI, networking, runner package, or container runtime changes. Clear old proofs when the verified boundary changes.
+
+With a current proof, the supervisor can optionally publish `STATUS#` using the verified instance credentials. Readiness follows the pinned listener's session-established signal. Exit follows the observed process exit and output drain. Enabling `publishStatus` requires the audited EC2-only IAM status grant and the operator AMI qualification in T26. Leave it disabled for an unqualified AMI. The supervisor never forwards unclassified child output to its logs. [Runner session readiness signal](https://github.com/actions/runner/blob/d1eb12d4b115c301201de27d667284e1a80f2ab5/src/Runner.Listener/Runner.cs#L472-L491).
+
+## Local verification
+
+`make check-lifecycle` covers bootstrap wire identity, offer consumption, failure and restart behavior using synthetic credentials and loopback MiniStack. The separate `tests/Knightfall.ScaleSet.Aws.Bootstrap.LinuxChecks/run.sh` smoke check exercises the actual Linux privilege drop, RAM filesystem, no plaintext in process inputs, one readiness signal, cleanup, and the fsynced marker. It requires Docker with the pinned local ARM64 SDK image or a compatible local image supplied through `SCALESET_LINUX_FIXTURE_IMAGE`. It uses synthetic material and runs in a disposable network-disabled Linux container. The fixture does not establish AWS IAM or AMI network isolation. Use T23 for the emulated whole flow and T26 for deployment-bound host and job verification.
