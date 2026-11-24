@@ -51,8 +51,7 @@
 
 ## Delivery
 
-- This is a planning baseline until T01 creates the solution and CI. Commands and layouts above describe the intended implementation; validate documentation changes with link, task/dependency, and whitespace checks while no build exists.
-- Keep task specifications in `docs/`; use the later T01–T26 issues to track dependencies, PRs, and verification rather than duplicating the specification text.
+- Keep task specifications in `docs/`; use the T01–T26 issues to track dependencies, PRs, and verification rather than duplicating the specification text.
 - Make the smallest complete, testable change.
 - Run relevant checks (`make check` or matching `.NET` and CDK suites) before declaring completion.
 - Report changes, validation results, and unresolved limitations.

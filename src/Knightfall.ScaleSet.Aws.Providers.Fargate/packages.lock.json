@@ -1,0 +1,51 @@
+{
+  "version": 2,
+  "dependencies": {
+    "net10.0": {
+      "AWSSDK.Core": {
+        "type": "Direct",
+        "requested": "[4.1.1.2, 4.1.1.2]",
+        "resolved": "4.1.1.2",
+        "contentHash": "RETCWprYHiCwwL6mgLnhCF/w7gwpHaGVIKU+Th+xDs0yzs2b7rgz09nicLT5+k0qm7OJxze6fqiU4ZdmC3tu5A==",
+        "dependencies": {
+          "AWSSDK.Extensions.Numerics": "[4.1.0, 5.0.0)",
+          "System.IO.Hashing": "11.0.0"
+        }
+      },
+      "AWSSDK.ECS": {
+        "type": "Direct",
+        "requested": "[4.1.1.1, 4.1.1.1]",
+        "resolved": "4.1.1.1",
+        "contentHash": "1WE41p1HojT6F8Fw+DcGsByHMl9eD4x79sfoZk4u3l043BaiuaI3I8/8uY70jYVXuHjZWDG6mGF5jpNZP/zgyQ==",
+        "dependencies": {
+          "AWSSDK.Core": "[4.1.1.1, 5.0.0)"
+        }
+      },
+      "AWSSDK.IdentityManagement": {
+        "type": "Direct",
+        "requested": "[4.1.3, 4.1.3]",
+        "resolved": "4.1.3",
+        "contentHash": "pv5MGBQEeR0eVH57ZP+UX1lMVaiKRV6a50WxR8Mro5RAqasEk5SPDwRWguk8klzHtoHRnaKoLFdSZqk7MjXZKw==",
+        "dependencies": {
+          "AWSSDK.Core": "[4.1.1.2, 5.0.0)"
+        }
+      },
+      "Roslynator.Analyzers": {
+        "type": "Direct",
+        "requested": "[5.0.1, 5.0.1]",
+        "resolved": "5.0.1",
+        "contentHash": "sCZ0Di4B937wKa9pwKbdsE6Njr8A/FdCLw28+yDKyMaDZ/f8JWxcFn6NOCukzKhCG/eA6M2DbXlKkrPi0g0lIA=="
+      },
+      "AWSSDK.Extensions.Numerics": {
+        "type": "Transitive",
+        "resolved": "4.1.0",
+        "contentHash": "hhoiXT1aUyVgIiQbQoqG3L1EEneqXDh2GKyH5izUlO6Rzi9GAAi8S6mlLiVwow23+EGg77zHjdmUi+ia3RSUTg=="
+      },
+      "System.IO.Hashing": {
+        "type": "Transitive",
+        "resolved": "11.0.0",
+        "contentHash": "U+Bv2qCYt6eONi+arSP0QIp4uTO6os6uceBsqiAwruZ+Wo2HrRhO/0tj38M9URJtS+4DhAtT3ka2TGNFYsnhyQ=="
+      }
+    }
+  }
+}
