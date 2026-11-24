@@ -1,0 +1,81 @@
+{
+  "apiVersion": "scaleset-aws/v1alpha1",
+  "kind": "RunnerDemandReplay",
+  "environment": "engineering-dev",
+  "aws": {
+    "account": "111122223333",
+    "region": "ap-southeast-2"
+  },
+  "records": [
+    {
+      "profileId": "linux-ec2-docker",
+      "scopeURL": "https://github.com/example-engineering",
+      "runnerGroup": "Linux-EC2",
+      "scaleSet": "linux-ec2-docker",
+      "scaleSetId": "9007199254740993",
+      "observedAt": "2026-11-24T00:12:00Z",
+      "inventory": {
+        "isComplete": true,
+        "backendCapacityCeiling": 10,
+        "backendLaunchHeadroom": 4,
+        "slots": [
+          { "id": "busy-runner", "state": "busy", "ownershipVerified": true },
+          {
+            "id": "starting-runner",
+            "state": "starting",
+            "ownershipVerified": true,
+            "startedAt": "2026-11-23T23:53:00Z"
+          },
+          { "id": "unknown-runner", "state": "unknown", "ownershipVerified": false }
+        ]
+      }
+    },
+    {
+      "profileId": "linux-ec2-docker",
+      "scopeURL": "https://www.github.com/EXAMPLE-ENGINEERING/",
+      "runnerGroup": "linux-ec2",
+      "scaleSet": "LINUX-EC2-DOCKER",
+      "scaleSetId": "9007199254740993",
+      "observedAt": "2026-11-24T00:00:00Z",
+      "demand": { "totalAssignedJobs": 3 },
+      "inventory": {
+        "isComplete": true,
+        "backendCapacityCeiling": 10,
+        "backendLaunchHeadroom": 4,
+        "slots": [
+          { "id": "busy-runner", "state": "busy", "ownershipVerified": true },
+          {
+            "id": "starting-runner",
+            "state": "starting",
+            "ownershipVerified": true,
+            "startedAt": "2026-11-23T23:53:00Z"
+          },
+          { "id": "unknown-runner", "state": "unknown", "ownershipVerified": false }
+        ]
+      }
+    },
+    {
+      "profileId": "linux-ec2-docker",
+      "scopeURL": "https://github.com/example-engineering",
+      "runnerGroup": "Linux-EC2",
+      "scaleSet": "linux-ec2-docker",
+      "scaleSetId": "9007199254740993",
+      "observedAt": "2026-11-24T01:04:00+01:00",
+      "inventory": {
+        "isComplete": true,
+        "backendCapacityCeiling": 10,
+        "backendLaunchHeadroom": 4,
+        "slots": [
+          { "id": "busy-runner", "state": "busy", "ownershipVerified": true },
+          {
+            "id": "starting-runner",
+            "state": "starting",
+            "ownershipVerified": true,
+            "startedAt": "2026-11-23T23:53:00Z"
+          },
+          { "id": "unknown-runner", "state": "unknown", "ownershipVerified": false }
+        ]
+      }
+    }
+  ]
+}

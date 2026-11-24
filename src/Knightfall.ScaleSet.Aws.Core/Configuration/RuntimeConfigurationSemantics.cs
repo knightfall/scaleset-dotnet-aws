@@ -135,6 +135,10 @@ internal static partial class RuntimeConfigurationSemantics
         }
     }
 
+    internal static (string Scope, string Group, string ScaleSet) GitHubBinding(
+        string scopeUrl, string runnerGroup, string scaleSet, string scopePath) =>
+        (ParseGitHubScope(scopeUrl, scopePath).Identity, Fold(runnerGroup), Fold(scaleSet));
+
     private static long? ValidatePinnedScaleSet(JsonElement routing, string path)
     {
         if (!routing.TryGetProperty("scaleSetId", out JsonElement scaleSetId))

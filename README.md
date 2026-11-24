@@ -45,3 +45,19 @@ strings to preserve their precision.
 
 GitHub routing values retain their authored spelling. Scope, group, scale-set,
 and label comparisons use the pinned Unicode 17.0 simple case-folding data.
+
+## Run an offline capacity report
+
+The pinned EC2 example uses no demand source and can run offline as-is.
+
+```sh
+npm --prefix cdk run config:emit -- ../testdata/config/ec2-only-pinned.yaml /tmp/runner-offline.json
+dotnet run --project src/Knightfall.ScaleSet.Aws.Controller -- reconcile --config /tmp/runner-offline.json --dry-run --once
+```
+
+For local snapshots or replays, set the demand path relative to the runtime
+JSON file or use an absolute path. The [replay fixture](testdata/dryrun/replay.json)
+shows the observation format, including the deployment and GitHub profile
+bindings. Replay evaluates observations in chronological order. The offline
+command reports whether AWS inspection was requested and requires local
+evidence files.
