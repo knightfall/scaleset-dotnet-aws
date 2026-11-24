@@ -13,7 +13,7 @@ public sealed partial class GitHubScaleSetConnection
         {
             throw BindingMismatch();
         }
-        var opened = await RunSessionMutationAsync(authorization,
+        var opened = await RunSessionMutationAsync(authorization, "session-open",
             token => _client.CreateMessageSessionAsync(session.Binding.ScaleSetId, session.OwnerName, token), cancellationToken)
             .ConfigureAwait(false);
         if (opened.Session.RunnerScaleSet is { Id: not 0 } set && set.Id != session.Binding.ScaleSetId)
@@ -34,7 +34,7 @@ public sealed partial class GitHubScaleSetConnection
             throw BindingMismatch();
         }
 
-        _ = await RunSessionMutationAsync(authorization, async token =>
+        _ = await RunSessionMutationAsync(authorization, owned is null ? "session-retire" : "session-close", async token =>
         {
             if (owned is null)
             {
@@ -49,13 +49,19 @@ public sealed partial class GitHubScaleSetConnection
     }
 
     private Task<T> RunSessionMutationAsync<T>(
-        SessionSendAuthorization authorization, Func<CancellationToken, Task<T>> send, CancellationToken cancellationToken)
+        SessionSendAuthorization authorization, string operation, Func<CancellationToken, Task<T>> send, CancellationToken cancellationToken)
     {
         if (authorization.Session.Binding.ScopeIdentity != ScopeIdentity)
         {
             throw BindingMismatch();
         }
-        return RunBoundMutationAsync(authorization.TryConsume, send, cancellationToken);
+        return RunBoundMutationAsync(authorization.TryConsume, async token =>
+        {
+            using var telemetry = GitHubListenerDiagnostics.Start(operation, _clock, CancellationToken.None);
+            var result = await send(token).ConfigureAwait(false);
+            telemetry.Complete("returned");
+            return result;
+        }, cancellationToken);
     }
 
     private delegate bool ConsumeAuthorization(out TimeSpan remaining);

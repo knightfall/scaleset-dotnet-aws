@@ -18,7 +18,11 @@ public enum BootstrapOfferStatus
     AlreadyConsumed = 3,
 }
 
-public sealed record BootstrapOfferReceipt(BootstrapOfferStatus Status, JitOfferEnvelope? Offer = null);
+public sealed record BootstrapOfferReceipt(BootstrapOfferStatus Status, JitOfferEnvelope? Offer = null)
+{
+    /// <summary>Indicates that the exact decoded offer expired while its conditional deletion was in flight.</summary>
+    public bool Expired { get; init; }
+}
 
 /// <summary>Performs only the HELLO put and one-shot OFFER delete allowed to the runner's own bootstrap principal.</summary>
 public sealed class DynamoDbBootstrapOfferClient
@@ -70,10 +74,12 @@ public sealed class DynamoDbBootstrapOfferClient
         string helloDigest = BootstrapItems.HelloDigest(hello);
         var key = LifecycleKey.Offer(_awsUserId);
         cancellationToken.ThrowIfCancellationRequested();
+        using var telemetry = DynamoDbDiagnostics.StartHandoff("offer.consume", _clock);
         int prior = Interlocked.CompareExchange(ref _consumeState, InFlight, ReadyToConsume);
         if (prior != ReadyToConsume)
         {
-            return new BootstrapOfferReceipt(prior == Consumed ? BootstrapOfferStatus.AlreadyConsumed : BootstrapOfferStatus.Indeterminate);
+            return telemetry.Complete(new BootstrapOfferReceipt(
+                prior == Consumed ? BootstrapOfferStatus.AlreadyConsumed : BootstrapOfferStatus.Indeterminate));
         }
 
         int finish = Indeterminate;
@@ -97,27 +103,30 @@ public sealed class DynamoDbBootstrapOfferClient
             }, cancellationToken).ConfigureAwait(false);
             if (response.HttpStatusCode != HttpStatusCode.OK || response.Attributes is not { Count: > 0 } item)
             {
-                return new BootstrapOfferReceipt(BootstrapOfferStatus.Indeterminate);
+                return telemetry.Complete(new BootstrapOfferReceipt(BootstrapOfferStatus.Indeterminate));
             }
             var offer = BootstrapItems.DecodeOffer(key, item, helloDigest);
             if (offer.Binding.Identity.ResourceArn != _resourceArn ||
-                !offer.Binding.BootNonce.AsSpan().SequenceEqual(hello.BootNonce.AsSpan()) ||
-                offer.Binding.ExpiresAtUnixMilliseconds <= _clock.GetUtcNow().ToUnixTimeMilliseconds())
+                !offer.Binding.BootNonce.AsSpan().SequenceEqual(hello.BootNonce.AsSpan()))
             {
-                return new BootstrapOfferReceipt(BootstrapOfferStatus.Indeterminate);
+                return telemetry.Complete(new BootstrapOfferReceipt(BootstrapOfferStatus.Indeterminate));
+            }
+            if (offer.Binding.ExpiresAtUnixMilliseconds <= _clock.GetUtcNow().ToUnixTimeMilliseconds())
+            {
+                return telemetry.Complete(new BootstrapOfferReceipt(BootstrapOfferStatus.Indeterminate) { Expired = true });
             }
             finish = Consumed;
-            return new BootstrapOfferReceipt(BootstrapOfferStatus.Consumed, offer);
+            return telemetry.Complete(new BootstrapOfferReceipt(BootstrapOfferStatus.Consumed, offer));
         }
         catch (ConditionalCheckFailedException)
         {
             finish = ReadyToConsume;
-            return new BootstrapOfferReceipt(BootstrapOfferStatus.NotAvailable);
+            return telemetry.Complete(new BootstrapOfferReceipt(BootstrapOfferStatus.NotAvailable));
         }
         catch (Exception error) when (BootstrapItems.IsIndeterminate(error) ||
                                       error is InvalidDataException or CryptographicException or JsonException)
         {
-            return new BootstrapOfferReceipt(BootstrapOfferStatus.Indeterminate);
+            return telemetry.Complete(new BootstrapOfferReceipt(BootstrapOfferStatus.Indeterminate));
         }
         catch (AmazonServiceException)
         {

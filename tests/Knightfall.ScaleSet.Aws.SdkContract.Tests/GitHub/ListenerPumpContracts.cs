@@ -1,4 +1,10 @@
+using System.Collections.Concurrent;
+using System.Diagnostics;
+using System.Diagnostics.Metrics;
 using System.Net;
+using Knightfall.ScaleSet.Aws.Core.Configuration;
+using Knightfall.ScaleSet.Aws.Core.Telemetry;
+using Knightfall.ScaleSet.Aws.GitHub;
 using Knightfall.ScaleSet.Aws.ListenerConsumer;
 using ScaleSet.Client;
 using ScaleSet.Listener;
@@ -11,6 +17,87 @@ public sealed class ListenerPumpContracts
     private const long MessageId = 9_000_000_004;
     private static readonly ScaleSetListenerSessionKey Key = new(
         "github.com/owner/repository", GitHubWire.SetId, GitHubWire.SessionId);
+
+    [Fact]
+    public async Task ObservedQueuePreservesReleasedPumpSpansAndMeasuresPollAndAcknowledgement()
+    {
+        var token = TestContext.Current.CancellationToken;
+        var runtime = RuntimeConfigurationLoader.Load(await File.ReadAllBytesAsync(
+            Path.Combine(AppContext.BaseDirectory, "fargate-only.json"), token));
+        var profile = Assert.IsType<TelemetryProfile>(TelemetryProfile.From(Assert.Single(runtime.Profiles)));
+        using var scope = TelemetryProfileScope.Enter(profile);
+        var spans = new ConcurrentQueue<Activity>();
+        using var parent = new Activity("listener-telemetry-fixture").SetIdFormat(ActivityIdFormat.W3C).Start();
+        using var activityListener = new ActivityListener
+        {
+            ShouldListenTo = source => source.Name is "ScaleSet.Listener" or "Knightfall.ScaleSet.Aws.GitHub",
+            Sample = static (ref ActivityCreationOptions<ActivityContext> _) => ActivitySamplingResult.AllDataAndRecorded,
+            ActivityStopped = span =>
+            {
+                if (span.TraceId == parent.TraceId)
+                {
+                    spans.Enqueue(span);
+                }
+            },
+        };
+        ActivitySource.AddActivityListener(activityListener);
+        var measurements = new ConcurrentQueue<(string Operation, string? Unit, double Value)>();
+        using var meter = new MeterListener
+        {
+            InstrumentPublished = (instrument, listener) =>
+            {
+                if (instrument.Meter.Name == "Knightfall.ScaleSet.Aws.GitHub" &&
+                    instrument.Name == "scaleset.aws.listener.operation.duration")
+                {
+                    listener.EnableMeasurementEvents(instrument);
+                }
+            },
+        };
+        meter.SetMeasurementEventCallback<double>((instrument, value, tags, _) =>
+        {
+            var fields = tags.ToArray().ToDictionary(pair => pair.Key, pair => pair.Value, StringComparer.Ordinal);
+            if (fields.GetValueOrDefault("profile") is string id && id == profile.Id)
+            {
+                Assert.Equal("fargate", fields["provider"]);
+                Assert.DoesNotContain(fields.Keys, key => key is not ("profile" or "provider" or "operation" or "outcome" or "reason"));
+                measurements.Enqueue(((string)fields["operation"]!, instrument.Unit, value));
+            }
+        });
+        meter.Start();
+        var clock = new ContractClock();
+        var wireClock = new QueueTimestampClock();
+        var queue = new QueueSession
+        {
+            Poll = _ =>
+            {
+                wireClock.Advance(TimeSpan.FromSeconds(2));
+                return Task.FromResult<RunnerScaleSetMessage?>(new() { MessageId = MessageId });
+            },
+            Delete = () => wireClock.Advance(TimeSpan.FromMilliseconds(250)),
+        };
+        var store = StartStore(owner: CancellationToken.None);
+        var complete = new ConsumerDeliveryHandler(static (_, _) => Task.FromResult(ScaleSetListenerDeliveryDisposition.Completed));
+        var pump = CreatePump(new ObservedMessageSession(queue, wireClock), store, complete, clock, CancellationToken.None);
+
+        var result = await pump.StepAsync(token);
+
+        Assert.Equal(ScaleSetListenerStepStatus.MessageAcknowledged, result.Status);
+        Assert.Equal((0L, 7), Assert.Single(queue.Polls));
+        Assert.Equal(MessageId, Assert.Single(queue.Deletes));
+        var poll = Assert.Single(spans, span => span.OperationName == "scaleset.aws.listener.poll");
+        var ack = Assert.Single(spans, span => span.OperationName == "scaleset.aws.listener.acknowledge");
+        Assert.Equal("received", poll.GetTagItem("outcome"));
+        Assert.Equal("returned", ack.GetTagItem("outcome"));
+        foreach (var span in new[] { poll, ack })
+        {
+            Assert.Equal("scaleset.listener.operation", span.Parent?.OperationName);
+            Assert.Equal("ScaleSet.Listener", span.Parent?.Source.Name);
+            Assert.Equal(profile.Id, span.GetTagItem("profile"));
+        }
+        Assert.Collection(measurements,
+            value => Assert.Equal(("poll", "s", 2.0), value),
+            value => Assert.Equal(("acknowledge", "s", 0.25), value));
+    }
 
     [Fact]
     public async Task ReceivedIsDurableBeforeHandlingAndReplayRetainsObservationTime()
@@ -105,10 +192,31 @@ public sealed class ListenerPumpContracts
         using var client = GitHubWire.Connect(http, clock);
         var cancellationToken = TestContext.Current.CancellationToken;
         var session = await client.CreateMessageSessionAsync(GitHubWire.SetId, "owner", cancellationToken);
-        var pump = CreatePump(session, store, UnexpectedDelivery(), clock, CancellationToken.None);
+        using var telemetryParent = new Activity("ambiguous-ack-fixture").SetIdFormat(ActivityIdFormat.W3C).Start();
+        var observations = new ConcurrentQueue<Activity>();
+        using var listener = new ActivityListener
+        {
+            ShouldListenTo = source => source.Name == "Knightfall.ScaleSet.Aws.GitHub",
+            Sample = static (ref ActivityCreationOptions<ActivityContext> _) => ActivitySamplingResult.AllDataAndRecorded,
+            ActivityStopped = span =>
+            {
+                if (span.TraceId == telemetryParent.TraceId)
+                {
+                    observations.Enqueue(span);
+                }
+            },
+        };
+        ActivitySource.AddActivityListener(listener);
+        var observed = new ObservedMessageSession(session, clock);
+        var pump = CreatePump(observed, store, UnexpectedDelivery(), clock, CancellationToken.None);
 
         var error = await Assert.ThrowsAsync<ScaleSetApiException>(() => pump.StepAsync(cancellationToken));
-        var reconstructed = await CreatePump(session, store, UnexpectedDelivery(), clock, CancellationToken.None).StepAsync(cancellationToken);
+        var reconstructed = await CreatePump(observed, store, UnexpectedDelivery(), clock, CancellationToken.None).StepAsync(cancellationToken);
+
+        var acknowledge = Assert.Single(observations);
+        Assert.Equal("scaleset.aws.listener.acknowledge", acknowledge.OperationName);
+        Assert.Equal("unknown", acknowledge.GetTagItem("outcome"));
+        Assert.DoesNotContain(acknowledge.TagObjects, tag => tag.Value?.ToString()?.Contains(GitHubWire.QueueToken, StringComparison.Ordinal) == true);
 
         Assert.Null(error.StatusCode);
         Assert.True(error.IsTransientTransportFailure);
@@ -250,6 +358,17 @@ public sealed class ListenerPumpContracts
     private static ConsumerDeliveryHandler UnexpectedDelivery() =>
         new(static (_, _) => throw new InvalidOperationException("The delivery was already processed."));
 
+    private sealed class QueueTimestampClock : TimeProvider
+    {
+        private long _timestamp;
+
+        public override long TimestampFrequency => TimeSpan.TicksPerSecond;
+
+        public override long GetTimestamp() => _timestamp;
+
+        internal void Advance(TimeSpan duration) => _timestamp += duration.Ticks;
+    }
+
     private sealed class QueueSession : IMessageSessionClient
     {
         public RunnerScaleSetSession Session { get; init; } = new() { SessionId = Key.SessionId };
@@ -257,6 +376,7 @@ public sealed class ListenerPumpContracts
         internal List<(long Cursor, int Capacity)> Polls { get; } = [];
         internal List<long> Deletes { get; } = [];
         internal Func<CancellationToken, Task<RunnerScaleSetMessage?>>? Poll { get; init; }
+        internal Action? Delete { get; init; }
 
         public Task<RunnerScaleSetMessage?> GetMessageAsync(long lastMessageId, int maxCapacity, CancellationToken cancellationToken)
         {
@@ -268,6 +388,7 @@ public sealed class ListenerPumpContracts
         {
             cancellationToken.ThrowIfCancellationRequested();
             Deletes.Add(messageId);
+            Delete?.Invoke();
             return Task.CompletedTask;
         }
 

@@ -114,26 +114,34 @@ public sealed partial class DynamoDbLifecycleStore
             throw new ArgumentException("Only an unfinished operation may have a due time.", nameof(write));
         }
 
+        string operation = write.State switch
+        {
+            EffectState.Planned => "effect-plan",
+            EffectState.Executing => "effect-begin",
+            EffectState.Uncertain => "effect-uncertain",
+            _ => "effect-settle",
+        };
+        using var telemetry = DynamoDbDiagnostics.Start(operation, cancellationToken);
         var head = await ReadEffectIndexAsync(profile, cancellationToken).ConfigureAwait(false);
         if (head is not { State: EffectIndexState.Ready } || !MatchesLease(head, lease))
         {
-            return LifecycleWriteOutcome.RebuildRequired;
+            return telemetry.Complete(LifecycleWriteOutcome.RebuildRequired);
         }
 
         var operationKey = LifecycleKey.Operation(profile, write.IntentId);
         var existing = await ReadEffectAsync(profile, write.IntentId, cancellationToken).ConfigureAwait(false);
         if (existing?.Revision != write.ExpectedRevision)
         {
-            return LifecycleWriteOutcome.Conflict;
+            return telemetry.Complete(LifecycleWriteOutcome.Conflict);
         }
         if (guard is not null && (head != guard.Index || existing?.State != (exactPrevious?.Entry.State ?? EffectState.Planned)))
         {
-            return LifecycleWriteOutcome.Conflict;
+            return telemetry.Complete(LifecycleWriteOutcome.Conflict);
         }
         if (leaseAccess == LeaseAccess.Recovery &&
             (write.State != EffectState.Settled || existing?.State is not (EffectState.Executing or EffectState.Uncertain)))
         {
-            return LifecycleWriteOutcome.Conflict;
+            return telemetry.Complete(LifecycleWriteOutcome.Conflict);
         }
 
         bool wasUnfinished = existing?.IsUnfinished == true;
@@ -143,7 +151,7 @@ public sealed partial class DynamoDbLifecycleStore
         {
             if (await ReadEffectIndexAsync(profile, cancellationToken).ConfigureAwait(false) != head)
             {
-                return LifecycleWriteOutcome.Conflict;
+                return telemetry.Complete(LifecycleWriteOutcome.Conflict);
             }
             throw InvalidRecord();
         }
@@ -151,17 +159,17 @@ public sealed partial class DynamoDbLifecycleStore
         int delta = Convert.ToInt32(isUnfinished) - Convert.ToInt32(wasUnfinished);
         long newCount = checked(count + delta);
         var nextIndex = head with { Revision = NextRevision(head.Revision), UnfinishedCount = newCount };
-        var operation = Record(operationKey, profile.Deployment, NextRevision(write.ExpectedRevision), transitionId);
-        operation.Add("effectState", StringValue(EffectStateValue(write.State)));
-        operation.Add("payload", StringValue(write.Payload));
+        var operationItem = Record(operationKey, profile.Deployment, NextRevision(write.ExpectedRevision), transitionId);
+        operationItem.Add("effectState", StringValue(EffectStateValue(write.State)));
+        operationItem.Add("payload", StringValue(write.Payload));
         if (write.DueAt is { } due)
         {
-            operation.Add("dueShard", StringValue(ShardKey(profile.Deployment, Shard(operationKey))));
-            operation.Add("dueAtMillis", NumberValue(due.ToUnixTimeMilliseconds()));
+            operationItem.Add("dueShard", StringValue(ShardKey(profile.Deployment, Shard(operationKey))));
+            operationItem.Add("dueAtMillis", NumberValue(due.ToUnixTimeMilliseconds()));
         }
 
         var leaseCondition = LeaseCondition(lease, leaseAccess, leaseValidThrough);
-        var writeOperation = CompareAndPut(operationKey, operation, write.ExpectedRevision, profile.Deployment);
+        var writeOperation = CompareAndPut(operationKey, operationItem, write.ExpectedRevision, profile.Deployment);
         if (exactPrevious is not null)
         {
             var put = writeOperation.Write.Put;
@@ -217,7 +225,8 @@ public sealed partial class DynamoDbLifecycleStore
             actions.Add(DeleteMarker(profile, head.Generation, write.IntentId));
         }
         // Reusing a durable transition can require a fresh transaction bound to the current index revision.
-        return await WriteAsync(actions, requestToken ?? (exactPrevious is null ? transitionId : Guid.NewGuid()), cancellationToken).ConfigureAwait(false);
+        return telemetry.Complete(await WriteAsync(actions, requestToken ?? (exactPrevious is null ? transitionId : Guid.NewGuid()), cancellationToken)
+            .ConfigureAwait(false));
     }
 
     public async Task<ActiveEffectPage?> ReadActiveOperationsAsync(

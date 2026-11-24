@@ -55,6 +55,16 @@ public sealed class GitHubListenerDeliveryHandler : IScaleSetListenerDeliveryHan
         ScaleSetListenerDelivery delivery, CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(delivery);
+        using var telemetry = GitHubListenerDiagnostics.Start("delivery", _timeProvider, cancellationToken);
+        var disposition = await HandleCoreAsync(delivery, cancellationToken).ConfigureAwait(false);
+        telemetry.Complete(disposition == ScaleSetListenerDeliveryDisposition.Completed ? "completed" : "deferred",
+            delivery.IsReplay ? "replay" : null);
+        return disposition;
+    }
+
+    private async Task<ScaleSetListenerDeliveryDisposition> HandleCoreAsync(
+        ScaleSetListenerDelivery delivery, CancellationToken cancellationToken)
+    {
         RequireOwnedSession(delivery.SessionKey);
         if (delivery.Kind == ScaleSetListenerDeliveryKind.EmptyPoll)
         {
@@ -132,6 +142,12 @@ public sealed class GitHubListenerDeliveryHandler : IScaleSetListenerDeliveryHan
             ? (int)Math.Max(0L, (long)basis.Capacity.Maximum - basis.Capacity.OutsideAssigned - basis.Demand!.Value.TotalAssignedJobs) : 0;
         var attempt = await _ledger.ReserveAsync(receipt, messageId, offeredIds, allowance, basis.Guards, cancellationToken)
             .ConfigureAwait(false);
+        GitHubListenerDiagnostics.Count("admission-reserve", attempt switch
+        {
+            null => "deferred",
+            { Request.RequestIds.IsEmpty: true } => "no_capacity",
+            _ => "reserved",
+        });
         if (attempt?.Request.RequestIds.IsEmpty != false)
         {
             return Disposition(attempt is not null);
@@ -146,23 +162,33 @@ public sealed class GitHubListenerDeliveryHandler : IScaleSetListenerDeliveryHan
         cancellationToken.ThrowIfCancellationRequested();
         var accepted = NoAcceptedRequests;
         GitHubOperationException? cooldown = null;
-        try
+        using (var telemetry = GitHubListenerDiagnostics.Start("acquire", _timeProvider, CancellationToken.None))
         {
-            using var retry = ScaleSetRequestRetry.Configure(static options => options with { MaxRetries = 0 });
-            var response = await _session.AcquireJobsAsync(attempt.Request.RequestIds, cancellationToken).ConfigureAwait(false);
-            accepted = AcceptedSubset(response, attempt.Request.RequestIds);
-        }
-        catch (Exception issue) when (issue is ScaleSetApiException or HttpRequestException or IOException or JsonException or
-                                      TimeoutException or OperationCanceledException && !cancellationToken.IsCancellationRequested)
-        {
-            if (issue is ScaleSetRateLimitException or ScaleSetApiException { StatusCode: 401 })
+            try
             {
-                cooldown = GitHubOperationException.From(issue);
+                using var retry = ScaleSetRequestRetry.Configure(static options => options with { MaxRetries = 0 });
+                var response = await _session.AcquireJobsAsync(attempt.Request.RequestIds, cancellationToken).ConfigureAwait(false);
+                telemetry.Complete("returned");
+                accepted = AcceptedSubset(response, attempt.Request.RequestIds);
+            }
+            catch (Exception issue) when (issue is ScaleSetApiException or HttpRequestException or IOException or JsonException or
+                                          TimeoutException or OperationCanceledException && !cancellationToken.IsCancellationRequested)
+            {
+                if (issue is ScaleSetRateLimitException or ScaleSetApiException { StatusCode: 401 })
+                {
+                    cooldown = GitHubOperationException.From(issue);
+                    telemetry.Complete("unknown", issue is ScaleSetRateLimitException ? "rate_limit" : "unauthorized");
+                }
+                else if (GitHubListenerDiagnostics.IsDeadline(issue, cancellationToken))
+                {
+                    telemetry.Complete("unknown", "timeout");
+                }
             }
         }
 
         receipt = await RequireReceiptAsync(messageId, receipt.Value.Digest, cancellationToken).ConfigureAwait(false);
         var settled = await _ledger.SettleAttemptAsync(receipt, messageId, accepted, cancellationToken).ConfigureAwait(false);
+        GitHubListenerDiagnostics.Count("admission-settle", GitHubListenerDiagnostics.WriteOutcome(settled));
         if (cooldown is not null)
         {
             throw cooldown;

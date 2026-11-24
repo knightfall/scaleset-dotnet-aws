@@ -24,13 +24,15 @@ public sealed class GitHubListenerCheckpointStore : IScaleSetListenerCheckpointS
     private readonly DynamoDbLifecycleStore _store;
     private readonly OwnedSessionFence _fence;
     private readonly LifecycleKey _key;
+    private readonly TimeProvider _clock;
 
-    public GitHubListenerCheckpointStore(DynamoDbLifecycleStore store, OwnedSessionFence fence)
+    public GitHubListenerCheckpointStore(DynamoDbLifecycleStore store, OwnedSessionFence fence, TimeProvider? clock = null)
     {
         ArgumentNullException.ThrowIfNull(store);
         ArgumentNullException.ThrowIfNull(fence);
         _store = store;
         _fence = fence;
+        _clock = clock ?? TimeProvider.System;
         _key = LifecycleKey.Checkpoint(fence.Identity.Profile, fence.Identity.SessionId);
         SessionKey = new ScaleSetListenerSessionKey(fence.Identity.ScopeIdentity, fence.Identity.ScaleSetId,
             fence.Identity.SessionId);
@@ -42,9 +44,11 @@ public sealed class GitHubListenerCheckpointStore : IScaleSetListenerCheckpointS
         ScaleSetListenerSessionKey key, CancellationToken cancellationToken)
     {
         RequireSession(key);
+        using var telemetry = GitHubListenerDiagnostics.Start("checkpoint-read", _clock, cancellationToken);
         var record = await _store.ReadRecordAsync(_key, cancellationToken).ConfigureAwait(false);
         if (record is null)
         {
+            telemetry.Complete("empty");
             return null;
         }
         if (record.Payload is not { } payload)
@@ -73,6 +77,7 @@ public sealed class GitHubListenerCheckpointStore : IScaleSetListenerCheckpointS
         {
             throw InvalidCheckpoint();
         }
+        telemetry.Complete("read");
         return checkpoint;
     }
 
@@ -91,8 +96,17 @@ public sealed class GitHubListenerCheckpointStore : IScaleSetListenerCheckpointS
         // Preserve the exact SDK snapshot used when the pump compares an uncertain transition with readback.
         string payload = JsonSerializer.Serialize(new StoredCheckpoint(checkpoint, AcknowledgmentSha256(checkpoint)));
         RequireBounded(payload);
+        string operation = checkpoint.Pending?.Phase switch
+        {
+            ScaleSetListenerPendingPhase.Received => "checkpoint-received",
+            ScaleSetListenerPendingPhase.Processed => "checkpoint-processed",
+            ScaleSetListenerPendingPhase.Acknowledging => "checkpoint-acknowledging",
+            _ => checkpoint.LastAcknowledgedMessageId is null ? "checkpoint-initialized" : "checkpoint-settled",
+        };
+        using var telemetry = GitHubListenerDiagnostics.Start(operation, _clock, cancellationToken);
         var outcome = await _store.WriteSessionRecordsAsync(_fence, checkpoint.TransitionId,
             [new LifecycleRecordWrite(_key, expectedRevision, payload)], cancellationToken).ConfigureAwait(false);
+        telemetry.Complete(GitHubListenerDiagnostics.WriteOutcome(outcome));
         return outcome switch
         {
             LifecycleWriteOutcome.Committed => ScaleSetListenerCheckpointWriteResult.Committed,

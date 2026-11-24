@@ -1,4 +1,5 @@
 using Knightfall.ScaleSet.Aws.Core.Lifecycle;
+using Knightfall.ScaleSet.Aws.Core.Telemetry;
 using Knightfall.ScaleSet.Aws.DynamoDb;
 using ScaleSet.Client;
 
@@ -11,6 +12,7 @@ public sealed partial class GitHubListenerLane
     {
         ArgumentNullException.ThrowIfNull(retirement);
         await _serial.WaitAsync(cancellationToken).ConfigureAwait(false);
+        using var profileTelemetry = TelemetryProfileScope.Enter(_telemetryProfile);
         try
         {
             using var administration = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _definition.OwnershipLost);

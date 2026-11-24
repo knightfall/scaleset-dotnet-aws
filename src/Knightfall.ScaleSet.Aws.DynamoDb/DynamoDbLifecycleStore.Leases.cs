@@ -55,6 +55,7 @@ public sealed partial class DynamoDbLifecycleStore
             throw new ArgumentException("An exact ECS task ARN is required.", nameof(ownerTaskArn));
         }
 
+        using var telemetry = DynamoDbDiagnostics.StartLease("lease-acquire", cancellationToken);
         var existing = await ReadLeaseAsync(deployment, cancellationToken).ConfigureAwait(false);
         var now = _timeProvider.GetUtcNow();
         // Never use a time bound more permissive than the store's local observation.
@@ -68,7 +69,7 @@ public sealed partial class DynamoDbLifecycleStore
             (existing.OwnerId == ownerId ||
              (existing.Mode != ControllerLeaseMode.Released && existing.ValidUntil > expiredBy)))
         {
-            return new ControllerLeaseChange(LifecycleWriteOutcome.LeaseRejected, existing);
+            return telemetry.Complete(new ControllerLeaseChange(LifecycleWriteOutcome.LeaseRejected, existing));
         }
 
         ControllerLeasePredecessor? previous = null;
@@ -88,8 +89,8 @@ public sealed partial class DynamoDbLifecycleStore
         var acquired = new ControllerLease(deployment, ownerId, ownerTaskArn, NextRevision(existing?.Epoch),
             writerProtocol, deadline, NextRevision(existing?.Revision), Guid.NewGuid(),
             ControllerLeaseMode.RecoveryOnly, previous, requiredTask);
-        return await WriteLeaseChangeAsync(acquired, existing, null,
-            existing?.Mode == ControllerLeaseMode.Released ? null : expiredBy, cancellationToken).ConfigureAwait(false);
+        return telemetry.Complete(await WriteLeaseChangeAsync(acquired, existing, null,
+            existing?.Mode == ControllerLeaseMode.Released ? null : expiredBy, cancellationToken).ConfigureAwait(false));
     }
 
     public async Task<ControllerLeaseChange> RenewLeaseAsync(
@@ -99,18 +100,20 @@ public sealed partial class DynamoDbLifecycleStore
         CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(expected);
+        using var telemetry = DynamoDbDiagnostics.StartLease("lease-renew", cancellationToken);
         var deadline = AtMillisecond(validUntil);
         if (expected.Mode == ControllerLeaseMode.Released || deadline <= expected.ValidUntil || deadline <= latestNow)
         {
-            return new ControllerLeaseChange(LifecycleWriteOutcome.LeaseRejected, null);
+            return telemetry.Complete(new ControllerLeaseChange(LifecycleWriteOutcome.LeaseRejected, null));
         }
 
         if (await ReadLeaseAsync(expected.Deployment, cancellationToken).ConfigureAwait(false) != expected)
         {
-            return new ControllerLeaseChange(LifecycleWriteOutcome.Conflict, null);
+            return telemetry.Complete(new ControllerLeaseChange(LifecycleWriteOutcome.Conflict, null));
         }
         var renewed = expected with { ValidUntil = deadline, Revision = NextRevision(expected.Revision), TransitionId = Guid.NewGuid() };
-        return await WriteLeaseChangeAsync(renewed, expected, ConservativeLatest(latestNow), null, cancellationToken).ConfigureAwait(false);
+        return telemetry.Complete(await WriteLeaseChangeAsync(renewed, expected, ConservativeLatest(latestNow), null, cancellationToken)
+            .ConfigureAwait(false));
     }
 
     /// <summary>Releases an active lease after the owner has quiesced all external sends.</summary>

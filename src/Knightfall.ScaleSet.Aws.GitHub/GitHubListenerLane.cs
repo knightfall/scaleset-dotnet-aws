@@ -1,5 +1,6 @@
 using Knightfall.ScaleSet.Aws.Core.Configuration;
 using Knightfall.ScaleSet.Aws.Core.Lifecycle;
+using Knightfall.ScaleSet.Aws.Core.Telemetry;
 using Knightfall.ScaleSet.Aws.DynamoDb;
 using ScaleSet.Client;
 using ScaleSet.Listener;
@@ -11,6 +12,7 @@ public sealed partial class GitHubListenerLane : IDisposable
     private readonly DynamoDbLifecycleStore _store;
     private readonly GitHubListenerProfile _definition;
     private readonly RunnerProfile _profile;
+    private readonly TelemetryProfile? _telemetryProfile;
     private readonly SessionBinding _binding;
     private readonly TimeProvider _clock;
     private readonly GitHubListenerTiming _timing;
@@ -40,6 +42,7 @@ public sealed partial class GitHubListenerLane : IDisposable
         _store = store;
         _definition = definition;
         _profile = profile;
+        _telemetryProfile = TelemetryProfile.From(profile);
         _binding = binding;
         _clock = clock;
         _timing = timing;
@@ -50,9 +53,14 @@ public sealed partial class GitHubListenerLane : IDisposable
 
     public GitHubListenerLaneResult? LastResult { get; private set; }
 
+    public DateTimeOffset? ReadCredentialCooldown() =>
+        Volatile.Read(ref _stopping) == 0 && !_definition.OwnershipLost.IsCancellationRequested
+            ? _cooldown.Read(_connection.SecretArn) : null;
+
     public async Task<GitHubListenerLaneResult> StepAsync(CancellationToken stoppingToken)
     {
         await _serial.WaitAsync(stoppingToken).ConfigureAwait(false);
+        using var profileTelemetry = TelemetryProfileScope.Enter(_telemetryProfile);
         try
         {
             if (Volatile.Read(ref _stopping) != 0)
@@ -68,7 +76,17 @@ public sealed partial class GitHubListenerLane : IDisposable
 
             // The shared supervisor owns backoff across profile lanes with the same credential.
             using var retry = ScaleSetRequestRetry.Configure(static options => options with { MaxRetries = 0 });
+            using var telemetry = GitHubListenerDiagnostics.Start("step", _clock, stoppingToken);
             var result = await _pump!.StepAsync(stoppingToken).ConfigureAwait(false);
+            telemetry.Complete(result.Status switch
+            {
+                ScaleSetListenerStepStatus.Initialized => "initialized",
+                ScaleSetListenerStepStatus.EmptyPoll => "empty",
+                ScaleSetListenerStepStatus.MessageAcknowledged => "acknowledged",
+                ScaleSetListenerStepStatus.Deferred => "deferred",
+                ScaleSetListenerStepStatus.CheckpointConflict => "conflict",
+                _ => "unknown",
+            });
             _recoveryRequired = result.Status is ScaleSetListenerStepStatus.RecoveryRequired or ScaleSetListenerStepStatus.CheckpointConflict;
             return Report(new GitHubListenerLaneResult(_recoveryRequired ? GitHubListenerLaneStatus.RecoveryRequired : GitHubListenerLaneStatus.Stepped,
                 result, result.RetryAt));
@@ -90,6 +108,7 @@ public sealed partial class GitHubListenerLane : IDisposable
     public async Task<GitHubListenerLaneResult> RotateAsync(CancellationToken cancellationToken)
     {
         await _serial.WaitAsync(cancellationToken).ConfigureAwait(false);
+        using var profileTelemetry = TelemetryProfileScope.Enter(_telemetryProfile);
         try
         {
             if (_rotation is null || Volatile.Read(ref _stopping) != 0 || _recoveryRequired || _known is not null)
@@ -167,6 +186,7 @@ public sealed partial class GitHubListenerLane : IDisposable
     {
         Interlocked.Exchange(ref _stopping, 1);
         await _serial.WaitAsync(cleanupToken).ConfigureAwait(false);
+        using var profileTelemetry = TelemetryProfileScope.Enter(_telemetryProfile);
         try
         {
             if (_definition.OwnershipLost.IsCancellationRequested)
@@ -264,6 +284,7 @@ public sealed partial class GitHubListenerLane : IDisposable
         }
         if (_cooldown.Read(_connection.SecretArn) is { } retryAt)
         {
+            GitHubListenerDiagnostics.Count("session-open", "deferred", "cooldown");
             return new GitHubListenerLaneResult(GitHubListenerLaneStatus.Waiting, RetryAt: retryAt);
         }
         if (await ReadOwnershipAsync(cancellationToken).ConfigureAwait(false) is not { } ownership)
@@ -278,11 +299,14 @@ public sealed partial class GitHubListenerLane : IDisposable
         }
         if (durable is { Phase: SessionPhase.OpenIntent or SessionPhase.Closing })
         {
-            _ = await _store.QuarantineSessionAsync(durable, ownership.Lease.Fence, cancellationToken).ConfigureAwait(false);
+            using var telemetry = GitHubListenerDiagnostics.Start("session-quarantine", _clock, cancellationToken);
+            var change = await _store.QuarantineSessionAsync(durable, ownership.Lease.Fence, cancellationToken).ConfigureAwait(false);
+            telemetry.Complete(GitHubListenerDiagnostics.WriteOutcome(change.Outcome));
             return new GitHubListenerLaneResult(GitHubListenerLaneStatus.RecoveryRequired);
         }
         if (durable is { Phase: SessionPhase.Quarantined })
         {
+            GitHubListenerDiagnostics.Count("session-quarantine", "deferred", "held");
             return new GitHubListenerLaneResult(GitHubListenerLaneStatus.RecoveryRequired);
         }
         if (durable is { Phase: SessionPhase.Active })
@@ -392,12 +416,12 @@ public sealed partial class GitHubListenerLane : IDisposable
             _recoveryRequired = true;
             return;
         }
-        _checkpoint = new GitHubListenerCheckpointStore(_store, fence);
+        _checkpoint = new GitHubListenerCheckpointStore(_store, fence, _clock);
         var handler = new GitHubListenerDeliveryHandler(_store, fence, session, ReadCapacityAsync, _clock);
         var execution = new GitHubListenerExecutionPolicy(_store, fence, _checkpoint.SessionKey, _cooldown, _connection.SecretArn,
             ReadOwnershipAsync, handler.ReadPollCapacityAsync, _clock, _timing.WriteReserve, _definition.OwnershipLost);
         var options = new ScaleSetListenerPumpOptions(_checkpoint.SessionKey, _definition.OwnershipLost);
-        _pump = new ScaleSetListenerPump(session, options, _checkpoint, handler, execution, _clock);
+        _pump = new ScaleSetListenerPump(new ObservedMessageSession(session, _clock), options, _checkpoint, handler, execution, _clock);
     }
 
     private void ClearPump()
@@ -452,6 +476,10 @@ public sealed partial class GitHubListenerLane : IDisposable
     private GitHubListenerLaneResult Report(GitHubListenerLaneResult result)
     {
         LastResult = result;
+        if (result.Status == GitHubListenerLaneStatus.RecoveryRequired)
+        {
+            GitHubListenerDiagnostics.Count("supervise", "unknown", "recovery_required");
+        }
         return result;
     }
 
