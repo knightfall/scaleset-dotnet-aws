@@ -99,7 +99,7 @@ internal static class ActiveControllerRuntime
         {
             var key = new LifecycleProfile(deployment, profile.Id);
             var session = new ControllerProfileSession(configuration, profile, context.Generation, owner, store,
-                secrets, gitHub, registration, supervisor, rotation, cooldown, clock);
+                secrets, gitHub, registration, supervisor, rotation, cooldown, clock, context.Stopping);
             return new ControllerProfileReconciler(configuration, profile, key, context.Generation, backends[key], session,
                 owner, store, dispatcher, jit, handoff, retirement, metrics, clock, EffectTiming);
         }).ToArray();

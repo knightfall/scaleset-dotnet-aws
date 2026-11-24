@@ -38,7 +38,8 @@ internal sealed class ControllerProfileSession : IDisposable
     private readonly string[] _labels;
     private readonly SemaphoreSlim _serial = new(1);
     private readonly CancellationTokenSource _admissions = new();
-    private readonly CancellationTokenSource _polls = new();
+    private readonly CancellationTokenSource _polls;
+    private readonly CancellationToken _processStopping;
     private GitHubScaleSetBinding? _binding;
     private GitHubScaleSetConnection? _connection;
     private GitHubListenerLane? _lane;
@@ -50,7 +51,7 @@ internal sealed class ControllerProfileSession : IDisposable
     internal ControllerProfileSession(RuntimeConfiguration configuration, RunnerProfile profile, long generation,
         ControllerLeaseOwnership ownership, DynamoDbLifecycleStore store, GitHubSecretLoader secrets, GitHubScaleSetClientFactory clients,
         GitHubScaleSetRegistration registration, GitHubListenerSupervisor supervisor, GitHubCredentialRotator rotation,
-        GitHubCredentialCooldown cooldown, TimeProvider clock)
+        GitHubCredentialCooldown cooldown, TimeProvider clock, CancellationToken processStopping = default)
     {
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(generation);
         if (configuration.Mode != ControllerMode.Active || profile.State == RunnerProfileState.Disabled ||
@@ -71,6 +72,8 @@ internal sealed class ControllerProfileSession : IDisposable
         _rotation = rotation;
         _cooldown = cooldown;
         _clock = clock;
+        _processStopping = processStopping;
+        _polls = CancellationTokenSource.CreateLinkedTokenSource(processStopping);
         _telemetry = TelemetryProfile.From(profile);
         _key = new LifecycleProfile(ControllerLeaseRecoveryCoordinator.DeploymentKey(configuration), profile.Id);
         _github = configuration.GitHub[profile.GitHub.Connection];
@@ -234,7 +237,8 @@ internal sealed class ControllerProfileSession : IDisposable
         return result;
     }
 
-    private bool AdmissionsStopped => Volatile.Read(ref _disposed) != 0 || _admissions.IsCancellationRequested || _ownership.OwnershipLost.IsCancellationRequested;
+    private bool AdmissionsStopped => Volatile.Read(ref _disposed) != 0 || _admissions.IsCancellationRequested ||
+        _processStopping.IsCancellationRequested || _ownership.OwnershipLost.IsCancellationRequested;
 
     private async Task<GitHubScaleSetBinding?> RegisterAsync(CatalogProfile catalog, CancellationToken cancellationToken)
     {

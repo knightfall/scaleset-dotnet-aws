@@ -29,7 +29,7 @@ internal sealed class ControllerProfileReconciler(
     {
         using var scope = TelemetryProfileScope.Enter(TelemetryProfile.From(profile));
         using var diagnostics = ReconciliationDiagnostics.Start(TelemetryProfile.From(profile), dryRun: false);
-        if (ownership.ReadAuthority() is not { } authority || await store.ReadCatalogProfileAsync(key, cancellationToken).ConfigureAwait(false) is not
+        if (ownership.ReadAuthority() is not { } authority || await store.ReadCatalogProfileAsync(Key, cancellationToken).ConfigureAwait(false) is not
                 { } catalog || catalog.AppliedGeneration != generation)
         {
             diagnostics?.Complete("deferred", "ownership_unavailable");
@@ -37,12 +37,12 @@ internal sealed class ControllerProfileReconciler(
         }
         if (catalog.State == CatalogProfileState.Tombstoned)
         {
-            telemetry.Retire(authority.Lease.Fence, key.ProfileId);
+            telemetry.Retire(authority.Lease.Fence, Key.ProfileId);
             diagnostics?.Complete("success", "profile_retired");
             return true;
         }
 
-        var progress = await effects.ReconcilePassAsync(authority.Lease, authority.Clock, key, _effectsCursor,
+        var progress = await effects.ReconcilePassAsync(authority.Lease, authority.Clock, Key, _effectsCursor,
             backend.ObservationEffects, recovery: null, cancellationToken).ConfigureAwait(false);
         _effectsCursor = progress.Continuation;
         if (progress.Outcome is LifecycleWriteOutcome.LeaseRejected or LifecycleWriteOutcome.RebuildRequired or LifecycleWriteOutcome.Indeterminate)
@@ -58,13 +58,13 @@ internal sealed class ControllerProfileReconciler(
             diagnostics?.Complete("deferred", "ownership_unavailable");
             return false;
         }
-        var snapshot = await store.ReadExecutorInventoryAsync(key, cancellationToken).ConfigureAwait(false);
+        var snapshot = await store.ReadExecutorInventoryAsync(Key, cancellationToken).ConfigureAwait(false);
         bool complete = cloud.IsComplete && observed.Complete && (snapshot.IsConsistent || snapshot.Revision is null) &&
             snapshot.Executors.All(executor => observed.Exact.ContainsKey(executor.Binding.AllocationId));
         var sample = ProjectInventory(snapshot, cloud, observed.Unowned, complete);
         var coverage = new ExecutorInventoryObservation(sample.ObservedAt, complete, observed.Unowned,
             sample.BackendCapacityCeiling, sample.BackendLaunchHeadroom);
-        var published = await store.PublishExecutorInventoryAsync(key, current.Lease.Fence, snapshot.Revision, coverage, cancellationToken)
+        var published = await store.PublishExecutorInventoryAsync(Key, current.Lease.Fence, snapshot.Revision, coverage, cancellationToken)
             .ConfigureAwait(false);
         if (published != LifecycleWriteOutcome.Committed)
         {
@@ -75,21 +75,21 @@ internal sealed class ControllerProfileReconciler(
         GitHubScaleSetBinding? binding = null;
         if (catalog.State is CatalogProfileState.Active or CatalogProfileState.Draining)
         {
-            binding = await session.EnsureRegisteredAsync(cancellationToken).ConfigureAwait(false);
+            binding = await Session.EnsureRegisteredAsync(cancellationToken).ConfigureAwait(false);
         }
-        var demand = await store.ReadCurrentSessionDemandAsync(key, cancellationToken).ConfigureAwait(false);
+        var demand = await store.ReadCurrentSessionDemandAsync(Key, cancellationToken).ConfigureAwait(false);
         var plan = CapacityPlanner.Plan(profile, demand is null ? null : new DemandSample(demand.ObservedAt, demand.TotalAssignedJobs), sample, clock);
-        var effectIndex = await store.ReadEffectIndexAsync(key, cancellationToken).ConfigureAwait(false);
+        var effectIndex = await store.ReadEffectIndexAsync(Key, cancellationToken).ConfigureAwait(false);
         bool exactIndex = effectIndex is { State: EffectIndexState.Ready } && effectIndex.OwnerEpoch == current.Lease.Epoch;
         bool ready = IsReady(catalog.State, binding, plan, exactIndex, complete);
         var now = clock.GetUtcNow();
         telemetry.SetOwnership(current.Lease, current.Clock, timing.WriteReserve);
-        telemetry.SetListenerCooldown(current.Lease.Fence, key.ProfileId, session.ReadCredentialCooldown());
-        telemetry.Observe(current.Lease.Fence, key.ProfileId, new ProfileTelemetryObservation(plan, now,
+        telemetry.SetListenerCooldown(current.Lease.Fence, Key.ProfileId, Session.ReadCredentialCooldown());
+        telemetry.Observe(current.Lease.Fence, Key.ProfileId, new ProfileTelemetryObservation(plan, now,
             now + timing.ObservationFreshness, demand?.ObservedAt, sample.ObservedAt, cloud.DriftCount,
             exactIndex ? effectIndex!.UnfinishedCount : null, null, ready));
 
-        if (binding is not null && await session.GetConnectionAsync(cancellationToken).ConfigureAwait(false) is { } connection)
+        if (binding is not null && await Session.GetConnectionAsync(cancellationToken).ConfigureAwait(false) is { } connection)
         {
             await AdvanceExecutorsAsync(catalog, current, observed.Exact, connection, cancellationToken).ConfigureAwait(false);
         }
@@ -104,14 +104,14 @@ internal sealed class ControllerProfileReconciler(
 
         if (catalog.State is CatalogProfileState.Draining or CatalogProfileState.ClosureHeld && ownership.ReadAuthority() is { } retiring)
         {
-            var result = await retirement.AdvanceAsync(key, retiring, cancellationToken).ConfigureAwait(false);
+            var result = await retirement.AdvanceAsync(Key, retiring, cancellationToken).ConfigureAwait(false);
             if (result.Status is ProfileRetirementStatus.ClosureHeld or ProfileRetirementStatus.SessionRetirementRequired)
             {
-                _ = await session.RetireDrainingSessionAsync(retirement, cancellationToken).ConfigureAwait(false);
+                _ = await Session.RetireDrainingSessionAsync(retirement, cancellationToken).ConfigureAwait(false);
             }
             if (result.Status == ProfileRetirementStatus.Retired)
             {
-                telemetry.Retire(retiring.Lease.Fence, key.ProfileId);
+                telemetry.Retire(retiring.Lease.Fence, Key.ProfileId);
                 ready = true;
             }
         }
@@ -151,7 +151,7 @@ internal sealed class ControllerProfileReconciler(
         foreach (var resource in cloud.Resources.DistinctBy(resource => resource.ResourceArn))
         {
             if (resource.Binding is not { } expected || resource.Observation is not { } observation ||
-                await store.ReadExecutorAsync(key, expected.AllocationId, cancellationToken).ConfigureAwait(false) is not { } existing ||
+                await store.ReadExecutorAsync(Key, expected.AllocationId, cancellationToken).ConfigureAwait(false) is not { } existing ||
                 existing.Binding != expected)
             {
                 if (resource.Observation?.State != ExecutorResourceState.IrreversiblyTerminated)
@@ -177,7 +177,7 @@ internal sealed class ControllerProfileReconciler(
 
     private async Task ObserveEc2ProcessAsync(DeploymentLeaseFence fence, ExecutorBinding binding, long runnerId, CancellationToken cancellationToken)
     {
-        var current = await store.ReadJitHandoffAsync(key, Guid.ParseExact(binding.AllocationId, "D"), cancellationToken).ConfigureAwait(false);
+        var current = await store.ReadJitHandoffAsync(Key, Guid.ParseExact(binding.AllocationId, "D"), cancellationToken).ConfigureAwait(false);
         if (current is { RunnerId: { } expected } && expected == runnerId && current.Identity.ResourceArn == binding.ResourceArn &&
             current.Identity.Incarnation == binding.Incarnation &&
             await store.ReadEc2BootstrapStatusAsync(current, cancellationToken).ConfigureAwait(false) is { } status)
@@ -194,7 +194,7 @@ internal sealed class ControllerProfileReconciler(
         foreach (var (allocation, resource) in exact)
         {
             if (ownership.ReadAuthority() is not { } current ||
-                await store.ReadExecutorAsync(key, allocation, cancellationToken).ConfigureAwait(false) is not { } executor ||
+                await store.ReadExecutorAsync(Key, allocation, cancellationToken).ConfigureAwait(false) is not { } executor ||
                 executor.Binding != resource.Binding || executor.State.HasConflict)
             {
                 continue;
@@ -207,14 +207,14 @@ internal sealed class ControllerProfileReconciler(
                     principal, observed.ObservedAt), connection, cancellationToken).ConfigureAwait(false);
                 if (result.Failure is { } failure)
                 {
-                    session.RecordCredentialFailure(failure);
+                    Session.RecordCredentialFailure(failure);
                     return;
                 }
             }
         }
 
         // Terminal executors leave the active index. Retained handoff rows can still require an exact GitHub removal after restart.
-        var pending = await store.ReadOutstandingJitHandoffPageAsync(key, _handoffCursor, cancellationToken).ConfigureAwait(false);
+        var pending = await store.ReadOutstandingJitHandoffPageAsync(Key, _handoffCursor, cancellationToken).ConfigureAwait(false);
         foreach (var remaining in pending.Handoffs)
         {
             if (ownership.ReadAuthority() is not { } current || current.Lease.Fence != authority.Lease.Fence)
@@ -222,10 +222,10 @@ internal sealed class ControllerProfileReconciler(
                 return;
             }
             var allocation = remaining.Identity.AllocationId;
-            if (await store.ReadExecutorAsync(key, allocation.ToString("D"), cancellationToken).ConfigureAwait(false) is
+            if (await store.ReadExecutorAsync(Key, allocation.ToString("D"), cancellationToken).ConfigureAwait(false) is
                 { State: { HasConflict: false, Resource.State: ExecutorResourceState.IrreversiblyTerminated } })
             {
-                _ = await handoff.RemoveTerminatedRunnerAsync(current, key, allocation, connection, ownership.OwnershipLost,
+                _ = await handoff.RemoveTerminatedRunnerAsync(current, Key, allocation, connection, ownership.OwnershipLost,
                     cancellationToken).ConfigureAwait(false);
             }
         }
