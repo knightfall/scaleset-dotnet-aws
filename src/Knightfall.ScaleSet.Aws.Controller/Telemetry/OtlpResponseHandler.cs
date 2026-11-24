@@ -93,7 +93,7 @@ internal sealed class OtlpResponseHandler(
             }
             throw;
         }
-        catch (Exception error) when (error is HttpRequestException or IOException or FormatException)
+        catch (Exception error) when (error is HttpRequestException or IOException or FormatException or InvalidDataException)
         {
             response?.Dispose();
             report(endpoint.Signal, error is InvalidDataException ? ExportReceipt.InvalidResponse : ExportReceipt.Unavailable);

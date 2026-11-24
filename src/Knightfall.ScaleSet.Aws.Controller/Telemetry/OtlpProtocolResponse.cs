@@ -41,7 +41,8 @@ internal static class OtlpProtocolResponse
         {
             return ExportReceipt.Rejected;
         }
-        return GrpcPayload(body) is { } payload ? Parse(payload) : ExportReceipt.InvalidResponse;
+        return response.TrailingHeaders.Contains("grpc-status") && GrpcPayload(body) is { } payload
+            ? Parse(payload) : ExportReceipt.InvalidResponse;
     }
 
     internal static byte[]? GrpcPayload(byte[] body)
@@ -93,19 +94,21 @@ internal static class OtlpProtocolResponse
                 }
                 hasPartial = true;
                 using var partial = input.ReadBytes().CreateCodedInput();
-                long rejected = 0;
-                bool hasMessage = false;
+                long? rejected = null;
+                bool? hasMessage = null;
                 uint field;
                 while ((field = partial.ReadTag()) != 0)
                 {
                     switch (field)
                     {
-                        case 8:
+                        case 8 when rejected is null:
                             rejected = partial.ReadInt64();
                             break;
-                        case 18:
+                        case 18 when hasMessage is null:
                             hasMessage = !partial.ReadBytes().IsEmpty;
                             break;
+                        case 8 or 18:
+                            return ExportReceipt.InvalidResponse;
                         default:
                             partial.SkipLastField();
                             break;
@@ -115,7 +118,7 @@ internal static class OtlpProtocolResponse
                 {
                     < 0 => ExportReceipt.InvalidResponse,
                     > 0 => ExportReceipt.PartiallyRejected,
-                    _ when hasMessage => ExportReceipt.AcceptedWithWarning,
+                    _ when hasMessage is true => ExportReceipt.AcceptedWithWarning,
                     _ => ExportReceipt.Accepted,
                 };
             }

@@ -16,8 +16,7 @@ internal static class TelemetryViews
     private static readonly FrozenSet<string> OperationMetrics = new[]
     {
         "reconcile.duration", "listener.operation.duration", "provider.operation.duration", "handoff.duration",
-        "startup.duration", "handoff.operations", "listener.operations", "provider.operations", "lease.losses", "dynamodb.conflicts",
-        "effect.rebuild.pages", "ec2.az_failovers", "ec2.template_drifts", "event.age",
+        "startup.duration", "startup.observations", "handoff.operations", "listener.operations", "provider.operations",
     }.ToFrozenSet(StringComparer.Ordinal);
 
     private static readonly FrozenSet<string> RuntimeMetrics = new[]
@@ -63,8 +62,15 @@ internal static class TelemetryViews
         {
             return View("profile", "provider", "operation", "outcome", "reason");
         }
-        return instrument.Meter.Name == TelemetryNames.Controller && suffix == "telemetry.smoke"
-            ? View() : MetricStreamConfiguration.Drop;
+        return suffix switch
+        {
+            "ec2.az_failovers" or "event.age" => View("profile", "provider"),
+            "ec2.template_drifts" => View("profile", "provider", "reason"),
+            "dynamodb.conflicts" or "effect.rebuild.pages" => View("profile", "provider", "operation", "outcome"),
+            "lease.losses" => View(),
+            "telemetry.smoke" when instrument.Meter.Name == TelemetryNames.Controller => View(),
+            _ => MetricStreamConfiguration.Drop,
+        };
     }
 
     private static MetricStreamConfiguration View(params string[] tags) => new() { TagKeys = tags, CardinalityLimit = 2_000 };

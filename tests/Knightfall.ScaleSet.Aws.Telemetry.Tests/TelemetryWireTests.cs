@@ -114,6 +114,24 @@ public sealed partial class TelemetryWireTests
         Assert.Single(receiver.Requests, request => IsSignal(request, "logs"));
     }
 
+    [Theory]
+    [InlineData(false, false)]
+    [InlineData(true, false)]
+    [InlineData(true, true)]
+    public async Task SuccessHeadersDoNotAcceptAnOversizedBodyOrMissingGrpcTrailer(bool grpc, bool missingTrailer)
+    {
+        var cancellationToken = TestContext.Current.CancellationToken;
+        var failedResponse = missingTrailer ? ReceiverReply.GrpcStatusWithoutTrailer : ReceiverReply.Oversized;
+        await using var receiver = await OtlpLoopback.StartAsync(grpc,
+            request => IsSignal(request, "logs") ? failedResponse : ReceiverReply.Accepted, cancellationToken);
+        await using var output = new StringWriter(CultureInfo.InvariantCulture);
+        await using var errors = new StringWriter(CultureInfo.InvariantCulture);
+
+        Assert.Equal(1, await TelemetrySmokeCommand.VerifyAsync(Settings(receiver.Url, grpc), output, errors).WaitAsync(cancellationToken));
+        Assert.Contains("logs: InvalidResponse", errors.ToString(), StringComparison.OrdinalIgnoreCase);
+        Assert.Single(receiver.Requests, request => IsSignal(request, "logs"));
+    }
+
     [Fact]
     public async Task ReceiverWithHeadersAndStalledBodiesSharesOneShutdownBudget()
     {
@@ -205,10 +223,19 @@ public sealed partial class TelemetryWireTests
             }
         }
         unknown.Add(1);
+        using (var unsafeActivity = Assert.IsType<Activity>(activitySource.StartActivity("scaleset.aws.provider." + Secret)))
+        {
+            unsafeActivity.AddEvent(new ActivityEvent(Secret, tags: new ActivityTagsCollection
+            {
+                { "reason", Secret },
+            }));
+        }
         Assert.True(await pipeline.StopAsync().WaitAsync(cancellationToken));
 
         var requests = receiver.Requests;
         Assert.All(requests, request => Assert.DoesNotContain(Secret, Encoding.UTF8.GetString(request.Payload()), StringComparison.Ordinal));
+        var trace = Signal(requests, grpc: false, "traces", "trace", "Trace");
+        Assert.Equal(4, trace.Messages(2).Sum(scope => scope.Messages(2).Count()));
         var metric = Signal(requests, grpc: false, "metrics", "metrics", "Metrics");
         var counter = Assert.Single(metric.Messages(2).SelectMany(static scope => scope.Messages(2)),
             static instrument => instrument.Text(1) == "scaleset.aws.provider.operations");
@@ -263,6 +290,43 @@ public sealed partial class TelemetryWireTests
     }
 
     [Fact]
+    public async Task FullTraceQueueReportsDropsAndResumesAfterAStalledExport()
+    {
+        var cancellationToken = TestContext.Current.CancellationToken;
+        int sent = 0;
+        await using var receiver = await OtlpLoopback.StartAsync(grpc: false,
+            _ => Interlocked.Increment(ref sent) == 1 ? ReceiverReply.StalledBody : ReceiverReply.Accepted, cancellationToken);
+        var settings = TelemetrySettings.Load(readEnvironment: key => key switch
+        {
+            "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT" => receiver.Url,
+            "OTEL_EXPORTER_OTLP_TRACES_PROTOCOL" => "http/protobuf",
+            "OTEL_EXPORTER_OTLP_TRACES_TIMEOUT" => "2000",
+            "OTEL_TRACES_SAMPLER" => "parentbased_always_on",
+            _ => null,
+        });
+        await using var diagnostics = new StringWriter(CultureInfo.InvariantCulture);
+        await using var pipeline = TelemetryPipeline.Start(settings, TextWriter.Synchronized(diagnostics));
+        using var source = new ActivitySource(Controller);
+        source.StartActivity("scaleset.aws.telemetry.smoke")!.Dispose();
+        await receiver.FirstRequest.WaitAsync(cancellationToken);
+        await Task.Run(() =>
+        {
+            for (int index = 0; index < 2_200; index++)
+            {
+                source.StartActivity("scaleset.aws.telemetry.smoke")!.Dispose();
+            }
+        }, cancellationToken).WaitAsync(TimeSpan.FromSeconds(1.5), cancellationToken);
+
+        Assert.True(await pipeline.StopAsync().WaitAsync(TimeSpan.FromSeconds(6), cancellationToken));
+        Assert.Equal(ExportReceipt.Timeout, pipeline.FirstReceipt(TelemetrySignal.Traces));
+        Assert.Contains("Traces queue is full", diagnostics.ToString(), StringComparison.Ordinal);
+        Assert.True(receiver.Requests.Count > 1);
+        int captured = receiver.Requests.Sum(request =>
+            new OtlpMessage(request.Payload()).Messages(1).Sum(resource => resource.Messages(2).Sum(scope => scope.Messages(2).Count())));
+        Assert.InRange(captured, 2, 2_049);
+    }
+
+    [Fact]
     public async Task OfflineCliRoutesTelemetrySmokeWithNoCloudEnvironment()
     {
         var cancellationToken = TestContext.Current.CancellationToken;
@@ -276,6 +340,7 @@ public sealed partial class TelemetryWireTests
         start.Environment.Clear();
         start.Environment["OTEL_EXPORTER_OTLP_PROTOCOL"] = "http/protobuf";
         start.Environment["OTEL_EXPORTER_OTLP_ENDPOINT"] = "http://127.0.0.1:1/wrong";
+        start.Environment["OTEL_DOTNET_EXPERIMENTAL_OTLP_RETRY"] = "disk";
         // The test host shares ASP.NET Core assemblies. Exercise the standalone
         // controller with its real runtimeconfig, dependencies, and AppHost output.
         var target = new DirectoryInfo(AppContext.BaseDirectory);

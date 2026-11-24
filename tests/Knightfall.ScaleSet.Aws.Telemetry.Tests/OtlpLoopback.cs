@@ -15,6 +15,8 @@ internal enum ReceiverReply
     Partial = 1,
     Rejected = 2,
     StalledBody = 3,
+    Oversized = 4,
+    GrpcStatusWithoutTrailer = 5,
 }
 
 internal sealed record OtlpCapture(string Path, string MediaType, string Protocol, string Authorization, byte[] Body)
@@ -92,13 +94,25 @@ internal sealed class OtlpLoopback : IAsyncDisposable
             return;
         }
 
-        byte[] response = reply == ReceiverReply.Partial ? [10, 2, 8, 1] : [];
+        byte[] response = reply switch
+        {
+            ReceiverReply.Partial => [10, 2, 8, 1],
+            ReceiverReply.Oversized => new byte[65_537],
+            _ => [],
+        };
         if (grpc)
         {
             byte[] frame = new byte[response.Length + 5];
             BinaryPrimitives.WriteUInt32BigEndian(frame.AsSpan(1, 4), (uint)response.Length);
             response.CopyTo(frame.AsSpan(5));
-            context.Response.AppendTrailer("grpc-status", reply == ReceiverReply.Rejected ? "7" : "0");
+            if (reply == ReceiverReply.GrpcStatusWithoutTrailer)
+            {
+                context.Response.Headers.Append("grpc-status", "0");
+            }
+            else
+            {
+                context.Response.AppendTrailer("grpc-status", reply == ReceiverReply.Rejected ? "7" : "0");
+            }
             await context.Response.Body.WriteAsync(frame, cancellationToken);
             return;
         }
