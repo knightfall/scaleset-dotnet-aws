@@ -33,6 +33,9 @@ and synthesize the CDK baseline offline. The lifecycle tests run against a pinne
 MiniStack process on loopback and require Python 3.11 or newer. To select a local
 interpreter, run `make check MINISTACK_PYTHON=python3.11`.
 
+The standalone `make check-integration` target also exercises the YAML emitter.
+Run `npm --prefix cdk ci` first to install its pinned dependencies.
+
 ## Compile a configuration
 
 Run `npm --prefix cdk ci` to install the pinned compiler dependencies. Use

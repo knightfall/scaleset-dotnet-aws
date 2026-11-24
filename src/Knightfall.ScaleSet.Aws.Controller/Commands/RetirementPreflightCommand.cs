@@ -15,7 +15,17 @@ public static class RetirementPreflightCommand
     private const string Usage = "Use preflight retire --current-config <runtime.json> --current-sha256 <hex> " +
         "--current-generation <number> --config <runtime.json> --sha256 <hex> --generation <number>.";
 
-    public static async Task<int> RunAsync(string[] args, TextWriter stdout, TextWriter stderr, CancellationToken cancellationToken = default)
+    public static Task<int> RunAsync(string[] args, TextWriter stdout, TextWriter stderr, CancellationToken cancellationToken = default) =>
+        RunCoreAsync(args, stdout, stderr, VerifyAsync, cancellationToken);
+
+    internal static Task<int> RunAsync(string[] args, TextWriter stdout, TextWriter stderr, IAmazonDynamoDB dynamo,
+        IAmazonSecurityTokenService sts, TimeProvider clock, CancellationToken cancellationToken) =>
+        RunCoreAsync(args, stdout, stderr, (current, previous, candidate, generation, token) =>
+            VerifyAsync(current, previous, candidate, generation, dynamo, sts, clock, token), cancellationToken);
+
+    private static async Task<int> RunCoreAsync(string[] args, TextWriter stdout, TextWriter stderr,
+        Func<RuntimeConfiguration, long, RuntimeConfiguration, long, CancellationToken, Task<RetirementPreflightResult>> verify,
+        CancellationToken cancellationToken)
     {
         var options = Parse(args);
         if (options is null)
@@ -38,7 +48,7 @@ public static class RetirementPreflightCommand
                     .AsMemory(), cancellationToken).ConfigureAwait(false);
                 return 1;
             }
-            var result = await VerifyAsync(current, options.Current.Generation, candidate, options.Candidate.Generation, token)
+            var result = await verify(current, options.Current.Generation, candidate, options.Candidate.Generation, token)
                 .ConfigureAwait(false);
             if (result.Status == RetirementPreflightStatus.Verified)
             {
@@ -88,13 +98,21 @@ public static class RetirementPreflightCommand
             MaxStaleConnectionRetries = 0,
             DisableClockSkewCorrection = true,
         });
+        using var dynamo = new AmazonDynamoDBClient(credentials, dynamoOptions);
+        return await VerifyAsync(current, currentGeneration, candidate, generation, dynamo, sts, TimeProvider.System, cancellationToken)
+            .ConfigureAwait(false);
+    }
+
+    private static async Task<RetirementPreflightResult> VerifyAsync(RuntimeConfiguration current, long currentGeneration,
+        RuntimeConfiguration candidate, long generation, IAmazonDynamoDB dynamo, IAmazonSecurityTokenService sts,
+        TimeProvider clock, CancellationToken cancellationToken)
+    {
         var caller = await sts.GetCallerIdentityAsync(new GetCallerIdentityRequest(), cancellationToken).ConfigureAwait(false);
         if (caller.Account != current.Aws.Account)
         {
             return new RetirementPreflightResult(RetirementPreflightStatus.BindingMismatch, []);
         }
-        using var dynamo = new AmazonDynamoDBClient(credentials, dynamoOptions);
-        var store = new DynamoDbLifecycleStore(dynamo, current.TrackingTable.Name, TimeProvider.System);
+        var store = new DynamoDbLifecycleStore(dynamo, current.TrackingTable.Name, clock);
         return await store.VerifyRetirementAsync(current, currentGeneration, candidate, generation, cancellationToken).ConfigureAwait(false);
     }
 
