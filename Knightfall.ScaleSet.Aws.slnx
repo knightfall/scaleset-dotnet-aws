@@ -12,6 +12,7 @@
   <Folder Name="/tests/">
     <Project Path="tests/Knightfall.ScaleSet.Aws.Core.Tests/Knightfall.ScaleSet.Aws.Core.Tests.csproj" />
     <Project Path="tests/Knightfall.ScaleSet.Aws.ListenerConsumer/Knightfall.ScaleSet.Aws.ListenerConsumer.csproj" />
+    <Project Path="tests/Knightfall.ScaleSet.Aws.Providers.Tests/Knightfall.ScaleSet.Aws.Providers.Tests.csproj" />
     <Project Path="tests/Knightfall.ScaleSet.Aws.SdkContract.Tests/Knightfall.ScaleSet.Aws.SdkContract.Tests.csproj" />
   </Folder>
 </Solution>
