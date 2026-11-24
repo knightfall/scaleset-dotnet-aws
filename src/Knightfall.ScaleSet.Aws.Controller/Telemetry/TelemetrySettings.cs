@@ -95,6 +95,11 @@ public sealed class TelemetrySettings
         {
             return null;
         }
+        if (headers.Count != 0 && endpoint.Scheme != Uri.UriSchemeHttps && !IsLoopback(endpoint))
+        {
+            string endpointKey = signalEndpoint is null ? Exporter + "ENDPOINT" : signalKey;
+            throw Invalid(endpointOverride is null ? endpointKey : "--otlp-endpoint");
+        }
 
         var wireEndpoint = protocol switch
         {
@@ -104,6 +109,10 @@ public sealed class TelemetrySettings
         };
         return new TelemetryEndpoint(signal, protocol, wireEndpoint, TimeSpan.FromMilliseconds(timeout), headers);
     }
+
+    private static bool IsLoopback(Uri endpoint) =>
+        endpoint.Host.Equals("localhost", StringComparison.OrdinalIgnoreCase) || endpoint.Host == "[::1]" ||
+        (endpoint.HostNameType == UriHostNameType.IPv4 && endpoint.IsLoopback);
 
     private static FrozenDictionary<string, object> Resource(Func<string, string?> read)
     {

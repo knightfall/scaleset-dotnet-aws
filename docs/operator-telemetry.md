@@ -115,6 +115,12 @@ The secret and key ARNs must match the deployment's AWS partition, account, and
 Region. CDK rejects unknown fields, duplicate keys, literal header values, and
 partial secret ARNs.
 
+Use HTTPS for every remote exporter that sends headers. This applies to
+both protocols and to signal endpoints that inherit the common headers. HTTP
+with headers is supported for `localhost` and literal loopback addresses used
+in local smoke tests. CDK checks secret references, and the controller validates
+the resolved endpoint and headers before registering the exporters.
+
 Store the complete header list as the Secrets Manager secret string, using
 the same format as `OTEL_EXPORTER_OTLP_HEADERS`, for example
 `authorization=Bearer%20REPLACE_ME`. Supply the actual value through your
