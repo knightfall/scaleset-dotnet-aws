@@ -10,6 +10,7 @@
     <Project Path="src/Knightfall.ScaleSet.Aws.RunnerBootstrap/Knightfall.ScaleSet.Aws.RunnerBootstrap.csproj" />
   </Folder>
   <Folder Name="/tests/">
+    <Project Path="tests/Knightfall.ScaleSet.Aws.ListenerConsumer/Knightfall.ScaleSet.Aws.ListenerConsumer.csproj" />
     <Project Path="tests/Knightfall.ScaleSet.Aws.SdkContract.Tests/Knightfall.ScaleSet.Aws.SdkContract.Tests.csproj" />
   </Folder>
 </Solution>

@@ -83,3 +83,71 @@ does not expand the live service qualification.
 Custom GHES hosts ([#20](https://github.com/knightfall/scaleset.NET/issues/20)) and
 custom root CA/mTLS helpers ([#21](https://github.com/knightfall/scaleset.NET/issues/21))
 remain outside this baseline and must be rejected during configuration validation.
+
+## T02 contract verification
+
+### Published package identity
+
+An isolated restore from NuGet.org resolved Client and Listener
+`0.1.0-alpha.1`. Both registry archives passed `dotnet nuget verify --all`
+with the NuGet.org repository signature. Each archive had the same 10 release
+entries as its GitHub counterpart and one additional signature entry. The
+SHA-512 digests of the original archives matched the NuGet content hashes in
+both test project lock files. The original archives also matched the manifest's
+SHA-256 digests and passed both SLSA provenance and SPDX SBOM verification
+against `publish.yaml` at the release source commit.
+
+The contract suite builds a separate [Listener consumer fixture](../tests/Knightfall.ScaleSet.Aws.ListenerConsumer/).
+Its dependency graph contains the pinned Client and Listener packages, their
+transitive dependencies, and the repository analyzer. It implements the
+checkpoint store, delivery handler, and execution policy through the public
+package interfaces.
+
+### GitHub adapter and session supervision (T08–T11)
+
+- The released SDK exposes the GitHub.com and GitHub Enterprise Cloud target
+  shapes. Enterprise credentials must use the PAT path. The service determines
+  the token's granted scopes. The controller rejects custom GHES hosts and
+  `caBundlePath` during configuration validation.
+- The create and update requests serialize default label types as `System`.
+  Lookup responses can explicitly return a missing scale set or runner.
+- Use the sanitized exception diagnostics when recording GitHub errors.
+  `ScaleSetApiException.Response` retains raw response data. Preserve status
+  and rate-limit metadata in controller error records and exclude the raw
+  response, credential material, and session queue URLs from telemetry.
+- An administrative `DeleteMessageSessionAsync` sends a single DELETE for
+  the exact scale-set ID and session GUID. A dropped response or a 400/404
+  remains uncertain under the controller's recovery policy. The session
+  client's queue acknowledgement can refresh credentials on recognized
+  token expiry. The client adopts the credentials and retries only if the
+  refresh returns the same session GUID. A reconstructed `Acknowledging`
+  checkpoint after a lost response stops the pump for recovery under the
+  exact session identity.
+
+### AWS adapters and journal-owned retries (T06–T17)
+
+- The pinned DynamoDB, EC2, and ECS marshallers generate a UUID when their
+  idempotency token is omitted. The generated value stays in the wire payload.
+  Assign the controller's token before the journaled call and reuse that exact
+  token for an eligible replay of the same immutable request. Keep each new
+  transaction or launch intent's token distinct.
+- Configure journal-owned AWS write clients with both `MaxErrorRetry = 0`
+  and `MaxStaleConnectionRetries = 0`. The pinned SDK handles stale pooled
+  connection resets under a separate retry budget. These operations expose
+  the retry limits on the client configuration, so use a dedicated configured
+  client for journal-owned writes. The fake transport checks count SDK sends
+  at the HTTP handler boundary. Recover uncertain service outcomes through the
+  effect journal.
+- DynamoDB transaction cancellation reasons follow the request's item order.
+  The SDK can return an absent reason list. Treat missing reasons as unknown.
+  The conditional consume path requests `ALL_OLD` and extracts the preimage
+  from the successful `DeleteItem` response.
+- EC2 Describe responses and ECS `ListTasks` can return continuation
+  tokens. ECS `DescribeTasks` takes a batch of task IDs and returns separate
+  task and failure lists. Inspect those lists independently on `DescribeTasks`
+  and `RunTask`, including HTTP 200 responses with partial failures.
+
+Run the [offline contract suite](../tests/Knightfall.ScaleSet.Aws.SdkContract.Tests/)
+after updating either package family. The suite instantiates the pinned SDKs
+with fake HTTP handlers. AWS emulator and live target qualification use the
+separate evidence recorded by later tasks.
