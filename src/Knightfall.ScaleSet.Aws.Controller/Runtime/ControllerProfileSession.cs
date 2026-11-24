@@ -1,4 +1,3 @@
-using System.Runtime.CompilerServices;
 using Knightfall.ScaleSet.Aws.Core.Catalog;
 using Knightfall.ScaleSet.Aws.Core.Configuration;
 using Knightfall.ScaleSet.Aws.Core.Lifecycle;
@@ -7,8 +6,6 @@ using Knightfall.ScaleSet.Aws.DynamoDb;
 using Knightfall.ScaleSet.Aws.GitHub;
 using ScaleSet.Client;
 using ScaleSet.Listener;
-
-[assembly: InternalsVisibleTo("Knightfall.ScaleSet.Aws.Lifecycle.Tests")]
 
 namespace Knightfall.ScaleSet.Aws.Controller.Runtime;
 
