@@ -4,6 +4,11 @@ Use one AWS account and Region per deployment. Start with the [profile binding t
 
 ## Prepare the artifacts
 
+The default Direct EC2 mode holds a still-running host after GitHub reports job
+completion. Verify process exit and log collection before reclaiming it through
+your approved external procedure. For automatic cleanup, bind the qualified AMI
+and Launch Template to the supervisor's status grant and boot proof. [EC2 cleanup qualification](profile-bindings.md#qualify-ec2-supervisor-cleanup)
+
 Start with a [verified release archive](releases/VERIFYING.md) or build an
 archive from the reviewed source as shown below.
 The [maintainer release process](releases/PUBLISHING.md) records how the

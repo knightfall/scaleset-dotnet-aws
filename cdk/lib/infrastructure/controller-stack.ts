@@ -39,6 +39,7 @@ import { validateFargatePreflight } from "./fargate-preflight.ts";
 import {
   bootstrapPolicy,
   ec2Profiles,
+  ec2SupervisorStatusPolicy,
   fargateProfiles,
   grantEc2,
   grantFargate,
@@ -161,6 +162,22 @@ export class ControllerInfrastructure extends Stack {
       grantHostFence(this.controllerRole, this.hostingCluster);
       grantGitHubCredentials(this.controllerRole, runtime, enabled);
       this.attachBootstrapPolicies(enabled);
+      for (const { provisioner } of ec2) {
+        if (provisioner.statusQualification === undefined) continue;
+        const id = stableId(
+          "Ec2SupervisorStatus",
+          provisioner.bootstrapRoleArn,
+        );
+        const role = iam.Role.fromRoleArn(
+          this,
+          id,
+          provisioner.bootstrapRoleArn,
+        );
+        new iam.Policy(this, `${id}Policy`, {
+          roles: [role],
+          statements: [ec2SupervisorStatusPolicy(this.trackingTable)],
+        });
+      }
       if (ec2.length > 0) {
         const { queue, dlq } = this.observationQueues("Ec2");
         this.addEventRule(

@@ -42,7 +42,7 @@ internal sealed class DirectEc2BootstrapExecution(
             var imds = new Ec2ImdsV2(metadataHttp, host.Endpoint, clock);
             var verifier = new Ec2BootstrapIdentity(imds, credentials => new AmazonSecurityTokenServiceClient(credentials, ec2.StsConfig()));
             var authority = new Ec2BootstrapAuthority(scope[4], scope[3], role.Arn, role.RoleId);
-            var identity = await verifier.VerifyAsync(authority, lifetime.Token);
+            var identity = await verifier.VerifyAsync(authority, lifetime.Token, DirectEc2Fixture.LinuxImage);
             var scoped = cloud.Controller.Configure<AmazonDynamoDBConfig>();
             scoped.HttpClientFactory = gate;
             receipt = new AmazonDynamoDBClient(identity.Credentials, scoped);
@@ -56,7 +56,7 @@ internal sealed class DirectEc2BootstrapExecution(
 
             async Task ReportAsync(BootstrapRunnerObservation observation, CancellationToken token)
             {
-                var current = await verifier.VerifyAsync(authority, token);
+                var current = await verifier.VerifyAsync(authority, token, DirectEc2Fixture.LinuxImage);
                 if (current.AwsUserId != identity.AwsUserId || current.ResourceArn != identity.ResourceArn)
                 {
                     throw new InvalidOperationException("EC2 bootstrap identity changed during status publication.");
@@ -64,7 +64,10 @@ internal sealed class DirectEc2BootstrapExecution(
                 using var statusClient = new AmazonDynamoDBClient(current.Credentials, cloud.Controller.Configure<AmazonDynamoDBConfig>());
                 var publisher = new DynamoDbEc2BootstrapStatusClient(statusClient, cloud.TableName, current.AwsUserId, current.ResourceArn, clock);
                 var result = await publisher.PublishAsync(observation.Hello, new JitEc2BootstrapStatus(observation.OfferId,
-                    observation.RunnerId, observation.Exited ? 2 : 1, observation.Exited, clock.GetUtcNow()), token);
+                    observation.RunnerId, observation.Exited ? 2 : 1, observation.Exited, clock.GetUtcNow())
+                {
+                    QualificationSha256 = DirectEc2Fixture.StatusQualificationDigest,
+                }, token);
                 if (result != LifecycleWriteOutcome.Committed)
                 {
                     throw new InvalidOperationException("EC2 bootstrap status was not committed.");

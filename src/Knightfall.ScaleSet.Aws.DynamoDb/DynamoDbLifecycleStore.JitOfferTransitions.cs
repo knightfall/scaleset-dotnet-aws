@@ -331,7 +331,11 @@ public sealed partial class DynamoDbLifecycleStore
         try
         {
             BootstrapItems.RequireKey(key, row);
-            var status = BootstrapItems.Deserialize<JitEc2BootstrapStatus>(BootstrapItems.Text(row, "payload"));
+            var status = BootstrapItems.Deserialize<JitEc2BootstrapStatus>(BootstrapItems.Text(row, "payload")) with
+            {
+                // Keep the payload readable by a controller rolled back to the original STATUS contract.
+                QualificationSha256 = row.ContainsKey("qualificationSha256") ? BootstrapItems.Text(row, "qualificationSha256") : null,
+            };
             DynamoDbEc2BootstrapStatusClient.ValidateStatus(status);
             return status.RunnerId == runnerId && status.OfferId == handoff.OfferId &&
                 BootstrapItems.Text(row, "helloSha256") == handoff.HelloSha256 &&

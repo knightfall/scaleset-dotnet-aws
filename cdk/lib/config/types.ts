@@ -44,6 +44,11 @@ export interface Ec2Provisioner {
   readonly bootstrapProtocol: "v1";
   readonly tenancy?: "default" | "dedicated";
   readonly subnetStrategy?: "round-robin" | "failure-weighted";
+  readonly statusQualification?: {
+    readonly imageId: string;
+    readonly roleId: string;
+    readonly evidenceSha256: string;
+  };
 }
 
 export interface FargateProvisioner {

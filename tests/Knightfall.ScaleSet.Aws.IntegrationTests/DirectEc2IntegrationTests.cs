@@ -21,6 +21,61 @@ public sealed partial class DirectEc2IntegrationTests
         TimeSpan.FromMinutes(5), TimeSpan.FromSeconds(5));
 
     [Fact]
+    public async Task DetachedExternallyTerminatedInstanceReleasesItsExactAllocationAfterControllerReplacement()
+    {
+        using var deadline = CancellationTokenSource.CreateLinkedTokenSource(TestContext.Current.CancellationToken);
+        deadline.CancelAfter(TimeSpan.FromSeconds(45));
+        var token = deadline.Token;
+        using var cloud = await MiniStackIamFixture.CreateAsync(token);
+        var role = await cloud.EnsureRunnerRoleAsync(DirectEc2Fixture.RoleName(), includeStatus: false, token);
+        using var fixture = await DirectEc2Fixture.CreateAsync(cloud.Endpoint, cloud.Controller.Credentials,
+            cloud.Controller.Ec2, cloud.Controller.Iam, Account, Region, role.Arn, token);
+        fixture.Wire.DetachTerminalInterfaces = true;
+        var configuration = await fixture.ConfigurationAsync(cloud.TableName, "1", token);
+        var clock = new FixtureClock();
+        var profile = Assert.Single(configuration.Profiles);
+        var store = new DynamoDbLifecycleStore(cloud.Controller.DynamoDb, cloud.TableName, clock);
+        var owner = await ActivateInitialAsync(store, configuration, clock, token);
+        var key = new LifecycleProfile(owner.Lease.Deployment, profile.Id);
+        var catalog = await BindCatalogAsync(store, key, owner.Lease, token);
+        using var inspector = fixture.Inspector(clock);
+        using var provider = fixture.Provider(configuration, key, clock);
+        var backend = Backend(configuration, profile, key, inspector, provider, store, clock);
+        await ReconcileAsync(backend, owner, catalog, token);
+        await ReconcileAsync(backend, owner, catalog, token);
+        var launched = Assert.IsType<ExecutorBinding>(Assert.Single((await backend.ReadAsync(owner.Lease, token)).Resources).Binding);
+        var beforeTermination = Assert.Single((await store.ReadExecutorInventoryAsync(key, token)).Executors);
+        Assert.Equal(launched, beforeTermination.Binding);
+        await cloud.Controller.Ec2.TerminateInstancesAsync(new TerminateInstancesRequest { InstanceIds = [InstanceId(launched)] }, token);
+        Assert.Equal(ExecutorResourceState.Running,
+            (await store.ReadExecutorAsync(key, launched.AllocationId, token))?.State.Resource?.State);
+
+        var restartedStore = new DynamoDbLifecycleStore(cloud.Controller.DynamoDb, cloud.TableName, clock);
+        var successor = await ReplaceAsync(restartedStore, configuration, owner.Lease, clock, token);
+        using var restartedInspector = fixture.Inspector(clock);
+        using var restartedProvider = fixture.Provider(configuration, key, clock);
+        var restarted = Backend(configuration, profile, key, restartedInspector, restartedProvider, restartedStore, clock);
+        var inventory = await restarted.ReadAsync(successor.Lease, token);
+        Assert.True(inventory.IsComplete);
+        Assert.True(inventory.LaunchHeadroom > 0);
+        var terminal = Assert.Single(inventory.Resources);
+        Assert.Equal(launched, terminal.Binding);
+        var observation = Assert.IsType<ExecutorResourceObservation>(terminal.Observation);
+        Assert.Equal(ExecutorResourceState.IrreversiblyTerminated, observation.State);
+        Assert.Equal(LifecycleWriteOutcome.Committed, await restartedStore.ObserveResourceAsync(successor.Lease.Fence, launched, observation, token));
+        Assert.Empty((await restartedStore.ReadExecutorInventoryAsync(key, token)).Executors);
+        Assert.Equal(CatalogRolloutStatus.Applied, (await restartedStore.AdvanceCatalogRolloutAsync(successor.Lease.Fence,
+            configuration, catalog.AppliedGeneration, token)).Status);
+        var currentCatalog = await BindCatalogAsync(restartedStore, key, successor.Lease, token);
+        await ReconcileAsync(restarted, successor, currentCatalog, token);
+        var replacement = Assert.Single((await restartedStore.ReadExecutorInventoryAsync(key, token)).Executors);
+        Assert.NotEqual(launched.AllocationId, replacement.Binding.AllocationId);
+        Assert.Equal(ExecutorResourceState.Running, replacement.State.Resource?.State);
+        Assert.Empty(fixture.Wire.Calls("TerminateInstances"));
+        Assert.Equal(3, fixture.Wire.Calls("RunInstances").Length);
+    }
+
+    [Fact]
     public async Task NativeAliasDriftFreezesNewLaunchesAndRetainsTheAlternateZoneInstanceAcrossReplacement()
     {
         using var deadline = CancellationTokenSource.CreateLinkedTokenSource(TestContext.Current.CancellationToken);

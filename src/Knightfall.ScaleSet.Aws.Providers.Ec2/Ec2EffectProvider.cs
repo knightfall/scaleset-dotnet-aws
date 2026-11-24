@@ -76,7 +76,8 @@ public sealed partial class Ec2EffectProvider : IReconciliationEffectProvider, I
             return await CheckLaunchAsync(envelope, launch, cancellationToken).ConfigureAwait(false);
         }
         bool eligible = envelope.Request is Ec2TerminateEffectRequest termination && IsScopedTermination(termination, out string instanceId) &&
-            await ReadTerminationTargetAsync(termination, instanceId, cancellationToken).ConfigureAwait(false) is { State: Ec2InstanceState.Running };
+            await ReadTerminationTargetAsync(termination, instanceId, cancellationToken).ConfigureAwait(false) is { State: Ec2InstanceState.Running } target &&
+            (_provisioner.StatusQualification is not { } qualification || target.ImageId == qualification.ImageId);
         return new EffectDispatchPrecondition(envelope.Sha256, envelope.Target, _clock.GetUtcNow(), eligible);
     }
 

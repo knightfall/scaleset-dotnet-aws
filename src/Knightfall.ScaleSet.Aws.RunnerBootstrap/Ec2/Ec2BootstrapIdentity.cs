@@ -32,12 +32,14 @@ internal sealed record VerifiedEc2BootstrapIdentity(string ResourceArn, string A
 
 internal sealed partial class Ec2BootstrapIdentity(Ec2ImdsV2 imds, Func<SessionAWSCredentials, IAmazonSecurityTokenService> createSts)
 {
-    internal async Task<VerifiedEc2BootstrapIdentity> VerifyAsync(Ec2BootstrapAuthority authority, CancellationToken cancellationToken)
+    internal async Task<VerifiedEc2BootstrapIdentity> VerifyAsync(Ec2BootstrapAuthority authority, CancellationToken cancellationToken,
+        string? expectedImageId = null)
     {
         authority.Validate();
         var metadata = await imds.ReadAsync(authority.RoleName, cancellationToken).ConfigureAwait(false);
         var instance = metadata.Document;
         if (instance.Account != authority.Account || instance.Region != authority.Region ||
+            (expectedImageId is not null && instance.ImageId != expectedImageId) ||
             !InstanceIdPattern().IsMatch(instance.InstanceId))
         {
             throw InvalidIdentity();

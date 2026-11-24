@@ -643,6 +643,105 @@ test("active profiles alone supply provider permissions, event rules and role-sc
   }
 });
 
+test("only an active qualified EC2 role receives the supervisor STATUS policy", () => {
+  const config = fixture("mixed-ec2-fargate");
+  const { spec } = config.runtime;
+  const ec2 = spec.profiles.find(
+    (profile) => profile.provisioner.type === "ec2",
+  );
+  assert.ok(ec2?.provisioner.type === "ec2");
+  const fargate = spec.profiles.find(
+    (profile) => profile.provisioner.type === "fargate",
+  );
+  assert.ok(fargate?.provisioner.type === "fargate");
+  const qualified = {
+    ...ec2,
+    provisioner: {
+      ...ec2.provisioner,
+      launchTemplateVersion: { type: "pinned", version: "12" } as const,
+      statusQualification: {
+        imageId: "ami-0123456789abcdef0",
+        roleId: "AROAFIXTUREBOOTSTRAP01",
+        evidenceSha256: "b".repeat(64),
+      },
+    },
+  };
+  const compiled = rewrite(config, {
+    ...spec,
+    mode: "active",
+    profiles: [qualified, fargate],
+  });
+  const template = synthesize(compiled);
+  const policies = Object.values(template.findResources("AWS::IAM::Policy"));
+  const status = policies.filter((policy) =>
+    JSON.stringify(policy).includes("STATUS#${aws:userid}"),
+  );
+  assert.equal(status.length, 1);
+  assert.deepEqual(status[0].Properties.Roles, [
+    ec2.provisioner.bootstrapRoleArn.split("/").at(-1),
+  ]);
+  assert.equal(status[0].Properties.PolicyDocument.Statement.length, 1);
+  const [statement] = status[0].Properties.PolicyDocument.Statement;
+  assert.equal(statement.Action, "dynamodb:PutItem");
+  assert.deepEqual(statement.Condition["ForAllValues:StringEquals"], {
+    "dynamodb:LeadingKeys": ["STATUS#${aws:userid}"],
+  });
+  assert.deepEqual(statement.Condition.NumericEquals, {
+    "ec2:RoleDelivery": "2.0",
+  });
+  assert.match(
+    JSON.stringify(statement.Condition.ArnLike["ec2:SourceInstanceARN"]),
+    /:ec2:ap-southeast-2:111122223333:instance\/\*/u,
+  );
+  assert.deepEqual(statement.Condition.Null, {
+    "dynamodb:LeadingKeys": "false",
+    "dynamodb:EnclosingOperation": "true",
+  });
+  assert.doesNotMatch(
+    JSON.stringify(
+      synthesize(
+        rewrite(compiled, { ...compiled.runtime.spec, mode: "dry-run" }),
+      ).toJSON(),
+    ),
+    /STATUS#/u,
+  );
+
+  assert.throws(
+    () =>
+      rewrite(config, {
+        ...spec,
+        profiles: [
+          {
+            ...qualified,
+            provisioner: {
+              ...qualified.provisioner,
+              launchTemplateVersion: { type: "alias", name: "$Latest" },
+            },
+          },
+          fargate,
+        ],
+      }),
+    /numeric pinned Launch Template/u,
+  );
+  assert.throws(
+    () =>
+      rewrite(config, {
+        ...spec,
+        profiles: [
+          qualified,
+          {
+            ...fargate,
+            provisioner: {
+              ...fargate.provisioner,
+              bootstrapRoleArn: ec2.provisioner.bootstrapRoleArn,
+            },
+          },
+        ],
+      }),
+    /dedicated EC2 bootstrap role/u,
+  );
+});
+
 test("dry run uses neither lifecycle mutations nor event consumers", () => {
   const config = fixture("mixed-ec2-fargate");
   for (const inspectAws of [false, true]) {

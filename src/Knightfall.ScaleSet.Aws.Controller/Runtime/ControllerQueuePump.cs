@@ -70,23 +70,28 @@ internal sealed class ControllerQueuePump(RuntimeConfiguration configuration, IA
             return true;
         }
         var inventory = await provider.ReadStateChangeAsync(hint, cancellationToken).ConfigureAwait(false);
-        if (!inventory.IsComplete || inventory.Instances is not [{ IsAuthoritative: true, OriginalLaunchTime: { } launchTime } instance] ||
-            instance.ResourceArn != binding.ResourceArn || instance.AllocationId?.ToString("D") != binding.AllocationId ||
-            instance.Incarnation != binding.Incarnation || instance.LaunchTemplateId != identity.LaunchTemplateId ||
-            instance.LaunchTemplateVersion != identity.LaunchTemplateVersion || launchTime != identity.InstanceLaunchTime ||
-            launchTime > inventory.ObservedAt)
+        if (!inventory.IsComplete || inventory.Instances is not [{ IsAuthoritative: true } instance])
+        {
+            return false;
+        }
+        bool matches = instance.ReportedState == Ec2InstanceState.Terminated
+            ? instance.CorroboratesTerminal(binding, configuration.Aws.Account, configuration.Aws.Region, inventory.ObservedAt)
+            : instance.ResourceArn == binding.ResourceArn && instance.AllocationId?.ToString("D") == binding.AllocationId &&
+                instance.Incarnation == binding.Incarnation && instance.LaunchTemplateId == identity.LaunchTemplateId &&
+                instance.LaunchTemplateVersion == identity.LaunchTemplateVersion && instance.OriginalLaunchTime == identity.InstanceLaunchTime;
+        if (!matches || identity.InstanceLaunchTime > inventory.ObservedAt)
         {
             return false;
         }
 
-        var state = instance.State switch
+        var state = instance.ReportedState switch
         {
             Ec2InstanceState.Pending => ExecutorResourceState.Starting,
             Ec2InstanceState.Running => ExecutorResourceState.Running,
             Ec2InstanceState.Terminated => ExecutorResourceState.IrreversiblyTerminated,
             _ => ExecutorResourceState.Unknown,
         };
-        var observation = new ExecutorResourceObservation(state, inventory.ObservedAt, launchTime, Guid.NewGuid());
+        var observation = new ExecutorResourceObservation(state, inventory.ObservedAt, identity.InstanceLaunchTime, Guid.NewGuid());
         return await ApplyAsync(ownership, binding, observation, cancellationToken).ConfigureAwait(false);
     }
 

@@ -104,7 +104,22 @@ for address in '169.254.169.254' '[fd00:ec2::254]'; do
 done
 ```
 
-Record evidence for the exact AMI, Launch Template version, runner version, boot ID, UID/GID, and tested Docker modes. Create the root-owned, mode `0600` boot proof only after the checks pass. Keep `publishStatus: false` by default. The standard CDK bootstrap policy grants HELLO and OFFER operations. To enable EC2 `STATUS#`, qualify the real boot boundary, separately authorize only the EC2 supervisor's scoped status write, and verify access from the privileged service and denial from workflow code in the target. Disable reporting again if any of that evidence changes or expires. [AWS IMDS versions](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/configuring-instance-metadata-service.html) · [AWS IMDS access controls](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/instance-metadata-limiting-access.html)
+### Qualify EC2 supervisor cleanup
+
+The default uses external reclamation for still-running hosts. The dry-run report lists that mode as `external-reclamation-required`. GitHub completion alone leaves the host held. Exact EC2 terminal readback releases the allocation even when the primary network interface has detached.
+
+To enable automatic cleanup, qualify the exact AMI, pinned numeric Launch Template version, dedicated EC2 bootstrap role and immutable IAM role ID, runner version, UID/GID, and supported Docker modes. Record the results and hash the reviewed qualification evidence. Set the optional EC2 provisioner field as shown below.
+
+```yaml
+statusQualification:
+  imageId: ami-0123456789abcdef0
+  roleId: AROAFIXTUREBOOTSTRAP01
+  evidenceSha256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+```
+
+Copy the same object into the root-owned [bootstrap settings](ec2-runner-bootstrap.md#qualify-the-isolation-boundary-before-enabling-status), set `publishStatus: true`, and write the matching root-owned current-boot proof only after the checks pass. The active stack grants `PutItem` for `STATUS#${aws:userid}` on the lifecycle table to that EC2 role, with EC2-sourced IMDSv2 credentials required. The role must be dedicated to the qualified profile. The controller validates the configured AMI and role ID in preflight and reads status only for the matching running instance and exact handoff. Cleanup waits for authenticated process exit, GitHub completion, and the log flush grace period. Qualify the actual AWS IAM grant and denial from the workflow and nested containers before depending on it.
+
+Drain and reclaim runners from a prior binding before replacing the AMI, Launch Template version, or qualification evidence. Remove `statusQualification` from the controller and set `publishStatus: false` on the image when the qualification expires or no longer applies. [AWS EC2 credential condition keys](https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_policies_condition-keys.html) · [AWS IMDS access controls](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/instance-metadata-limiting-access.html)
 
 ### Fargate task, network, and quota
 

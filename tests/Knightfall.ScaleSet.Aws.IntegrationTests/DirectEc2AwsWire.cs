@@ -23,6 +23,8 @@ internal sealed class DirectEc2AwsWire(Uri endpoint, string firstSubnet) : Deleg
 
     internal HttpClientFactory ClientFactory => new Factory(this);
 
+    internal bool DetachTerminalInterfaces { get; set; }
+
     protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
     {
         if (request.RequestUri is not { Scheme: "http", Host: "127.0.0.1" } uri || uri.Authority != endpoint.Authority ||
@@ -97,9 +99,16 @@ internal sealed class DirectEc2AwsWire(Uri endpoint, string firstSubnet) : Deleg
                     tags.Add(
                         Tag(ns, "aws:ec2launchtemplate:id", launch.TemplateId),
                         Tag(ns, "aws:ec2launchtemplate:version", launch.TemplateVersion));
-                    item.Add(new XElement(ns + "networkInterfaceSet", new XElement(ns + "item",
-                        new XElement(ns + "attachment", new XElement(ns + "deviceIndex", 0),
-                            new XElement(ns + "attachTime", launch.OriginalLaunchTime)))));
+                    if (DetachTerminalInterfaces && item.Element(ns + "instanceState")?.Element(ns + "name")?.Value == "terminated")
+                    {
+                        item.Elements(ns + "networkInterfaceSet").Remove();
+                    }
+                    else
+                    {
+                        item.Add(new XElement(ns + "networkInterfaceSet", new XElement(ns + "item",
+                            new XElement(ns + "attachment", new XElement(ns + "deviceIndex", 0),
+                                new XElement(ns + "attachTime", launch.OriginalLaunchTime)))));
+                    }
                 }
             }
 

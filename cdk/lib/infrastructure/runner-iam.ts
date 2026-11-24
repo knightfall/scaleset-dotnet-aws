@@ -282,6 +282,32 @@ export function bootstrapPolicy(table: ITable) {
   ];
 }
 
+export function ec2SupervisorStatusPolicy(table: ITable) {
+  const stack = Stack.of(table);
+  return new iam.PolicyStatement({
+    actions: ["dynamodb:PutItem"],
+    resources: [table.tableArn],
+    conditions: {
+      "ForAllValues:StringEquals": {
+        "dynamodb:LeadingKeys": ["STATUS#${aws:userid}"],
+      },
+      ArnLike: {
+        "ec2:SourceInstanceARN": stack.formatArn({
+          service: "ec2",
+          resource: "instance",
+          resourceName: "*",
+          arnFormat: ArnFormat.SLASH_RESOURCE_NAME,
+        }),
+      },
+      NumericEquals: { "ec2:RoleDelivery": "2.0" },
+      Null: {
+        "dynamodb:LeadingKeys": "false",
+        "dynamodb:EnclosingOperation": "true",
+      },
+    },
+  });
+}
+
 function bootstrapStatement(table: ITable, action: string, leadingKey: string) {
   return new iam.PolicyStatement({
     actions: [action],

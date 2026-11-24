@@ -85,18 +85,19 @@ public sealed partial class Ec2EffectProvider
     {
         using var operation = Ec2Diagnostics.Start("termination_readback", _telemetryProfile, cancellationToken);
         var target = await ReadTerminationTargetAsync(request, instanceId, cancellationToken).ConfigureAwait(false);
-        var evidence = IsTerminal(target) ? TerminalEvidence(envelope, request, instanceId) : null;
+        var binding = RetainedTerminationBinding(request, instanceId);
+        var evidence = target?.CorroboratesTerminal(binding, _configuration.Aws.Account, _configuration.Aws.Region, _clock.GetUtcNow()) == true
+            ? Applied(envelope, binding, Ec2InstanceState.Terminated, request.InstanceLaunchTime) : null;
         Ec2Diagnostics.RecordEffect(operation, evidence);
         return evidence;
     }
 
-    private EffectEvidence TerminalEvidence(EffectEnvelope envelope, Ec2TerminateEffectRequest request, string instanceId)
+    private ExecutorBinding RetainedTerminationBinding(Ec2TerminateEffectRequest request, string instanceId)
     {
         var incarnation = Ec2ExecutorIncarnation.Compute(_configuration.Aws.Account, _configuration.Aws.Region, instanceId,
             request.InstanceLaunchTime, request.LaunchTemplateVersion);
-        var binding = new ExecutorBinding(_profile, request.AllocationId.ToString("D"), request.InstanceArn, incarnation,
+        return new ExecutorBinding(_profile, request.AllocationId.ToString("D"), request.InstanceArn, incarnation,
             new Ec2ExecutorIdentity(request.InstanceLaunchTime, request.LaunchTemplateId, request.LaunchTemplateVersion));
-        return Applied(envelope, binding, Ec2InstanceState.Terminated, request.InstanceLaunchTime);
     }
 
     private EffectEvidence Applied(EffectEnvelope envelope, ExecutorBinding binding, Ec2InstanceState state, DateTimeOffset start)
@@ -115,9 +116,6 @@ public sealed partial class Ec2EffectProvider
             ResourceObservation = new ExecutorResourceObservation(resourceState, observed, start, Guid.NewGuid()),
         };
     }
-
-    /// <summary>The retained exact binding supplies original launch time if the terminal row has lost its primary interface.</summary>
-    private static bool IsTerminal(Ec2InventoryEntry? target) => target is { ReportedState: Ec2InstanceState.Terminated };
 
     private static bool HasUniqueTag(List<Tag>? tags, string key, string expected) =>
         tags?.Where(tag => tag?.Key == key).Take(2).ToArray() is [{ Value: var value }] && value == expected;

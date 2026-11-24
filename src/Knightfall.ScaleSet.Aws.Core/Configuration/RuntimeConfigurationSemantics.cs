@@ -88,7 +88,7 @@ internal static partial class RuntimeConfigurationSemantics
         {
             string path = ChildPath("/spec/profiles", profileIndex++);
             RequireUnique(profileIds, Text(profile, "id"), path + "/id", "Profile IDs must be unique.");
-            ValidateProfile(profile, networks, clusters, aws, path);
+            ValidateProfile(profile, profiles, networks, clusters, aws, path);
 
             JsonElement routing = profile.GetProperty("github");
             if (!scopes.TryGetValue(Text(routing, "connection"), out string? scope))
@@ -159,7 +159,7 @@ internal static partial class RuntimeConfigurationSemantics
         return id;
     }
 
-    private static void ValidateProfile(JsonElement profile, JsonElement networks, JsonElement clusters, AwsScope aws, string path)
+    private static void ValidateProfile(JsonElement profile, JsonElement profiles, JsonElement networks, JsonElement clusters, AwsScope aws, string path)
     {
         JsonElement capacity = profile.GetProperty("capacity");
         if (!capacity.GetProperty("idleReserve").TryGetInt32(out int reserve) ||
@@ -200,6 +200,23 @@ internal static partial class RuntimeConfigurationSemantics
         else
         {
             RequireArn(Text(provisioner, "instanceProfileArn"), "iam", aws, prefix + "/instanceProfileArn");
+            if (provisioner.TryGetProperty("statusQualification", out _))
+            {
+                JsonElement templateVersion = provisioner.GetProperty("launchTemplateVersion");
+                if (!linux || Text(templateVersion, "type") != "pinned" ||
+                    !long.TryParse(Text(templateVersion, "version"), NumberStyles.None, CultureInfo.InvariantCulture, out _))
+                {
+                    throw Invalid(prefix + "/statusQualification",
+                        "Supervisor STATUS requires a Linux profile and a numeric pinned Launch Template version.");
+                }
+                string role = Text(provisioner, "bootstrapRoleArn");
+                if (profiles.EnumerateArray().Select(other => other.GetProperty("provisioner"))
+                    .Count(other => Text(other, "bootstrapRoleArn") == role ||
+                        (other.TryGetProperty("executionRoleArn", out var executionRole) && executionRole.GetString() == role)) != 1)
+                {
+                    throw Invalid(prefix + "/bootstrapRoleArn", "Supervisor STATUS requires a dedicated EC2 bootstrap role.");
+                }
+            }
         }
     }
 

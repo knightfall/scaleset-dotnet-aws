@@ -423,7 +423,26 @@
         "bootstrapRoleArn": { "$ref": "#/$defs/roleArn" },
         "bootstrapProtocol": { "const": "v1" },
         "tenancy": { "enum": ["default", "dedicated"] },
-        "subnetStrategy": { "enum": ["round-robin", "failure-weighted"] }
+        "subnetStrategy": { "enum": ["round-robin", "failure-weighted"] },
+        "statusQualification": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["imageId", "roleId", "evidenceSha256"],
+          "properties": {
+            "imageId": {
+              "type": "string",
+              "pattern": "^ami-(?:[0-9a-f]{8}|[0-9a-f]{17})(?![\\s\\S])"
+            },
+            "roleId": {
+              "type": "string",
+              "pattern": "^AROA[A-Z0-9]{12,124}(?![\\s\\S])"
+            },
+            "evidenceSha256": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{64}(?![\\s\\S])"
+            }
+          }
+        }
       }
     },
     "launchTemplateVersion": {

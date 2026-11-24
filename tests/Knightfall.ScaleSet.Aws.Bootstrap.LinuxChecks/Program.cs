@@ -72,7 +72,18 @@ catch (IOException)
 {
 }
 File.WriteAllText(proofPath, JsonSerializer.Serialize(proof, BootstrapJson.Options));
-var boundary = LinuxRunnerBoundary.Verify(settings);
+_ = LinuxRunnerBoundary.Verify(settings);
+string qualification = new('a', 64);
+try
+{
+    _ = LinuxRunnerBoundary.Verify(settings, qualification);
+    throw new InvalidOperationException("The legacy boot proof was accepted for qualified STATUS.");
+}
+catch (IOException)
+{
+}
+File.WriteAllText(proofPath, JsonSerializer.Serialize(proof with { StatusQualificationSha256 = qualification }, BootstrapJson.Options));
+var boundary = LinuxRunnerBoundary.Verify(settings, qualification);
 
 File.WriteAllText(Path.Combine(privateState, "parent-environment"), parentSentinel);
 Environment.SetEnvironmentVariable("AWS_SESSION_TOKEN", parentSentinel);
