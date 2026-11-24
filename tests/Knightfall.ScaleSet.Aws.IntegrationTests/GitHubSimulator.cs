@@ -104,12 +104,41 @@ internal sealed class GitHubSimulator(string groupName)
         }
     }
 
-    internal void Complete(long requestId)
+    internal long StartJob(long requestId, long runnerId)
+    {
+        lock (_sync)
+        {
+            var runner = _runners[runnerId];
+            _runners[runnerId] = runner with { Assigned = true };
+            long id = _messageId++;
+            string body = JsonSerializer.Serialize(new[]
+            {
+                new { messageType = "JobStarted", runnerRequestId = requestId, runnerId, runnerName = runner.Name },
+            });
+            _queue.Add(id, new SimulatedMessage(id, AsRequested, body, new { totalAssignedJobs = TotalAssignedJobs }));
+            return id;
+        }
+    }
+
+    internal void Complete(long requestId, long? runnerId = null)
     {
         lock (_sync)
         {
             long id = _messageId++;
-            string body = JsonSerializer.Serialize(new[] { new { messageType = "JobCompleted", runnerRequestId = requestId, result = "success" } });
+            string body;
+            if (runnerId is long exact)
+            {
+                var runner = _runners[exact];
+                _runners[exact] = runner with { Assigned = false };
+                body = JsonSerializer.Serialize(new[]
+                {
+                    new { messageType = "JobCompleted", runnerRequestId = requestId, runnerId = exact, runnerName = runner.Name, result = "success" },
+                });
+            }
+            else
+            {
+                body = JsonSerializer.Serialize(new[] { new { messageType = "JobCompleted", runnerRequestId = requestId, result = "success" } });
+            }
             _queue.Add(id, new SimulatedMessage(id, AsRequested, body, new { totalAssignedJobs = TotalAssignedJobs }));
         }
     }

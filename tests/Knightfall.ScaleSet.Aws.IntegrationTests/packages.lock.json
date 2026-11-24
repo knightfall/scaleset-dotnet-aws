@@ -390,6 +390,16 @@
           "Knightfall.ScaleSet.Aws.Core": "[1.0.0, )"
         }
       },
+      "knightfall.scaleset.aws.runnerbootstrap": {
+        "type": "Project",
+        "dependencies": {
+          "AWSSDK.Core": "[4.1.1.2, 4.1.1.2]",
+          "AWSSDK.DynamoDBv2": "[4.1.0.3, 4.1.0.3]",
+          "AWSSDK.SecurityToken": "[4.1.1.1, 4.1.1.1]",
+          "Knightfall.ScaleSet.Aws.DynamoDb": "[1.0.0, )",
+          "Knightfall.ScaleSet.Aws.Handoff": "[1.0.0, )"
+        }
+      },
       "AWSSDK.Core": {
         "type": "CentralTransitive",
         "requested": "[4.1.1.2, 4.1.1.2]",
