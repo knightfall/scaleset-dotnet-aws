@@ -102,6 +102,7 @@ internal sealed class GitHubListenerExecutionPolicy : IScaleSetListenerExecution
         }
         if (IsRemote(context.Operation) && _cooldown.Read(_secretArn) is { } retryAt)
         {
+            GitHubListenerDiagnostics.Count("authorize", "deferred", "cooldown");
             return ScaleSetListenerAuthorization.Defer(retryAt);
         }
 
@@ -120,6 +121,7 @@ internal sealed class GitHubListenerExecutionPolicy : IScaleSetListenerExecution
         _ownershipLost.ThrowIfCancellationRequested();
         if (IsRemote(context.Operation) && _cooldown.Read(_secretArn) is { } latestRetryAt)
         {
+            GitHubListenerDiagnostics.Count("authorize", "deferred", "cooldown");
             return ScaleSetListenerAuthorization.Defer(latestRetryAt);
         }
         return remaining > TimeSpan.Zero

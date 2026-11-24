@@ -174,6 +174,10 @@ public sealed class ControllerLeaseOwnership : IDisposable
 
     private async Task<ControllerHeartbeatStatus> LoseAsync()
     {
+        if (!_lost.IsCancellationRequested)
+        {
+            DynamoDbDiagnostics.RecordLeaseLoss();
+        }
         await _lost.CancelAsync().ConfigureAwait(false);
         return ControllerHeartbeatStatus.OwnershipLost;
     }

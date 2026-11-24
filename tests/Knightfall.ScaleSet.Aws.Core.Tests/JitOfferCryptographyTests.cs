@@ -1,4 +1,6 @@
 using System.Collections.Immutable;
+using System.Diagnostics;
+using System.Diagnostics.Metrics;
 using System.Security.Cryptography;
 using Knightfall.ScaleSet.Aws.Handoff;
 using Xunit;
@@ -191,6 +193,81 @@ public sealed class JitOfferCryptographyTests
         var expired = new FixedClock(Expiry);
         Assert.Throws<CryptographicException>(() => recipient.Open(VectorOffer(), Identity, expired));
         Assert.Throws<CryptographicException>(() => JitOfferCryptography.Seal(VectorOffer().Binding, recipient.Hello, EncodedJit, expired));
+    }
+
+    [Fact]
+    public void CryptoTelemetryCarriesOnlyBoundedEvidenceAndMeasuresWithoutSampling()
+    {
+        const string source = "Knightfall.ScaleSet.Aws.Handoff";
+        using var parent = new Activity("fixture").SetIdFormat(ActivityIdFormat.W3C).Start();
+        var spans = new List<Activity>();
+        bool sample = true;
+        using var traces = new ActivityListener
+        {
+            ShouldListenTo = item => item.Name == source,
+            Sample = (ref ActivityCreationOptions<ActivityContext> options) => sample && options.Parent == parent.Context
+                ? ActivitySamplingResult.AllData : ActivitySamplingResult.None,
+            ActivityStopped = spans.Add,
+        };
+        ActivitySource.AddActivityListener(traces);
+
+        var operations = new List<(long Value, KeyValuePair<string, object?>[] Tags)>();
+        var durations = new List<(double Value, KeyValuePair<string, object?>[] Tags)>();
+        using var metrics = new MeterListener
+        {
+            InstrumentPublished = (instrument, listener) =>
+            {
+                if (instrument.Meter.Name == source)
+                {
+                    listener.EnableMeasurementEvents(instrument);
+                }
+            },
+        };
+        metrics.SetMeasurementEventCallback<long>((instrument, value, tags, _) =>
+        {
+            if (instrument.Name == "scaleset.aws.handoff.operations" && Activity.Current?.TraceId == parent.TraceId)
+            {
+                operations.Add((value, tags.ToArray()));
+            }
+        });
+        metrics.SetMeasurementEventCallback<double>((instrument, value, tags, _) =>
+        {
+            if (instrument.Name == "scaleset.aws.handoff.duration" && Activity.Current?.TraceId == parent.TraceId)
+            {
+                durations.Add((value, tags.ToArray()));
+            }
+        });
+        metrics.Start();
+
+        using var recipient = new JitRecipientKey(PrivateKey(RecipientPoint, 1), BootNonce);
+        var offer = JitOfferCryptography.Seal(VectorOffer().Binding, recipient.Hello, EncodedJit, Clock);
+        using var opened = recipient.Open(offer, Identity, Clock);
+        var tampered = offer with { Tag = FlipFirstByte(offer.Tag) };
+        Assert.Throws<AuthenticationTagMismatchException>(() => recipient.Open(tampered, Identity, Clock));
+        sample = false;
+        Assert.Throws<CryptographicException>(() => recipient.Open(offer, Identity, new FixedClock(Expiry)));
+
+        (string Operation, string Outcome)[] expected = [("seal", "success"), ("open", "success"), ("open", "rejected"), ("open", "expired")];
+        Assert.Equal(expected[..3].Select(item => "scaleset.aws.handoff." + item.Operation), spans.Select(span => span.OperationName));
+        for (int index = 0; index < spans.Count; index++)
+        {
+            Assert.Equal(parent.SpanId, spans[index].ParentSpanId);
+            AssertTags(spans[index].TagObjects, expected[index]);
+        }
+        Assert.Equal(expected.Length, operations.Count);
+        Assert.Equal(expected.Length, durations.Count);
+        for (int index = 0; index < expected.Length; index++)
+        {
+            Assert.Equal(1, operations[index].Value);
+            Assert.True(double.IsFinite(durations[index].Value) && durations[index].Value >= 0);
+            AssertTags(operations[index].Tags, expected[index]);
+            AssertTags(durations[index].Tags, expected[index]);
+        }
+
+        static void AssertTags(IEnumerable<KeyValuePair<string, object?>> tags, (string Operation, string Outcome) expected) =>
+            Assert.Collection(tags,
+                item => Assert.Equal(new KeyValuePair<string, object?>("operation", expected.Operation), item),
+                item => Assert.Equal(new KeyValuePair<string, object?>("outcome", expected.Outcome), item));
     }
 
     [Fact]

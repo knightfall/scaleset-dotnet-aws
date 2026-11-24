@@ -1,3 +1,5 @@
+using System.Diagnostics;
+using System.Diagnostics.Metrics;
 using System.Net;
 using System.Net.Sockets;
 using System.Text;
@@ -5,6 +7,7 @@ using System.Text.Json;
 using Amazon.DynamoDBv2;
 using Amazon.Runtime;
 using Amazon.SecurityToken;
+using Knightfall.ScaleSet.Aws.Core.Configuration;
 using Knightfall.ScaleSet.Aws.Core.Lifecycle;
 using Knightfall.ScaleSet.Aws.DynamoDb;
 using Knightfall.ScaleSet.Aws.Handoff;
@@ -160,6 +163,28 @@ public sealed class Ec2BootstrapTests
     public async Task OnlyTheAuthenticConsumedOfferLaunchesAndAReconstructedSupervisorCannotRepeatIt(string condition)
     {
         var cancellation = TestContext.Current.CancellationToken;
+        using var trace = new Activity("fixture").SetIdFormat(ActivityIdFormat.W3C).Start();
+        var metrics = new List<(string Instrument, KeyValuePair<string, object?>[] Tags)>();
+        using var listener = new MeterListener
+        {
+            InstrumentPublished = (instrument, listener) =>
+            {
+                if (instrument.Meter.Name == "Knightfall.ScaleSet.Aws.RunnerBootstrap" &&
+                    instrument.Name is "scaleset.aws.handoff.operations" or "scaleset.aws.startup.observations")
+                {
+                    listener.EnableMeasurementEvents(instrument);
+                }
+            },
+        };
+        listener.SetMeasurementEventCallback<long>((instrument, _, tags, _) =>
+        {
+            if (Activity.Current?.TraceId == trace.TraceId)
+            {
+                metrics.Add((instrument.Name, tags.ToArray()));
+            }
+        });
+        listener.Start();
+
         using var table = await MiniStackTable.CreateAsync(cancellation);
         var clock = new FixtureClock();
         var identity = new JitHandoffIdentity(Target.Deployment, Target.ProfileId, Target.ScopeIdentity, Target.ScaleSetId!.Value,
@@ -176,7 +201,8 @@ public sealed class Ec2BootstrapTests
         }
         var runner = new FixtureRunner();
         OneJobBootstrap Bootstrap() => new(new DynamoDbBootstrapOfferClient(table.Client, table.Name, Principal, Arn, clock),
-            Target, Arn, Principal, Reserve, runner, clock, TimeSpan.FromSeconds(15), TimeSpan.FromMilliseconds(30), ObserveAsync);
+            Target, Arn, Principal, Reserve, runner, clock, TimeSpan.FromSeconds(15), TimeSpan.FromMilliseconds(30), ObserveAsync,
+            telemetryProvider: RunnerProvisionerType.Ec2);
         var observed = new List<bool>();
         var status = new DynamoDbEc2BootstrapStatusClient(table.Client, table.Name, Principal, Arn, clock);
         async Task ObserveAsync(BootstrapRunnerObservation observation, CancellationToken token)
@@ -257,6 +283,35 @@ public sealed class Ec2BootstrapTests
         int requests = table.Wire.Requests.Count;
         Assert.Equal(RunnerBootstrapOutcome.AlreadySpent, await Bootstrap().RunAsync(cancellation));
         Assert.Equal(requests, table.Wire.Requests.Count);
+
+        var result = condition switch
+        {
+            "valid" => ("success", "offer_authenticated"),
+            "bad-target" => ("rejected", "binding_mismatch"),
+            "tampered" => ("rejected", "authentication_failed"),
+            "expires-in-flight" => ("expired", "receipt_expired"),
+            _ => ("unknown", "receipt_unknown"),
+        };
+        var handoff = metrics.Where(item => item.Instrument == "scaleset.aws.handoff.operations").ToArray();
+        Assert.Collection(handoff,
+            first => AssertTags(first.Tags, "bootstrap-consume", result.Item1, result.Item2),
+            second => AssertTags(second.Tags, "bootstrap-consume", "deferred", "already_spent"));
+        var startupMetrics = metrics.Where(item => item.Instrument == "scaleset.aws.startup.observations").ToArray();
+        if (condition == "valid")
+        {
+            AssertTags(Assert.Single(startupMetrics).Tags, "runner-listen", "success", "listener_connected");
+        }
+        else
+        {
+            Assert.Empty(startupMetrics);
+        }
+
+        static void AssertTags(KeyValuePair<string, object?>[] tags, string operation, string outcome, string reason) =>
+            Assert.Collection(tags,
+                item => Assert.Equal(new KeyValuePair<string, object?>("operation", operation), item),
+                item => Assert.Equal(new KeyValuePair<string, object?>("outcome", outcome), item),
+                item => Assert.Equal(new KeyValuePair<string, object?>("reason", reason), item),
+                item => Assert.Equal(new KeyValuePair<string, object?>("provider", "ec2"), item));
     }
 
     [Fact]

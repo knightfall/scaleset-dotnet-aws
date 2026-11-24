@@ -21,11 +21,12 @@ public sealed partial class DynamoDbLifecycleStore
         JitOfferCryptography.ValidateEnvelope(offer);
         var profile = catalog.Profile;
         RequireProfileLease(profile, lease.Fence);
+        using var telemetry = DynamoDbDiagnostics.StartHandoff("offer.publish", _timeProvider);
 
         var now = _timeProvider.GetUtcNow();
         if (lease.Mode != ControllerLeaseMode.Active)
         {
-            return new JitHandoffChange(LifecycleWriteOutcome.LeaseRejected);
+            return telemetry.Complete(new JitHandoffChange(LifecycleWriteOutcome.LeaseRejected));
         }
         if (handoff.State != JitHandoffState.Staged || !MatchesJitCatalog(catalog, handoff.Identity) ||
             !MatchesJitRequest(attempt.Entry.Envelope, handoff) || attempt.Entry.State != EffectState.Executing ||
@@ -35,13 +36,13 @@ public sealed partial class DynamoDbLifecycleStore
             !offer.Binding.BootNonce.AsSpan().SequenceEqual(handoff.Hello.BootNonce.AsSpan()) ||
             offer.Binding.ExpiresAtUnixMilliseconds <= now.ToUnixTimeMilliseconds())
         {
-            return new JitHandoffChange(LifecycleWriteOutcome.Conflict);
+            return telemetry.Complete(new JitHandoffChange(LifecycleWriteOutcome.Conflict));
         }
         var executor = await ReadExecutorAsync(profile, handoff.Identity.AllocationId.ToString("D"), cancellationToken).ConfigureAwait(false);
         if (executor is null || !MatchesJitExecutor(executor, handoff.Identity) || !MatchesJitProvider(catalog, executor) ||
             executor.State is not { AdmissionClosure: null, HasConflict: false, Resource.State: ExecutorResourceState.Running })
         {
-            return new JitHandoffChange(LifecycleWriteOutcome.Conflict);
+            return telemetry.Complete(new JitHandoffChange(LifecycleWriteOutcome.Conflict));
         }
 
         var offerKey = LifecycleKey.Offer(handoff.Identity.AwsUserId);
@@ -68,9 +69,9 @@ public sealed partial class DynamoDbLifecycleStore
         };
         if (!await AddJitRunnerAssociationAsync(actions, executor, runnerId, next.TransitionId, cancellationToken).ConfigureAwait(false))
         {
-            return new JitHandoffChange(LifecycleWriteOutcome.Conflict);
+            return telemetry.Complete(new JitHandoffChange(LifecycleWriteOutcome.Conflict));
         }
-        return await CommitJitHandoffChangeAsync(profile, next, actions, cancellationToken).ConfigureAwait(false);
+        return telemetry.Complete(await CommitJitHandoffChangeAsync(profile, next, actions, cancellationToken).ConfigureAwait(false));
     }
 
     public async Task<JitHandoffChange> RecordUnissuedJitAsync(
@@ -140,19 +141,20 @@ public sealed partial class DynamoDbLifecycleStore
         ArgumentNullException.ThrowIfNull(handoff);
         var profile = new LifecycleProfile(handoff.Identity.Deployment, handoff.Identity.ProfileId);
         RequireProfileLease(profile, lease.Fence);
+        using var telemetry = DynamoDbDiagnostics.StartHandoff("offer.revoke", _timeProvider);
         if (lease.Mode != ControllerLeaseMode.Active)
         {
-            return new JitHandoffChange(LifecycleWriteOutcome.LeaseRejected);
+            return telemetry.Complete(new JitHandoffChange(LifecycleWriteOutcome.LeaseRejected));
         }
         var current = await ReadJitHandoffAsync(profile, handoff.Identity.AllocationId, cancellationToken).ConfigureAwait(false);
         if (current is { State: JitHandoffState.Revoked, OfferSha256: not null } && current.Identity == handoff.Identity &&
             current.OfferSha256 == handoff.OfferSha256 && current.JitAttemptId == handoff.JitAttemptId)
         {
-            return new JitHandoffChange(LifecycleWriteOutcome.Committed, current);
+            return telemetry.Complete(new JitHandoffChange(LifecycleWriteOutcome.Committed, current));
         }
         if (handoff.State != JitHandoffState.Offered || !MatchesHandoff(handoff, current))
         {
-            return new JitHandoffChange(LifecycleWriteOutcome.Conflict);
+            return telemetry.Complete(new JitHandoffChange(LifecycleWriteOutcome.Conflict));
         }
 
         var key = LifecycleKey.Offer(handoff.Identity.AwsUserId);
@@ -181,8 +183,8 @@ public sealed partial class DynamoDbLifecycleStore
             },
         });
         // Revocation removes the offer. The counted handoff remains until the executor and registration have been reconciled.
-        return await CommitJitHandoffChangeAsync(profile, next,
-            [LeaseCondition(lease.Fence), WriteExactJitHandoff(profile, handoff, next), delete], cancellationToken).ConfigureAwait(false);
+        return telemetry.Complete(await CommitJitHandoffChangeAsync(profile, next,
+            [LeaseCondition(lease.Fence), WriteExactJitHandoff(profile, handoff, next), delete], cancellationToken).ConfigureAwait(false));
     }
 
     public async Task<JitHandoffChange> CompleteTerminatedJitHandoffAsync(

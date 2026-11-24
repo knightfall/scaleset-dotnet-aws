@@ -1,6 +1,6 @@
 # OpenTelemetry integration plan
 
-Status: implementation specification for [T19 / #20](https://github.com/knightfall/scaleset-dotnet-aws/issues/20), with host, deployment, and qualification work in T20, T21, T25, and T26. This document expands the [T19 task](tasks/M5-cdk-packaging-matrix.md#t19-implement-opentelemetry-tracing-metrics-and-otlp-logging); it does not claim that telemetry is implemented. The existing task dependency graph remains unchanged.
+Implementation specification for [T19 / #20](https://github.com/knightfall/scaleset-dotnet-aws/issues/20), with host, deployment, and qualification work in T20, T21, T25, and T26. This document expands the [T19 task](tasks/M5-cdk-packaging-matrix.md#t19-implement-opentelemetry-tracing-metrics-and-otlp-logging). The linked issues record task status and verification evidence.
 
 ## Outcomes and scope
 
@@ -67,7 +67,7 @@ Span names use a stable `scaleset.aws.` prefix and operation names, never resour
 | Handoff and bootstrap | Offer publish/consume/revoke, expiry and rejection, and startup observations with their evidence source. No JIT, key material, ciphertext, nonce, or signed metadata payload. |
 | Event processing | SQS receive/process/delete, duplicate/out-of-order handling and event age; no raw EventBridge/SQS body or receipt handle. |
 
-Define the AWS metric catalog in code and operator documentation. The following names are the planned minimum, all prefixed `scaleset.aws.`. Counts use explicit units such as `{runner}`, `{operation}`, or `{page}`; all durations use `s`.
+The [controller metric catalog](telemetry-metrics.md) gives the units and observed boundaries. The following names are required, all prefixed `scaleset.aws.`. Counts use explicit units such as `{runner}`, `{operation}`, or `{page}`. All durations use `s`.
 
 | Instrument suffix | Kind | Meaning |
 | --- | --- | --- |

@@ -13,9 +13,10 @@ public sealed partial class DynamoDbEffectDispatcher
         ArgumentNullException.ThrowIfNull(clockEvidence);
         ArgumentNullException.ThrowIfNull(profile);
         ArgumentNullException.ThrowIfNull(provider);
+        using var telemetry = DynamoDbDiagnostics.Start("fargate-replay", cancellationToken);
         if (expected.Mode != ControllerLeaseMode.Active || expected.Deployment != profile.Deployment || ownershipLost.IsCancellationRequested)
         {
-            return EffectDispatchStatus.OwnershipUnavailable;
+            return telemetry.Complete(EffectDispatchStatus.OwnershipUnavailable, "ownership");
         }
 
         using var owner = CancellationTokenSource.CreateLinkedTokenSource(ownershipLost, cancellationToken);
@@ -23,7 +24,7 @@ public sealed partial class DynamoDbEffectDispatcher
         var lease = await ReadCurrentLeaseAsync(expected, token).ConfigureAwait(false);
         if (lease is null || Window(lease, clockEvidence) is not { } readWindow)
         {
-            return EffectDispatchStatus.OwnershipUnavailable;
+            return telemetry.Complete(EffectDispatchStatus.OwnershipUnavailable, "ownership");
         }
         var previous = await _journal.ReadAsync(profile, intentId, token).ConfigureAwait(false);
         if (previous is not { Entry.State: EffectState.Executing or EffectState.Uncertain, Entry.Attempt: { } attempt,
@@ -31,11 +32,11 @@ public sealed partial class DynamoDbEffectDispatcher
                 Entry.Envelope: { Request: FargateLaunchEffectRequest { OwnershipTags: not null } request, ProviderReplayDeadline: { } cutoff } envelope } ||
             envelope.IntentId != EffectIntentIdentity.ForAllocation(request))
         {
-            return EffectDispatchStatus.NotPlanned;
+            return telemetry.Complete(EffectDispatchStatus.NotPlanned, "journal_state");
         }
         if (attempt.LeaseEpoch != lease.Epoch)
         {
-            return EffectDispatchStatus.OwnershipUnavailable;
+            return telemetry.Complete(EffectDispatchStatus.OwnershipUnavailable, "ownership");
         }
 
         var observedAfter = _clock.GetUtcNow();
@@ -44,12 +45,13 @@ public sealed partial class DynamoDbEffectDispatcher
         if (probe is not { IsComplete: true } || probe.EnvelopeSha256 != envelope.Sha256 || probe.Target != envelope.Target ||
             !IsCurrentObservation(probe.ObservedAt, observedAfter, _clock.GetUtcNow()))
         {
-            return EffectDispatchStatus.AwaitingEvidence;
+            return telemetry.Complete(EffectDispatchStatus.AwaitingEvidence, "incomplete_readback");
         }
         if (probe.Evidence is { } evidence)
         {
             var settled = await ResolveObservedAsync(lease, clockEvidence, previous, evidence, observedAfter, token).ConfigureAwait(false);
-            return settled == LifecycleWriteOutcome.Committed ? EffectDispatchStatus.Settled : EffectDispatchStatus.AwaitingEvidence;
+            return telemetry.Complete(settled == LifecycleWriteOutcome.Committed ? EffectDispatchStatus.Settled :
+                EffectDispatchStatus.AwaitingEvidence, "readback");
         }
 
         var index = await _store.ReadEffectIndexAsync(profile, token).ConfigureAwait(false);
@@ -60,15 +62,15 @@ public sealed partial class DynamoDbEffectDispatcher
         var now = _clock.GetUtcNow();
         if (lease is null || Window(lease, clockEvidence) is not { } sendWindow)
         {
-            return EffectDispatchStatus.OwnershipUnavailable;
+            return telemetry.Complete(EffectDispatchStatus.OwnershipUnavailable, "ownership");
         }
         if (!ReadyIndex(index, lease))
         {
-            return EffectDispatchStatus.RebuildRequired;
+            return telemetry.Complete(EffectDispatchStatus.RebuildRequired, "index_rebuild");
         }
         if (catalog is null || !DynamoDbLifecycleStore.MatchesFargateLaunchCatalog(catalog, envelope, request) || executor is not null)
         {
-            return EffectDispatchStatus.Ineligible;
+            return telemetry.Complete(EffectDispatchStatus.Ineligible, "allocation_guard");
         }
 
         var lower = now - clockEvidence.MaximumAbsoluteSkew;
@@ -81,20 +83,23 @@ public sealed partial class DynamoDbEffectDispatcher
         if (probe.ObservedAt - clockEvidence.MaximumAbsoluteSkew < previousDeadline || lower < previousDeadline ||
             lower > sendWindow.UpperUtcNow || deadline <= sendWindow.UpperUtcNow)
         {
-            return EffectDispatchStatus.AwaitingEvidence;
+            return telemetry.Complete(EffectDispatchStatus.AwaitingEvidence, "replay_window");
         }
 
         var guard = new EffectDispatchGuard(catalog, index!, allocation, null);
         var begun = await _journal.BeginFargateReplayAsync(lease, previous, lower, sendWindow.UpperUtcNow, deadline,
             _timing.WriteReserve, guard, token).ConfigureAwait(false);
-        return begun.Permission is { } permission
-            ? await SendAsync(lease, clockEvidence, guard, permission, provider, token).ConfigureAwait(false)
-            : begun.Outcome switch
-            {
-                LifecycleWriteOutcome.Conflict => EffectDispatchStatus.Conflict,
-                LifecycleWriteOutcome.LeaseRejected => EffectDispatchStatus.OwnershipUnavailable,
-                LifecycleWriteOutcome.RebuildRequired => EffectDispatchStatus.RebuildRequired,
-                _ => EffectDispatchStatus.AwaitingEvidence,
-            };
+        if (begun.Permission is { } permission)
+        {
+            var result = await SendAsync(lease, clockEvidence, guard, permission, provider, token).ConfigureAwait(false);
+            return telemetry.Complete(result, permission.HasStartedSending ? "resend_authorized" : "resend_suppressed");
+        }
+        return telemetry.Complete(begun.Outcome switch
+        {
+            LifecycleWriteOutcome.Conflict => EffectDispatchStatus.Conflict,
+            LifecycleWriteOutcome.LeaseRejected => EffectDispatchStatus.OwnershipUnavailable,
+            LifecycleWriteOutcome.RebuildRequired => EffectDispatchStatus.RebuildRequired,
+            _ => EffectDispatchStatus.AwaitingEvidence,
+        }, "guarded_begin");
     }
 }

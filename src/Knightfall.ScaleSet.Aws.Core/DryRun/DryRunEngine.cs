@@ -1,6 +1,7 @@
 using System.Collections.Immutable;
 using Knightfall.ScaleSet.Aws.Core.Configuration;
 using Knightfall.ScaleSet.Aws.Core.Planning;
+using Knightfall.ScaleSet.Aws.Core.Telemetry;
 
 namespace Knightfall.ScaleSet.Aws.Core.DryRun;
 
@@ -105,14 +106,18 @@ public static class DryRunEngine
         foreach (RunnerProfile profile in configuration.Profiles)
         {
             var observation = observations.GetValueOrDefault(profile.Id);
+            using var diagnostics = ReconciliationDiagnostics.Start(TelemetryProfile.From(profile), dryRun: true);
             try
             {
                 var plan = CapacityPlanner.Plan(profile, observation.Demand, observation.Inventory, clock);
+                var (outcome, reason) = CapacityPlanner.TelemetryOutcome(profile, plan);
+                diagnostics?.Complete(outcome, reason);
                 reports.Add(new DryRunProfileReport(profile.Id, profile.State, profile.Provisioner.Type,
                     observation.Demand?.ObservedAt, observation.Inventory?.ObservedAt, plan));
             }
             catch (ArgumentException)
             {
+                diagnostics?.Complete("rejected", "invalid_evidence");
                 throw new DryRunEvidenceException("Capacity observations contain invalid counts, slot identities, or timestamps.");
             }
         }

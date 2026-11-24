@@ -7,13 +7,15 @@ using Serilog.Parsing;
 
 namespace Knightfall.ScaleSet.Aws.Controller.Telemetry;
 
-internal sealed class SafeTelemetryLogSink(TelemetryPrivacy privacy, TelemetryExportState state, ILogEventSink? console) : ILogEventSink, IDisposable
+internal sealed class SafeTelemetryLogSink(TelemetryPrivacy privacy, TelemetryExportState state, ILogEventSink? console,
+    CancellationToken deadline) : ILogEventSink, IDisposable
 {
     internal const int PendingLogs = 2_048;
     internal const int LogBatchSize = 128;
     private static readonly MessageTemplate OperationTemplate = new MessageTemplateParser().Parse(TelemetryNames.EventTemplate);
     private static readonly MessageTemplate OtherTemplate = new MessageTemplateParser().Parse("Controller diagnostic event");
-    private readonly ILogEventSink _console = console ?? LoggerSinkConfiguration.CreateSink(configuration => configuration.Console(formatProvider: CultureInfo.InvariantCulture));
+    private readonly ConsoleTelemetryQueue _console = new(console ??
+        LoggerSinkConfiguration.CreateSink(configuration => configuration.Console(formatProvider: CultureInfo.InvariantCulture)), deadline);
     private ILogEventSink? _remote;
     private int _pending;
     private int _stopped;
@@ -22,7 +24,13 @@ internal sealed class SafeTelemetryLogSink(TelemetryPrivacy privacy, TelemetryEx
 
     internal void Release(int records) => Interlocked.Add(ref _pending, -records);
 
-    internal void Stop() => Volatile.Write(ref _stopped, 1);
+    internal Task<bool> ConsoleCompletion => _console.Completion;
+
+    internal void Stop()
+    {
+        Volatile.Write(ref _stopped, 1);
+        _console.Stop();
+    }
 
     public void Emit(LogEvent logEvent)
     {
@@ -32,7 +40,10 @@ internal sealed class SafeTelemetryLogSink(TelemetryPrivacy privacy, TelemetryEx
             return;
         }
         var safeEvent = Sanitize(logEvent, category);
-        _console.Emit(safeEvent);
+        if (!_console.TryWrite(safeEvent))
+        {
+            state.ReportConsoleDrop();
+        }
         if (_remote is null)
         {
             return;
@@ -49,14 +60,7 @@ internal sealed class SafeTelemetryLogSink(TelemetryPrivacy privacy, TelemetryEx
     public void Dispose()
     {
         Stop();
-        try
-        {
-            (_remote as IDisposable)?.Dispose();
-        }
-        finally
-        {
-            (_console as IDisposable)?.Dispose();
-        }
+        (_remote as IDisposable)?.Dispose();
     }
 
     private LogEvent Sanitize(LogEvent log, string category)

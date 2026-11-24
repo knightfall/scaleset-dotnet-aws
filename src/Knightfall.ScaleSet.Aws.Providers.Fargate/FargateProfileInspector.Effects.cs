@@ -5,6 +5,7 @@ using Amazon.ECS.Model;
 using Knightfall.ScaleSet.Aws.Core.Catalog;
 using Knightfall.ScaleSet.Aws.Core.Configuration;
 using Knightfall.ScaleSet.Aws.Core.Lifecycle;
+using Knightfall.ScaleSet.Aws.Core.Telemetry;
 using EcsTask = Amazon.ECS.Model.Task;
 using EcsNetwork = Amazon.ECS.Model.NetworkConfiguration;
 
@@ -109,6 +110,8 @@ public sealed partial class FargateProfileInspector
     private sealed class EffectProvider(FargateProfileInspector inspector, RuntimeConfiguration configuration,
         LifecycleProfile profile, InspectionTarget target, FargateContainerApproval approval) : IFargateReplayEffectProvider
     {
+        private readonly TelemetryProfile? _telemetryProfile = TelemetryProfile.From(target.Profile);
+
         public async Task<EffectDispatchPrecondition?> CheckAsync(EffectEnvelope envelope, CatalogBinding binding,
             CancellationToken cancellationToken)
         {
@@ -205,17 +208,20 @@ public sealed partial class FargateProfileInspector
                 return null;
             }
 
+            using var operation = FargateDiagnostics.Start("launch_readback", _telemetryProfile, cancellationToken);
             // Observation follows the immutable original allocation, including after a compatible rollout changes its cluster or network.
             var historic = new InventoryTarget(target.Scope with { ClusterArn = launch.ClusterArn, TaskDefinitionArn = launch.TaskDefinitionArn },
                 tags.BootstrapProtocol, launch.RunnerContainer, launch.SubnetIds);
             var snapshot = await inspector.ReadInventoryAsync(historic, launch.AllocationId, cancellationToken).ConfigureAwait(false);
             if (!snapshot.IsComplete)
             {
+                operation?.Complete("unknown", "inventory_incomplete");
                 return new FargateReplayObservation(envelope.Sha256, envelope.Target, snapshot.ObservedAt, IsComplete: false);
             }
 
             var observedAt = inspector._clock.GetUtcNow();
             var evidence = snapshot.Tasks is [{ IsOwned: true } task] ? Evidence(envelope, snapshot.Scope, task, observedAt) : null;
+            operation?.Complete(evidence is null ? "unknown" : "success", evidence is null ? "no_exact_task" : "exact_observation");
             return new FargateReplayObservation(envelope.Sha256, envelope.Target, snapshot.ObservedAt,
                 IsComplete: evidence is not null || snapshot.Tasks.IsEmpty, evidence);
         }
@@ -242,6 +248,7 @@ public sealed partial class FargateProfileInspector
         private async Task<EffectEvidence?> SendLaunchAsync(EffectEnvelope envelope, FargateLaunchEffectRequest request,
             CancellationToken cancellationToken)
         {
+            using var operation = FargateDiagnostics.Start("run_task", _telemetryProfile, cancellationToken);
             var tags = request.OwnershipTags!;
             // v1 starts the exact preflight-approved command from the pinned definition, with no runtime overrides.
             var reply = await inspector._ecs.RunTaskAsync(new RunTaskRequest
@@ -275,30 +282,39 @@ public sealed partial class FargateProfileInspector
             if (reply.Failures is { Count: > 0 } || reply.Tasks is not [{ TaskArn: { } arn } returned] ||
                 (returned.ClusterArn is not null && returned.ClusterArn != target.Scope.ClusterArn))
             {
+                operation?.Complete("unknown", "no_exact_task");
                 return null;
             }
             var launched = target.Inventory with { SubnetIds = request.SubnetIds };
             var observed = await ReadOwnedTaskAsync(launched, arn, request.AllocationId, cancellationToken).ConfigureAwait(false);
-            return observed is { } exact ? Evidence(envelope, target.Scope, exact.Task, exact.ObservedAt) : null;
+            var evidence = observed is { } exact ? Evidence(envelope, target.Scope, exact.Task, exact.ObservedAt) : null;
+            operation?.Complete(evidence is null ? "unknown" : "success", evidence is null ? "no_exact_task" : "exact_observation");
+            return evidence;
         }
 
         private async Task<EffectEvidence?> SendStopAsync(EffectEnvelope envelope, FargateStopEffectRequest request,
             CancellationToken cancellationToken)
         {
+            using var operation = FargateDiagnostics.Start("stop_task", _telemetryProfile, cancellationToken);
             _ = await inspector._ecs.StopTaskAsync(new StopTaskRequest
             {
                 Cluster = request.ClusterArn,
                 Task = request.TaskArn,
             }, cancellationToken).ConfigureAwait(false);
-            return await ObserveStopAsync(envelope, target.Inventory, request, cancellationToken).ConfigureAwait(false);
+            var evidence = await ObserveStopAsync(envelope, target.Inventory, request, cancellationToken).ConfigureAwait(false);
+            operation?.Complete(evidence is null ? "unknown" : "success", evidence is null ? "no_exact_terminal_state" : "exact_terminal_state");
+            return evidence;
         }
 
         private async Task<EffectEvidence?> ObserveStopAsync(EffectEnvelope envelope, InventoryTarget inventory, FargateStopEffectRequest request,
             CancellationToken cancellationToken)
         {
+            using var operation = FargateDiagnostics.Start("stop_readback", _telemetryProfile, cancellationToken);
             var observed = await ReadOwnedTaskAsync(inventory, request.TaskArn, request.AllocationId, cancellationToken).ConfigureAwait(false);
-            return observed is { Task.State: FargateTaskState.Stopped } exact && exact.Task.Incarnation == request.Incarnation
+            var evidence = observed is { Task.State: FargateTaskState.Stopped } exact && exact.Task.Incarnation == request.Incarnation
                 ? Evidence(envelope, inventory.Scope, exact.Task, exact.ObservedAt) : null;
+            operation?.Complete(evidence is null ? "unknown" : "success", evidence is null ? "no_exact_terminal_state" : "exact_terminal_state");
+            return evidence;
         }
 
         private async Task<OwnedTask?> ReadOwnedTaskAsync(InventoryTarget inventory, string taskArn, Guid allocation,

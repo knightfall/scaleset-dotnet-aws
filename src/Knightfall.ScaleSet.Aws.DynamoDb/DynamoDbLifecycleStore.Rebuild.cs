@@ -56,6 +56,16 @@ public sealed partial class DynamoDbLifecycleStore
         LifecycleProfile profile, DeploymentLeaseFence lease, CancellationToken cancellationToken)
     {
         RequireProfileLease(profile, lease);
+        using var telemetry = DynamoDbDiagnostics.Start("effect-rebuild", cancellationToken);
+        var result = await AdvanceEffectRebuildCoreAsync(profile, lease, cancellationToken).ConfigureAwait(false);
+        telemetry.Complete(result.Outcome);
+        DynamoDbDiagnostics.RecordRebuild(result);
+        return result;
+    }
+
+    private async Task<EffectRebuildPass> AdvanceEffectRebuildCoreAsync(
+        LifecycleProfile profile, DeploymentLeaseFence lease, CancellationToken cancellationToken)
+    {
         var head = await ReadEffectIndexAsync(profile, cancellationToken).ConfigureAwait(false);
         if (head is { State: EffectIndexState.Ready } && MatchesLease(head, lease))
         {

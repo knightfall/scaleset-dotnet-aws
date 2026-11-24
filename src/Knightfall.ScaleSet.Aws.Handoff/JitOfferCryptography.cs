@@ -44,6 +44,7 @@ public static class JitOfferCryptography
         ECDiffieHellman ephemeral, ReadOnlySpan<byte> nonce)
     {
         ArgumentNullException.ThrowIfNull(timeProvider);
+        using var diagnostics = new JitCryptographyDiagnostics.Operation("seal", timeProvider);
         ValidateHello(hello);
         JitOfferEncoding.ValidateBinding(binding);
         if (!binding.BootNonce.AsSpan().SequenceEqual(hello.BootNonce.AsSpan()) ||
@@ -51,7 +52,7 @@ public static class JitOfferCryptography
         {
             throw new CryptographicException("The JIT offer cannot be sealed.");
         }
-        RequireFresh(binding, timeProvider);
+        RequireFresh(binding, timeProvider, diagnostics);
 
         var publicKey = P256PublicKey.Export(ephemeral);
         var aad = JitOfferEncoding.EncodeAuthenticatedData(binding);
@@ -69,6 +70,7 @@ public static class JitOfferCryptography
             CryptographicOperations.ZeroMemory(key);
         }
 
+        diagnostics.Complete();
         return new JitOfferEnvelope(binding, ImmutableArray.CreateRange(publicKey), ImmutableArray.Create(nonce),
             ImmutableArray.CreateRange(ciphertext), ImmutableArray.Create<byte>(tag));
     }
@@ -77,12 +79,13 @@ public static class JitOfferCryptography
         JitOfferEnvelope envelope, JitHello hello, ECDiffieHellman privateKey, TimeProvider timeProvider)
     {
         ArgumentNullException.ThrowIfNull(timeProvider);
+        using var diagnostics = new JitCryptographyDiagnostics.Operation("open", timeProvider);
         ValidateEnvelope(envelope);
         if (!envelope.Binding.BootNonce.AsSpan().SequenceEqual(hello.BootNonce.AsSpan()))
         {
             throw JitOfferEncoding.InvalidBinding();
         }
-        RequireFresh(envelope.Binding, timeProvider);
+        RequireFresh(envelope.Binding, timeProvider, diagnostics);
 
         var aad = JitOfferEncoding.EncodeAuthenticatedData(envelope.Binding);
         var ephemeral = envelope.EphemeralPublicKey.AsSpan();
@@ -93,7 +96,8 @@ public static class JitOfferCryptography
             DeriveKey(privateKey, ephemeral, hello.RecipientPublicKey.AsSpan(), ephemeral, aad, key);
             using var gcm = new AesGcm(key, TagBytes);
             gcm.Decrypt(envelope.Nonce.AsSpan(), envelope.Ciphertext.AsSpan(), envelope.Tag.AsSpan(), plaintext, aad);
-            RequireFresh(envelope.Binding, timeProvider);
+            RequireFresh(envelope.Binding, timeProvider, diagnostics);
+            diagnostics.Complete();
             return new JitPlaintext(plaintext);
         }
         catch
@@ -134,10 +138,11 @@ public static class JitOfferCryptography
         }
     }
 
-    private static void RequireFresh(JitOfferBinding binding, TimeProvider timeProvider)
+    private static void RequireFresh(JitOfferBinding binding, TimeProvider timeProvider, JitCryptographyDiagnostics.Operation diagnostics)
     {
         if (timeProvider.GetUtcNow().ToUnixTimeMilliseconds() >= binding.ExpiresAtUnixMilliseconds)
         {
+            diagnostics.MarkExpired();
             throw new CryptographicException("The JIT offer has expired.");
         }
     }

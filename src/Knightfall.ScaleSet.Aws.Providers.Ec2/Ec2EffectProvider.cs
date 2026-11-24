@@ -8,6 +8,7 @@ using Amazon.SecurityToken;
 using Knightfall.ScaleSet.Aws.Core.Catalog;
 using Knightfall.ScaleSet.Aws.Core.Configuration;
 using Knightfall.ScaleSet.Aws.Core.Lifecycle;
+using Knightfall.ScaleSet.Aws.Core.Telemetry;
 
 namespace Knightfall.ScaleSet.Aws.Providers.Ec2;
 
@@ -21,6 +22,7 @@ public sealed partial class Ec2EffectProvider : IReconciliationEffectProvider, I
     private readonly Ec2ProfileInspector _inspector;
     private readonly TimeProvider _clock;
     private readonly string _instanceArnPrefix;
+    private readonly TelemetryProfile? _telemetryProfile;
 
     public Ec2EffectProvider(RuntimeConfiguration configuration, LifecycleProfile profile, AWSCredentials credentials,
         AmazonEC2Config ec2, AmazonIdentityManagementServiceConfig iam, AmazonSecurityTokenServiceConfig sts, TimeProvider clock)
@@ -30,7 +32,7 @@ public sealed partial class Ec2EffectProvider : IReconciliationEffectProvider, I
         ArgumentNullException.ThrowIfNull(ec2);
         if (configuration.Mode != ControllerMode.Active || RunnerOwnershipTags.DeploymentIdentity(configuration) != profile.Deployment ||
             configuration.Profiles.SingleOrDefault(item => item.Id == profile.ProfileId) is not
-                { State: RunnerProfileState.Active or RunnerProfileState.Draining, Provisioner: Ec2ProvisionerConfiguration provisioner })
+                { State: RunnerProfileState.Active or RunnerProfileState.Draining, Provisioner: Ec2ProvisionerConfiguration provisioner } configured)
         {
             throw new ArgumentException("EC2 effects require the exact enabled profile of an active controller.", nameof(profile));
         }
@@ -44,6 +46,7 @@ public sealed partial class Ec2EffectProvider : IReconciliationEffectProvider, I
         _configuration = configuration;
         _profile = profile;
         _provisioner = provisioner;
+        _telemetryProfile = TelemetryProfile.From(configured);
         _clock = clock;
         string partition = provisioner.BootstrapRoleArn.Split(':')[1];
         _instanceArnPrefix = $"arn:{partition}:ec2:{configuration.Aws.Region}:{configuration.Aws.Account}:instance/";
@@ -123,6 +126,10 @@ public sealed partial class Ec2EffectProvider : IReconciliationEffectProvider, I
             return new EffectDispatchPrecondition(envelope.Sha256, envelope.Target, _clock.GetUtcNow(), false);
         }
         bool matchesVersion = template.VersionNumber == request.LaunchTemplateVersion;
+        if (!matchesVersion && _provisioner.LaunchTemplateVersion is AliasLaunchTemplateVersion)
+        {
+            Ec2Diagnostics.RecordTemplateDrift(_telemetryProfile, "template_version_changed");
+        }
         bool eligible = matchesVersion &&
             template.InstanceType == request.InstanceType && template.InstanceProfileArn == request.InstanceProfileArn &&
             template.Tenancy == request.Tenancy && template.SecurityGroupIds.Order(StringComparer.Ordinal).SequenceEqual(request.SecurityGroupIds) &&
@@ -198,6 +205,12 @@ public sealed partial class Ec2EffectProvider : IReconciliationEffectProvider, I
     private async Task<EffectEvidence?> SendLaunchAsync(EffectEnvelope envelope, Ec2LaunchEffectRequest request,
         EffectAttempt attempt, CancellationToken cancellationToken)
     {
+        using var operation = Ec2Diagnostics.Start(request.AttemptOrdinal > 0 ? "run_instances_failover" : "run_instances",
+            _telemetryProfile, cancellationToken);
+        if (request.AttemptOrdinal > 0)
+        {
+            Ec2Diagnostics.RecordAzFailover(_telemetryProfile);
+        }
         string instanceId;
         try
         {
@@ -211,17 +224,21 @@ public sealed partial class Ec2EffectProvider : IReconciliationEffectProvider, I
         }
         catch (AmazonEC2Exception error) when (!cancellationToken.IsCancellationRequested && ClassifyRejection(error) is not null)
         {
-            return new EffectEvidence(EffectResolutionKind.Rejected, envelope.Sha256, envelope.Target, _clock.GetUtcNow(), attempt.Id)
+            var rejected = new EffectEvidence(EffectResolutionKind.Rejected, envelope.Sha256, envelope.Target, _clock.GetUtcNow(), attempt.Id)
             {
                 Ec2LaunchRejection = ClassifyRejection(error),
             };
+            Ec2Diagnostics.RecordEffect(operation, rejected);
+            return rejected;
         }
         catch (Exception error) when (Ec2ProfileInspector.IsReadFailure(error, cancellationToken))
         {
             return null;
         }
 
-        return await ObserveLaunchAsync(envelope, request, instanceId, cancellationToken).ConfigureAwait(false);
+        var evidence = await ObserveLaunchAsync(envelope, request, instanceId, cancellationToken).ConfigureAwait(false);
+        Ec2Diagnostics.RecordEffect(operation, evidence);
+        return evidence;
     }
 
     private static Ec2LaunchRejection? ClassifyRejection(AmazonEC2Exception error) =>

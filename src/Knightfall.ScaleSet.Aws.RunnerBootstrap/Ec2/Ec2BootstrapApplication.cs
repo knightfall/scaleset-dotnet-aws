@@ -1,6 +1,7 @@
 using System.Runtime.Versioning;
 using Amazon.DynamoDBv2;
 using Amazon.Runtime;
+using Knightfall.ScaleSet.Aws.Core.Configuration;
 using Knightfall.ScaleSet.Aws.Core.Lifecycle;
 using Knightfall.ScaleSet.Aws.DynamoDb;
 using Knightfall.ScaleSet.Aws.RunnerBootstrap.Linux;
@@ -25,7 +26,7 @@ internal sealed class Ec2BootstrapApplication(Ec2BootstrapSettings settings, Tim
         var spent = new Ec2SpentMarker(settings.SpentDirectory, identity.ResourceArn);
         var bootstrap = new RunnerBootstrap(offers, settings.Target, identity.ResourceArn, identity.AwsUserId, spent.TryReserve,
             new LinuxOneJobRunner(boundary), clock, TimeSpan.FromMinutes(5), TimeSpan.FromSeconds(2),
-            ReportAsync);
+            ReportAsync, telemetryProvider: RunnerProvisionerType.Ec2);
         return await bootstrap.RunAsync(cancellationToken).ConfigureAwait(false);
 
         async Task ReportAsync(BootstrapRunnerObservation observation, CancellationToken token)

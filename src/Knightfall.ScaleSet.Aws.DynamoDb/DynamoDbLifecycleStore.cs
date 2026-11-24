@@ -322,6 +322,7 @@ public sealed partial class DynamoDbLifecycleStore
             }
         }
 
+        using var telemetry = DynamoDbDiagnostics.Start("transaction", default);
         try
         {
             await _client.TransactWriteItemsAsync(new TransactWriteItemsRequest
@@ -329,40 +330,40 @@ public sealed partial class DynamoDbLifecycleStore
                 ClientRequestToken = transitionId.ToString("D"),
                 TransactItems = actions.Select(action => action.Write).ToList(),
             }, cancellationToken).ConfigureAwait(false);
-            return LifecycleWriteOutcome.Committed;
+            return telemetry.Complete(LifecycleWriteOutcome.Committed);
         }
         catch (TransactionCanceledException error)
         {
             if (error.CancellationReasons is not { } reasons || reasons.Count != actions.Count)
             {
-                return LifecycleWriteOutcome.Indeterminate;
+                return telemetry.Complete(LifecycleWriteOutcome.Indeterminate);
             }
             for (int index = 0; index < actions.Count; index++)
             {
                 if (reasons[index].Code == "ConditionalCheckFailed" && actions[index].ConditionFailure is { } failure)
                 {
-                    return failure;
+                    return telemetry.Complete(failure);
                 }
             }
             if (reasons.Any(reason => reason.Code is "ConditionalCheckFailed" or "TransactionConflict") &&
                 reasons.All(reason => reason.Code is "None" or "ConditionalCheckFailed" or "TransactionConflict"))
             {
-                return LifecycleWriteOutcome.Conflict;
+                return telemetry.Complete(LifecycleWriteOutcome.Conflict);
             }
-            return LifecycleWriteOutcome.Indeterminate;
+            return telemetry.Complete(LifecycleWriteOutcome.Indeterminate);
         }
         catch (AmazonServiceException error) when (IsStorageOutage(error) ||
             error.ErrorCode is "TransactionInProgressException" or "IdempotentParameterMismatchException")
         {
-            return LifecycleWriteOutcome.Indeterminate;
+            return telemetry.Complete(LifecycleWriteOutcome.Indeterminate);
         }
         catch (Exception error) when (error is HttpRequestException or IOException or TimeoutException)
         {
-            return LifecycleWriteOutcome.Indeterminate;
+            return telemetry.Complete(LifecycleWriteOutcome.Indeterminate);
         }
         catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
         {
-            return LifecycleWriteOutcome.Indeterminate;
+            return telemetry.Complete(LifecycleWriteOutcome.Indeterminate);
         }
     }
 

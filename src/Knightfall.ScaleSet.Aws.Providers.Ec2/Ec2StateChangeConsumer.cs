@@ -2,6 +2,7 @@ using System.Text.Json;
 using Amazon.SQS;
 using Amazon.SQS.Model;
 using Knightfall.ScaleSet.Aws.Core.Configuration;
+using Knightfall.ScaleSet.Aws.Core.Telemetry;
 
 namespace Knightfall.ScaleSet.Aws.Providers.Ec2;
 
@@ -14,12 +15,19 @@ public sealed class Ec2StateChangeConsumer
     private readonly string _queueUrl;
     private readonly AwsEnvironment _aws;
     private readonly string _instanceArnPrefix;
+    private readonly TimeProvider _clock;
 
     public Ec2StateChangeConsumer(RuntimeConfiguration configuration, IAmazonSQS sqs, string queueUrl)
+        : this(configuration, sqs, queueUrl, TimeProvider.System)
+    {
+    }
+
+    public Ec2StateChangeConsumer(RuntimeConfiguration configuration, IAmazonSQS sqs, string queueUrl, TimeProvider clock)
     {
         ArgumentNullException.ThrowIfNull(configuration);
         ArgumentNullException.ThrowIfNull(sqs);
         ArgumentException.ThrowIfNullOrWhiteSpace(queueUrl);
+        ArgumentNullException.ThrowIfNull(clock);
         var ec2 = configuration.Profiles.FirstOrDefault(profile => profile.State != RunnerProfileState.Disabled &&
             profile.Provisioner is Ec2ProvisionerConfiguration);
         if (configuration.Mode != ControllerMode.Active || ec2 is null)
@@ -34,6 +42,7 @@ public sealed class Ec2StateChangeConsumer
         _sqs = sqs;
         _queueUrl = queueUrl;
         _aws = configuration.Aws;
+        _clock = clock;
         string partition = ec2.Provisioner.BootstrapRoleArn.Split(':')[1];
         _instanceArnPrefix = $"arn:{partition}:ec2:{_aws.Region}:{_aws.Account}:instance/";
     }
@@ -42,31 +51,49 @@ public sealed class Ec2StateChangeConsumer
         Func<Ec2StateChangeHint, CancellationToken, Task<bool>> refresh, CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(refresh);
-        var response = await _sqs.ReceiveMessageAsync(new ReceiveMessageRequest
+        ReceiveMessageResponse response;
+        using (var receive = Ec2Diagnostics.Start("sqs_receive", null, cancellationToken))
         {
-            QueueUrl = _queueUrl,
-            MaxNumberOfMessages = 10,
-            WaitTimeSeconds = 10,
-        }, cancellationToken).ConfigureAwait(false);
+            response = await _sqs.ReceiveMessageAsync(new ReceiveMessageRequest
+            {
+                QueueUrl = _queueUrl,
+                MaxNumberOfMessages = 10,
+                WaitTimeSeconds = 10,
+            }, cancellationToken).ConfigureAwait(false);
+            receive?.Complete("success", response.Messages is { Count: > 0 } ? "batch_received" : "queue_empty");
+        }
 
+        var receivedAt = _clock.GetUtcNow();
         int acknowledged = 0;
         foreach (var message in response.Messages ?? [])
         {
             cancellationToken.ThrowIfCancellationRequested();
-            if (message?.ReceiptHandle is not { Length: > 0 } receipt || ReadHint(message.Body) is not { } hint ||
-                !await refresh(hint, cancellationToken).ConfigureAwait(false))
+            using var process = Ec2Diagnostics.Start("sqs_process", null, cancellationToken);
+            if (message?.ReceiptHandle is not { Length: > 0 } receipt || ReadHint(message.Body) is not { } observation)
             {
+                process?.Complete("rejected", "invalid_event");
+                continue;
+            }
+            Ec2Diagnostics.RecordEventAge(observation.EventTime, receivedAt);
+            if (!await refresh(observation.Hint, cancellationToken).ConfigureAwait(false))
+            {
+                process?.Complete("deferred", "readback_not_accepted");
                 continue;
             }
 
-            await _sqs.DeleteMessageAsync(new DeleteMessageRequest { QueueUrl = _queueUrl, ReceiptHandle = receipt },
-                cancellationToken).ConfigureAwait(false);
+            using (var delete = Ec2Diagnostics.Start("sqs_delete", null, cancellationToken))
+            {
+                await _sqs.DeleteMessageAsync(new DeleteMessageRequest { QueueUrl = _queueUrl, ReceiptHandle = receipt },
+                    cancellationToken).ConfigureAwait(false);
+                delete?.Complete("success", "acknowledged");
+            }
+            process?.Complete("success", "readback_accepted");
             acknowledged++;
         }
         return acknowledged;
     }
 
-    private Ec2StateChangeHint? ReadHint(string? body)
+    private (Ec2StateChangeHint Hint, DateTimeOffset? EventTime)? ReadHint(string? body)
     {
         if (string.IsNullOrWhiteSpace(body))
         {
@@ -92,7 +119,11 @@ public sealed class Ec2StateChangeConsumer
                 return null;
             }
             string arn = _instanceArnPrefix + instanceId;
-            return resources[0].GetString() == arn ? new Ec2StateChangeHint(instanceId!, arn) : null;
+            if (resources[0].GetString() != arn)
+            {
+                return null;
+            }
+            return (new Ec2StateChangeHint(instanceId!, arn), EventTimestamp.Read(root));
         }
         catch (JsonException)
         {

@@ -39,7 +39,7 @@ public sealed class TelemetryPipeline : IAsyncDisposable
     {
         var privacy = new TelemetryPrivacy(settings.Profiles);
         _exports = new TelemetryExportState(diagnostics, _clock);
-        _sink = new SafeTelemetryLogSink(privacy, _exports, console);
+        _sink = new SafeTelemetryLogSink(privacy, _exports, console, _transportShutdown.Token);
         _logger = new LoggerConfiguration().MinimumLevel.Information().Enrich.FromLogContext().WriteTo.Sink(_sink).CreateLogger();
         Logging = new SerilogLoggerFactory(_logger, dispose: false);
         try
@@ -102,7 +102,7 @@ public sealed class TelemetryPipeline : IAsyncDisposable
         long started = _clock.GetTimestamp();
         _sink.Stop();
         _transportShutdown.CancelAfter(ShutdownBudget - DisposalReserve);
-        var cleanup = CompleteShutdownAsync(started);
+        var cleanup = JoinShutdownAsync(started);
         try
         {
             var remaining = ShutdownBudget - _clock.GetElapsedTime(started);
@@ -120,10 +120,30 @@ public sealed class TelemetryPipeline : IAsyncDisposable
         return false;
     }
 
-    private async Task<bool> CompleteShutdownAsync(long started)
+    private async Task<bool> JoinShutdownAsync(long started)
     {
-        // These two SDK teardown APIs are synchronous. Run them together with
-        // logger teardown so each pipeline uses the same remaining budget.
+        var exporters = StopExportersAsync(started);
+        var console = _sink.ConsoleCompletion;
+        try
+        {
+            await Task.WhenAll(exporters, console).ConfigureAwait(false);
+            return exporters.Result && console.Result;
+        }
+        catch (Exception ex) when (ex is IOException or HttpRequestException or TimeoutException or
+            OperationCanceledException or InvalidOperationException or AggregateException)
+        {
+            return false;
+        }
+        finally
+        {
+            _transportShutdown.Dispose();
+        }
+    }
+
+    private async Task<bool> StopExportersAsync(long started)
+    {
+        // The SDK teardown APIs are synchronous. Start them together so each
+        // uses the same remaining budget even when console output is blocked.
         var traces = Task.Run(() => _traces?.Shutdown(RemainingMilliseconds(started)) ?? true);
         var metrics = Task.Run(() => _metrics?.Shutdown(RemainingMilliseconds(started)) ?? true);
         var logs = Task.Run(async () =>
@@ -134,32 +154,22 @@ public sealed class TelemetryPipeline : IAsyncDisposable
 
         try
         {
+            await Task.WhenAll(traces, metrics, logs).ConfigureAwait(false);
+            return traces.Result && metrics.Result;
+        }
+        finally
+        {
             try
             {
-                await Task.WhenAll(traces, metrics, logs).ConfigureAwait(false);
-                return traces.Result && metrics.Result;
+                if (_providers is not null)
+                {
+                    await _providers.DisposeAsync().ConfigureAwait(false);
+                }
             }
             finally
             {
-                try
-                {
-                    if (_providers is not null)
-                    {
-                        await _providers.DisposeAsync().ConfigureAwait(false);
-                    }
-                }
-                finally
-                {
-                    await _transportShutdown.CancelAsync().ConfigureAwait(false);
-                    _exports.Dispose();
-                    _transportShutdown.Dispose();
-                }
+                _exports.Dispose();
             }
-        }
-        catch (Exception ex) when (ex is IOException or HttpRequestException or TimeoutException or
-            OperationCanceledException or InvalidOperationException or AggregateException)
-        {
-            return false;
         }
     }
 
