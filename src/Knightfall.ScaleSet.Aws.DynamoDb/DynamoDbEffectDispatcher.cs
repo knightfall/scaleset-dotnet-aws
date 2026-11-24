@@ -120,7 +120,8 @@ public sealed partial class DynamoDbEffectDispatcher
         }
         var allocation = await _store.ReadExecutorAsync(profile, allocationId, token).ConfigureAwait(false);
         var observedAfter = _clock.GetUtcNow();
-        if ((!AllocationAllows(envelope.Request, allocation, observedAfter) && !IsKnownTerminalFargateStop(envelope.Request, allocation)) ||
+        bool knownTerminalStop = IsKnownTerminalFargateStop(envelope.Request, allocation);
+        if ((!AllocationAllows(envelope.Request, allocation, observedAfter) && !knownTerminalStop) ||
             Window(lease, clockEvidence) is not { } checkWindow)
         {
             return EffectDispatchStatus.Ineligible;
@@ -135,8 +136,7 @@ public sealed partial class DynamoDbEffectDispatcher
         }
         if (observation is null || observation.EnvelopeSha256 != envelope.Sha256 || observation.Target != envelope.Target ||
             !IsCurrentObservation(observation.ObservedAt, observedAfter, now) ||
-            (!AllocationAllows(envelope.Request, allocation, now) &&
-                (observation.AlreadyApplied is null || !IsKnownTerminalFargateStop(envelope.Request, allocation))) ||
+            (!AllocationAllows(envelope.Request, allocation, now) && !knownTerminalStop) ||
             sendWindow.UpperUtcNow < envelope.EarliestPossibleFirstSend)
         {
             return EffectDispatchStatus.Ineligible;
@@ -150,8 +150,28 @@ public sealed partial class DynamoDbEffectDispatcher
             return EffectDispatchStatus.Ineligible;
         }
 
-        var oldestEvidence = allocation?.State.Resource is { } resource && resource.ObservedAt < observation.ObservedAt
-            ? resource.ObservedAt : observation.ObservedAt;
+        var oldestEvidence = observation.ObservedAt;
+        if (knownTerminalStop)
+        {
+            // The durable resource retains its earliest death observation. Bound this no-send settlement by fresh readback.
+            if (envelope.Request is not FargateStopEffectRequest stop || observation.AlreadyApplied is not
+                { Kind: EffectResolutionKind.Applied, AttemptId: null, ExecutorBinding: { } binding, ResourceObservation: { } terminal } applied ||
+                applied.EnvelopeSha256 != envelope.Sha256 || applied.Target != envelope.Target || binding != allocation?.Binding ||
+                !IsCurrentObservation(applied.ObservedAt, observedAfter, now) ||
+                !IsCurrentObservation(terminal.ObservedAt, observedAfter, applied.ObservedAt) ||
+                !FargateEffectProof.Matches(profile, stop, binding, terminal))
+            {
+                return EffectDispatchStatus.Ineligible;
+            }
+            if (terminal.ObservedAt < oldestEvidence)
+            {
+                oldestEvidence = terminal.ObservedAt;
+            }
+        }
+        else if (allocation?.State.Resource is { } resource && resource.ObservedAt < oldestEvidence)
+        {
+            oldestEvidence = resource.ObservedAt;
+        }
         var usable = Min(sendWindow.Duration, _timing.ObservationFreshness - (now - oldestEvidence));
         if (envelope.Request is FargateLaunchEffectRequest { OwnershipTags: not null } && envelope.ProviderReplayDeadline is { } cutoff)
         {

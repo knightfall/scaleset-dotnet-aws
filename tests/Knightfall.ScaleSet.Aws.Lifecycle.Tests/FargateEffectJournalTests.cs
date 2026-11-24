@@ -222,6 +222,50 @@ public sealed class FargateEffectJournalTests
         Assert.Equal(RunnerId, executor.State.RunnerId);
     }
 
+    [Theory]
+    [InlineData("fresh")]
+    [InlineData("stale")]
+    [InlineData("wrong-incarnation")]
+    public async Task OldTerminalExecutorRequiresFreshExactStopReadback(string proofKind)
+    {
+        var token = TestContext.Current.CancellationToken;
+        using var table = await MiniStackTable.CreateAsync(token);
+        var fixture = await CreateFixtureAsync(table, token);
+        var binding = Bind(Launch(fixture.Profile));
+        await SeedStopCandidateAsync(fixture, binding, completed: false, token);
+        var terminalAt = Now.AddSeconds(1);
+        fixture.Clock.Now = terminalAt;
+        Assert.Equal(LifecycleWriteOutcome.Committed, await fixture.Store.ObserveResourceAsync(fixture.Lease.Fence, binding,
+            new ExecutorResourceObservation(ExecutorResourceState.IrreversiblyTerminated, terminalAt, null, Guid.NewGuid(), ProviderVersion: 5), token));
+        var stop = Stop(fixture, binding);
+        await PlanAsync(fixture, stop, token);
+
+        fixture.Clock.Now = terminalAt + Timing.ObservationFreshness + TimeSpan.FromSeconds(1);
+        var proof = Evidence(fixture.Clock, stop, binding, ExecutorResourceState.IrreversiblyTerminated, providerVersion: 6);
+        proof = proofKind switch
+        {
+            "stale" => proof with { ResourceObservation = proof.ResourceObservation! with { ObservedAt = terminalAt } },
+            "wrong-incarnation" => proof with { ExecutorBinding = binding with { Incarnation = Guid.NewGuid() } },
+            _ => proof,
+        };
+        var provider = new FixtureProvider(fixture.Clock) { AlreadyApplied = proof };
+        bool settles = proofKind == "fresh";
+
+        Assert.Equal(settles ? EffectDispatchStatus.Settled : EffectDispatchStatus.Ineligible,
+            await DispatchAsync(fixture, stop, provider, token));
+        Assert.Empty(provider.Sends);
+        var effect = await ReadAsync(fixture, stop, token);
+        Assert.Equal(settles ? EffectState.Settled : EffectState.Planned, effect.Entry.State);
+        Assert.Equal(settles ? proof : null, effect.Entry.Resolution);
+        var executor = Assert.IsType<ExecutorSnapshot>(await fixture.Store.ReadExecutorAsync(fixture.Profile, binding.AllocationId, token));
+        Assert.Equal(ExecutorResourceState.IrreversiblyTerminated, executor.State.Resource?.State);
+        Assert.Equal(terminalAt, executor.State.Resource?.ObservedAt);
+        Assert.Equal(settles ? 6 : 5, executor.State.Resource?.ProviderVersion);
+        Assert.Equal(ExecutorJobPhase.Started, executor.State.Job?.Phase);
+        Assert.Equal(RunnerId, executor.State.RunnerId);
+        Assert.False(executor.State.HasConflict);
+    }
+
     [Theory(Timeout = 60_000)]
     [InlineData(false)]
     [InlineData(true)]
