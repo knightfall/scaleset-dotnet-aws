@@ -57,6 +57,7 @@ function fixture({
   wrongTable = false,
   wrongBody = false,
   changedVersion = false,
+  expectedFargatePreflight = undefined as string | undefined,
 } = {}) {
   const steps: string[] = [];
   let count = 0;
@@ -110,6 +111,23 @@ function fixture({
         candidate.sha256,
       );
       assert.equal(compiled.Outputs.DeploymentGeneration.Value, "2");
+      const task = Object.values(compiled.Resources).find(
+        (resource) =>
+          (resource as { Type: string }).Type === "AWS::ECS::TaskDefinition",
+      ) as {
+        Properties: { ContainerDefinitions: [{ Environment?: unknown }] };
+      };
+      assert.deepEqual(
+        task.Properties.ContainerDefinitions[0].Environment,
+        expectedFargatePreflight === undefined
+          ? undefined
+          : [
+              {
+                Name: "SCALESET_FARGATE_PREFLIGHT",
+                Value: expectedFargatePreflight,
+              },
+            ],
+      );
       return ok();
     }
 
@@ -208,6 +226,39 @@ test("checks exact current and candidate bytes before preparation and again befo
     "execute",
     "wait",
   ]);
+});
+
+test("explicit Fargate evidence reaches the deployment artifact after early validation", () => {
+  const evidence = JSON.stringify({
+    profiles: {
+      "linux-shell": {
+        image: `runner@sha256:${"a".repeat(64)}`,
+        entryPoint: ["/opt/scaleset/RunnerBootstrap"],
+        command: ["fargate", "/opt/scaleset/fargate-bootstrap.json"],
+      },
+    },
+  });
+  const cloud = fixture({ expectedFargatePreflight: evidence });
+  deployController(
+    { compiled: candidate, generation: "2", fargatePreflight: evidence },
+    cloud.run,
+  );
+  assert.ok(cloud.steps.includes("prepare"));
+
+  const invalid = fixture();
+  assert.throws(
+    () =>
+      deployController(
+        {
+          compiled: candidate,
+          generation: "2",
+          fargatePreflight: '{"profiles":{"unrelated":{}}}',
+        },
+        invalid.run,
+      ),
+    /SCALESET_FARGATE_PREFLIGHT is invalid/u,
+  );
+  assert.deepEqual(invalid.steps, []);
 });
 
 test("a denied preflight before or after preparing never executes the change set", () => {

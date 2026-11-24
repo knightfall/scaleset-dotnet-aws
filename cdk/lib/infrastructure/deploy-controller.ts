@@ -11,6 +11,8 @@ import {
   generationValue,
   trackingTableName,
 } from "./deployment-input.ts";
+import { validateFargatePreflight } from "./fargate-preflight.ts";
+import type { ControllerDeploymentEnvironment } from "./fargate-preflight.ts";
 
 type Compiled = ReturnType<typeof compileConfig>;
 type ObjectProperties = Record<string, unknown>;
@@ -23,7 +25,7 @@ export interface CommandResult {
 
 type RunCommand = (program: string, args: string[]) => CommandResult;
 
-interface DeploymentTarget {
+interface DeploymentTarget extends ControllerDeploymentEnvironment {
   readonly compiled: Compiled;
   readonly generation: string;
 }
@@ -103,6 +105,10 @@ export function deployController(
   const identity = deploymentIdentity(runtime);
   const table = trackingTableName(runtime);
   generationValue(generation);
+  const fargatePreflight = validateFargatePreflight(
+    runtime,
+    target.fargatePreflight,
+  );
   const aws = (...args: string[]) =>
     run("aws", [
       "--no-cli-pager",
@@ -318,7 +324,9 @@ export function deployController(
     }
 
     const assembly = join(workspace, "assembly");
-    const artifact = synthesizeController(compiled, generation, assembly);
+    const artifact = synthesizeController(compiled, generation, assembly, {
+      fargatePreflight,
+    });
     const changeSetName = `scaleset-${randomUUID()}`;
     commandResult(
       run(process.execPath, [

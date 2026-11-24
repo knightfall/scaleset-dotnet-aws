@@ -26,10 +26,18 @@ function rewrite(
   );
 }
 
-function synthesize(compiled: ReturnType<typeof fixture>) {
+function synthesize(
+  compiled: ReturnType<typeof fixture>,
+  fargatePreflight?: string,
+) {
   const directory = mkdtempSync(join(tmpdir(), "scaleset-template-"));
   try {
-    const stack = synthesizeController(compiled, "9007199254740993", directory);
+    const stack = synthesizeController(
+      compiled,
+      "9007199254740993",
+      directory,
+      { fargatePreflight },
+    );
     const asset = readdirSync(directory).find((file) =>
       /^asset\..+\.json$/u.test(file),
     );
@@ -65,6 +73,166 @@ function rolePolicy(
 function actions(template: Template) {
   return new Set(rolePolicy(template).flatMap(({ Action }) => Action));
 }
+
+const shellApproval = {
+  image: `111122223333.dkr.ecr.ap-southeast-2.amazonaws.com/runner@sha256:${"a".repeat(64)}`,
+  entryPoint: ["/opt/scaleset/RunnerBootstrap"],
+  command: ["fargate", "/opt/scaleset/fargate-bootstrap.json"],
+  scratchMountPaths: ["/work"],
+};
+
+const quota = {
+  account: "111122223333",
+  region: "ap-southeast-2",
+  observedAt: "2026-11-23T10:00:00.0000001Z",
+  expiresAt: "2026-11-23T10:15:00+00:00",
+  remainingCpuUnits: 8_192,
+  reservedCpuUnits: 1_024,
+};
+
+test("explicit Fargate preflight changes only the controller task definition environment", () => {
+  const config = fixture("mixed-ec2-fargate");
+  const raw = JSON.stringify(
+    { profiles: { "linux-shell": shellApproval }, quota },
+    null,
+    2,
+  ).replace("8192", "9223372036854775807");
+  const defaultTemplate = synthesize(config);
+  const configuredTemplate = synthesize(config, raw);
+  configuredTemplate.resourceCountIs("AWS::ECS::TaskDefinition", 1);
+  configuredTemplate.hasResourceProperties("AWS::ECS::TaskDefinition", {
+    ContainerDefinitions: Match.arrayWith([
+      Match.objectLike({
+        Name: "Controller",
+        Environment: [{ Name: "SCALESET_FARGATE_PREFLIGHT", Value: raw }],
+      }),
+    ]),
+  });
+  defaultTemplate.hasResourceProperties("AWS::ECS::TaskDefinition", {
+    ContainerDefinitions: Match.arrayWith([
+      Match.objectLike({
+        Environment: Match.absent(),
+      }),
+    ]),
+  });
+  configuredTemplate.hasOutput("RuntimeConfigSha256", { Value: config.sha256 });
+  const wholeTemplate = configuredTemplate.toJSON();
+  const task = Object.values(wholeTemplate.Resources).find(
+    (entry) => (entry as { Type: string }).Type === "AWS::ECS::TaskDefinition",
+  ) as {
+    Properties: { ContainerDefinitions: [{ Environment?: unknown }] };
+  };
+  delete task.Properties.ContainerDefinitions[0].Environment;
+  assert.deepEqual(wholeTemplate, defaultTemplate.toJSON());
+});
+
+test("Fargate preflight is available in inspection mode and refuses unrelated profiles or modes", () => {
+  const mixed = fixture("mixed-ec2-fargate");
+  const inspection = rewrite(mixed, {
+    ...mixed.runtime.spec,
+    mode: "dry-run",
+    dryRun: { demand: { type: "none" }, inspectAws: true },
+  });
+  const evidence = JSON.stringify({
+    profiles: { "linux-shell": shellApproval },
+  });
+  synthesize(inspection, evidence).hasResourceProperties(
+    "AWS::ECS::TaskDefinition",
+    {
+      ContainerDefinitions: Match.arrayWith([
+        Match.objectLike({
+          Environment: [
+            { Name: "SCALESET_FARGATE_PREFLIGHT", Value: evidence },
+          ],
+        }),
+      ]),
+    },
+  );
+  const offline = rewrite(inspection, {
+    ...inspection.runtime.spec,
+    dryRun: { demand: { type: "none" }, inspectAws: false },
+  });
+  const disabled = rewrite(mixed, {
+    ...mixed.runtime.spec,
+    profiles: mixed.runtime.spec.profiles.map((profile) =>
+      profile.id === "linux-shell"
+        ? { ...profile, state: "disabled" }
+        : profile,
+    ),
+  });
+  for (const config of [offline, disabled, fixture("ec2-only-pinned")]) {
+    assert.throws(
+      () => synthesize(config, evidence),
+      /SCALESET_FARGATE_PREFLIGHT is invalid/u,
+    );
+  }
+  assert.throws(
+    () =>
+      synthesize(
+        mixed,
+        JSON.stringify({ profiles: { "linux-ec2-build": shellApproval } }),
+      ),
+    /SCALESET_FARGATE_PREFLIGHT is invalid/u,
+  );
+});
+
+test("Fargate preflight rejects invalid or oversized JSON without reflecting input", () => {
+  const config = fixture("mixed-ec2-fargate");
+  const approved = { profiles: { "linux-shell": shellApproval } };
+  const sentinel = "unexpected-value-must-stay-private";
+  const invalid = [
+    JSON.stringify({ ...approved, secrets: sentinel }),
+    JSON.stringify({
+      profiles: {
+        "linux-shell": {
+          ...shellApproval,
+          environment: { password: sentinel },
+        },
+      },
+    }),
+    JSON.stringify({
+      ...approved,
+      quota: { ...quota, account: "000000000000" },
+    }),
+    JSON.stringify({
+      ...approved,
+      quota: { ...quota, expiresAt: quota.observedAt },
+    }),
+    JSON.stringify({
+      ...approved,
+      quota: { ...quota, observedAt: "2026-02-30T01:00:00Z" },
+    }),
+    JSON.stringify({
+      ...approved,
+      quota: { ...quota, remainingCpuUnits: "8192" },
+    }),
+    JSON.stringify({ ...approved, quota }).replace(
+      "8192",
+      "9223372036854775808",
+    ),
+    JSON.stringify({ ...approved, quota }).replace("8192", "8.192e3"),
+    `{"profiles":{},"profiles":${JSON.stringify(approved.profiles)}}`,
+    JSON.stringify({
+      profiles: {
+        "linux-shell": {
+          ...shellApproval,
+          command: [`{{resolve:secretsmanager:${sentinel}}}`],
+        },
+      },
+    }),
+    JSON.stringify({
+      profiles: {
+        "linux-shell": { ...shellApproval, command: ["😀".repeat(4_096)] },
+      },
+    }),
+  ];
+  for (const input of invalid) {
+    assert.throws(() => synthesize(config, input), {
+      message:
+        "SCALESET_FARGATE_PREFLIGHT is invalid for the configured deployment.",
+    });
+  }
+});
 
 test("the versioned artifact and retained tracking table match the runtime contract", () => {
   const config = fixture("mixed-ec2-fargate");

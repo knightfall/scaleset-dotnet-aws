@@ -26,6 +26,8 @@ import {
   generationValue,
   trackingTableName,
 } from "./deployment-input.ts";
+import { validateFargatePreflight } from "./fargate-preflight.ts";
+import type { ControllerDeploymentEnvironment } from "./fargate-preflight.ts";
 import {
   bootstrapPolicy,
   ec2Profiles,
@@ -39,7 +41,7 @@ import {
 import type { RunnerCluster } from "./runner-iam.ts";
 import { RuntimeArtifact } from "./runtime-artifact.ts";
 
-export interface ControllerInfrastructureProps {
+export interface ControllerInfrastructureProps extends ControllerDeploymentEnvironment {
   readonly compiled: ReturnType<typeof compileConfig>;
   readonly generation: string;
   readonly artifactPath: string;
@@ -63,6 +65,10 @@ export class ControllerInfrastructure extends Stack {
       env: spec.aws,
     });
     generationValue(props.generation);
+    const fargatePreflight = validateFargatePreflight(
+      runtime,
+      props.fargatePreflight,
+    );
 
     const active = spec.mode === "active";
     const inspect = !active && spec.dryRun.inspectAws;
@@ -173,6 +179,7 @@ export class ControllerInfrastructure extends Stack {
       clusterArn: this.hostingCluster.arn,
       taskRole: this.controllerRole,
       command: this.runtimeArguments,
+      fargatePreflight,
     });
     new CfnOutput(this, "DeploymentIdentity", {
       value: deploymentIdentity(runtime),
@@ -340,6 +347,7 @@ export function synthesizeController(
   compiled: ReturnType<typeof compileConfig>,
   generation: string,
   outdir: string | undefined = undefined,
+  environment: ControllerDeploymentEnvironment = {},
 ) {
   const directory = mkdtempSync(join(tmpdir(), "scaleset-runtime-"));
   try {
@@ -353,6 +361,7 @@ export function synthesizeController(
       compiled,
       generation,
       artifactPath,
+      fargatePreflight: environment.fargatePreflight,
     });
     return app.synth().getStackArtifact(stack.artifactId);
   } finally {

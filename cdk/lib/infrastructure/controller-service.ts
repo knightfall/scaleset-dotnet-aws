@@ -5,6 +5,7 @@ import * as iam from "aws-cdk-lib/aws-iam";
 import * as logs from "aws-cdk-lib/aws-logs";
 import type { Construct } from "constructs";
 import type { RunnerControllerRuntime } from "../config/types.ts";
+import { fargatePreflightEnvironmentName } from "./fargate-preflight.ts";
 
 export const controllerHealthAddress = "127.0.0.1:8080";
 
@@ -13,6 +14,7 @@ interface ControllerServiceProps {
   readonly clusterArn: string;
   readonly taskRole: iam.IRole;
   readonly command: readonly string[];
+  readonly fargatePreflight?: string;
 }
 
 const memoryGiBRanges = new Map<number, readonly [number, number, number]>([
@@ -95,6 +97,10 @@ export function createControllerService(
       image.slice(digestSeparator + 1),
     ),
     command: [...props.command],
+    environment:
+      props.fargatePreflight === undefined
+        ? undefined
+        : { [fargatePreflightEnvironmentName]: props.fargatePreflight },
     essential: true,
     readonlyRootFilesystem: true,
     stopTimeout: Duration.seconds(90),

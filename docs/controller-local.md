@@ -31,6 +31,41 @@ Use `--config-s3-uri` and `--config-version-id` in place of `--config` to use a 
 
 The controller binds health to `127.0.0.1:8080` by default. The `healthcheck` command calls `/healthz`, which reports whether process and supervision are progressing. `/readyz` reports verified configuration, lease state where ownership is required, and readiness for each profile. Use the same `--health-addr` on the controller and probe when overriding the default.
 
+## Controller preflights
+
+Use the compiled configuration and matching digest for the read-only table and clock checks. The clock check needs a trusted controller task's ECS metadata endpoint.
+
+```sh
+dotnet /app/Knightfall.ScaleSet.Aws.Controller.dll preflight table --config /runtime.json --sha256 "$runtime_sha256"
+dotnet /app/Knightfall.ScaleSet.Aws.Controller.dll preflight clock --config /runtime.json --sha256 "$runtime_sha256"
+```
+
+Set `SCALESET_FARGATE_PREFLIGHT` when invoking the CDK synthesis or deployment entry point to supply nonsecret runner approvals and operator-verified Fargate quota evidence. CDK copies the JSON to the controller task only. The following example uses the `linux-shell` profile and its approved task definition. Replace the example image, exact argument and mount arrays, capacity values, and timestamps with verified values for your deployment. Times include an explicit UTC offset.
+
+```sh
+export SCALESET_FARGATE_PREFLIGHT='{
+  "profiles": {
+    "linux-shell": {
+      "image": "111122223333.dkr.ecr.ap-southeast-2.amazonaws.com/runner@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "entryPoint": ["/opt/scaleset/RunnerBootstrap"],
+      "command": ["fargate", "/opt/scaleset/fargate-bootstrap.json"],
+      "scratchMountPaths": ["/work"]
+    }
+  },
+  "quota": {
+    "account": "111122223333",
+    "region": "ap-southeast-2",
+    "observedAt": "2026-11-24T09:00:00Z",
+    "expiresAt": "2026-11-24T09:15:00Z",
+    "remainingCpuUnits": 8192,
+    "reservedCpuUnits": 1024
+  }
+}'
+npm --prefix cdk run synth
+```
+
+The input supports up to 16 KiB of UTF-8. Use it with enabled Fargate profiles in active or AWS-inspection mode. The values appear in the synthesized task definition, so keep credentials and secrets out of the argument arrays. The controller checks the actual task definition and freshness of quota evidence at runtime.
+
 ## Build the OCI archives
 
 From the repository root, set an absolute output path for each invocation. The SDK downloads the pinned Microsoft .NET 10 ASP.NET Core Noble chiseled-extra base and writes an OCI archive locally. [Microsoft container publishing configuration](https://learn.microsoft.com/en-us/dotnet/core/containers/publish-configuration)
