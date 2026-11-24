@@ -14,11 +14,12 @@ namespace Knightfall.ScaleSet.Aws.Lifecycle.Tests;
 internal sealed class MiniStackTable : IDisposable
 {
     internal static readonly DateTimeOffset Now = new(2050, 1, 2, 3, 4, 5, TimeSpan.Zero);
+    internal const string FirstTask = "arn:aws:ecs:us-east-1:000000000000:task/controller/00000000000000000000000000000001";
 
     internal readonly AmazonDynamoDBClient Client;
     internal readonly MiniStackWire Wire = new();
     internal readonly string Name = "lifecycle-" + Guid.NewGuid().ToString("N");
-    internal readonly DeploymentLeaseFence Lease = new("test", "controller-1", 1, 1);
+    internal readonly DeploymentLeaseFence Lease = new("test", "controller-1", 1, ControllerLease.CurrentWriterProtocol, FirstTask);
 
     private MiniStackTable()
     {
@@ -88,7 +89,12 @@ internal sealed class MiniStackTable : IDisposable
     internal async Task SetLeaseAsync(DeploymentLeaseFence fence, DateTimeOffset validUntil, CancellationToken cancellationToken)
     {
         var leaseItem = Key(LifecycleKey.Lease(fence.Deployment));
+        leaseItem["deployment"] = new AttributeValue(fence.Deployment);
+        leaseItem["revision"] = new AttributeValue { N = "1" };
+        leaseItem["transitionId"] = new AttributeValue(Guid.NewGuid().ToString("D"));
         leaseItem["ownerId"] = new AttributeValue(fence.OwnerId);
+        leaseItem["ownerTaskArn"] = new AttributeValue(fence.OwnerTaskArn);
+        leaseItem["leaseMode"] = new AttributeValue("active");
         leaseItem["epoch"] = new AttributeValue { N = FormattableString.Invariant($"{fence.Epoch}") };
         leaseItem["writerProtocol"] = new AttributeValue { N = FormattableString.Invariant($"{fence.WriterProtocol}") };
         leaseItem["validUntil"] = new AttributeValue { N = FormattableString.Invariant($"{validUntil.ToUnixTimeMilliseconds()}") };

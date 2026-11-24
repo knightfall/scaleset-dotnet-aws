@@ -9,5 +9,6 @@
   <ItemGroup>
     <ProjectReference Include="../../src/Knightfall.ScaleSet.Aws.DynamoDb/Knightfall.ScaleSet.Aws.DynamoDb.csproj" />
     <PackageReference Include="xunit.v3" />
+    <None Include="../../testdata/config/runtime/fargate-only.json" Link="fargate-only.json" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 </Project>

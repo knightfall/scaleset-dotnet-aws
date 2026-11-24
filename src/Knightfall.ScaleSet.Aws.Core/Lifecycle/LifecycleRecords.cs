@@ -2,7 +2,7 @@ using System.Collections.Immutable;
 
 namespace Knightfall.ScaleSet.Aws.Core.Lifecycle;
 
-public sealed record DeploymentLeaseFence(string Deployment, string OwnerId, long Epoch, int WriterProtocol);
+public sealed record DeploymentLeaseFence(string Deployment, string OwnerId, long Epoch, int WriterProtocol, string OwnerTaskArn);
 
 public sealed record SettledHistoryRetention(DateTimeOffset SettledAt, TimeSpan Retention);
 
