@@ -13,7 +13,7 @@ using Xunit;
 namespace Knightfall.ScaleSet.Aws.IntegrationTests;
 
 internal sealed class DirectEc2Fixture(
-    Uri endpoint, AWSCredentials credentials, string account, string region, string roleArn,
+    Uri endpoint, AWSCredentials credentials, string account, string region, string deployment, string roleArn,
     string instanceProfileArn, string vpc, string subnetA, string subnetB, string securityGroup, string templateId) : IDisposable
 {
     internal const string LinuxImage = "ami-0abcdef1234567890";
@@ -62,7 +62,7 @@ internal sealed class DirectEc2Fixture(
         }, cancellationToken);
         Assert.Equal(1, created.LaunchTemplate.DefaultVersionNumber);
         Assert.Equal(1, created.LaunchTemplate.LatestVersionNumber);
-        return new DirectEc2Fixture(endpoint, credentials, account, region, roleArn, profileArn, vpcId,
+        return new DirectEc2Fixture(endpoint, credentials, account, region, unique, roleArn, profileArn, vpcId,
             a.Subnet.SubnetId, b.Subnet.SubnetId, group.GroupId, created.LaunchTemplate.LaunchTemplateId);
     }
 
@@ -81,6 +81,7 @@ internal sealed class DirectEc2Fixture(
     {
         string document = await File.ReadAllTextAsync(Path.Combine(AppContext.BaseDirectory, "ec2-only-pinned.json"), cancellationToken);
         var tree = JsonNode.Parse(document)!;
+        tree["metadata"]!["name"] = deployment;
         var spec = tree["spec"]!;
         spec["aws"] = new JsonObject { ["account"] = account, ["region"] = region };
         spec["mode"] = "active";
