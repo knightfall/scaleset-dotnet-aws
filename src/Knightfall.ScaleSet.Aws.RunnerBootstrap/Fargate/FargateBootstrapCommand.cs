@@ -28,6 +28,7 @@ internal static class FargateBootstrapCommand
                 throw new IOException("The Fargate bootstrap settings file or user is invalid.");
             }
             LinuxFiles.DisableCoreDumps();
+            // Check that the platform supports the guard before publishing a hello.
             LinuxFiles.ProhibitPrivilegeGain();
             var settings = ReadSettings(settingsPath);
             _ = settings.Validate();

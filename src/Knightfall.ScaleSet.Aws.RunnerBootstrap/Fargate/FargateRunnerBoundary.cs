@@ -91,7 +91,15 @@ internal sealed class FargateRunnerBoundary : ILinuxOneJobBoundary, IDisposable
         file.Write(contents);
     }
 
-    public ProcessStartInfo StartInfo()
+    public Process? StartRunner()
+    {
+        var start = StartInfo();
+        // The child inherits no-new-privileges from the thread that forks it.
+        LinuxFiles.ProhibitPrivilegeGain();
+        return Process.Start(start);
+    }
+
+    internal ProcessStartInfo StartInfo()
     {
         var start = new ProcessStartInfo(_dotnet)
         {

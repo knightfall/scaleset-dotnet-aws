@@ -25,7 +25,7 @@ test "$3" = run
 test "$4" = --once
 test -z "${AWS_SESSION_TOKEN:-}"
 test -z "${ACTIONS_RUNNER_INPUT_JITCONFIG:-}"
-grep -Eq '^NoNewPrivs:[[:space:]]+1$' /proc/self/status
+grep -Eq '^NoNewPrivs:[[:space:]]+1$' "/proc/$$/status"
 grep -Eq '^CapEff:[[:space:]]+0+$' /proc/self/status
 test "$(stat -c %a .credentials)" = 600
 test "$(stat -f -c %T .credentials)" = tmpfs

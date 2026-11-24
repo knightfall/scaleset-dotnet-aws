@@ -104,7 +104,9 @@ internal sealed class LinuxRunnerBoundary : ILinuxOneJobBoundary
 
     public void PrepareHome() => LinuxFiles.CreatePrivateDirectory(Home, _settings.UserId, _settings.GroupId);
 
-    public ProcessStartInfo StartInfo()
+    public Process? StartRunner() => Process.Start(StartInfo());
+
+    internal ProcessStartInfo StartInfo()
     {
         var start = new ProcessStartInfo
         {

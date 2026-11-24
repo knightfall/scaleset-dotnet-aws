@@ -13,7 +13,7 @@ internal interface ILinuxOneJobBoundary
 
     void PrepareHome();
 
-    ProcessStartInfo StartInfo();
+    Process? StartRunner();
 
     void RemoveConfigFiles();
 }
@@ -40,7 +40,7 @@ internal sealed partial class LinuxOneJobRunner(ILinuxOneJobBoundary boundary, T
             }
 
             boundary.PrepareHome();
-            using var process = Process.Start(boundary.StartInfo()) ?? throw new IOException("The one-job runner could not start.");
+            using var process = boundary.StartRunner() ?? throw new IOException("The one-job runner could not start.");
             process.StandardInput.Close();
             using var output = stopGrace.HasValue ? new CancellationTokenSource() :
                 CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);

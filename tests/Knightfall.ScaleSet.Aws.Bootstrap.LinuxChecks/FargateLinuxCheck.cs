@@ -29,12 +29,11 @@ internal static class FargateLinuxCheck
             throw new InvalidOperationException("The Fargate fixture must be non-root.");
         }
         LinuxFiles.DisableCoreDumps();
-        LinuxFiles.ProhibitPrivilegeGain();
         Environment.SetEnvironmentVariable("AWS_SESSION_TOKEN", "offline-parent-credential-sentinel");
         Environment.SetEnvironmentVariable("ACTIONS_RUNNER_INPUT_JITCONFIG", "offline-parent-jit-sentinel");
         using var budget = new CancellationTokenSource(TimeSpan.FromSeconds(25));
+        await VerifySingleJobAfterThreadHopAsync(budget.Token).ConfigureAwait(false);
         await VerifyPinnedRunnerAsync(budget.Token).ConfigureAwait(false);
-        await VerifySingleJobAsync(interrupt: false, budget.Token).ConfigureAwait(false);
         await VerifySingleJobAsync(interrupt: true, budget.Token).ConfigureAwait(false);
         var receipts = Directory.GetFiles(Work, "*", SearchOption.AllDirectories);
         string[] expectedReceipts = ["completed\n", "signal\n"];
@@ -44,8 +43,42 @@ internal static class FargateLinuxCheck
         {
             throw new InvalidOperationException("The fixture job or SIGTERM was not observed in its separate work scratch.");
         }
-        Console.WriteLine("Fargate offline RAM, pinned launcher, one-job and SIGTERM checks passed.");
+        Console.WriteLine("Fargate offline RAM, pinned launcher, thread-hop privilege guard, one-job and SIGTERM checks passed.");
         return 0;
+    }
+
+    private static Task VerifySingleJobAfterThreadHopAsync(CancellationToken cancellationToken)
+    {
+        var startupGuarded = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var launch = new TaskCompletionSource<Task>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var worker = new Thread(() =>
+        {
+            try
+            {
+                startupGuarded.Task.WaitAsync(cancellationToken).GetAwaiter().GetResult();
+                if (!File.ReadLines("/proc/thread-self/status").Contains("NoNewPrivs:\t0", StringComparer.Ordinal))
+                {
+                    throw new InvalidOperationException("The pre-existing launch thread must start without no-new-privileges.");
+                }
+                // RunAsync starts the actual child synchronously on this thread before its first await.
+                launch.SetResult(VerifySingleJobAsync(interrupt: false, cancellationToken));
+            }
+            catch (Exception error)
+            {
+                launch.SetException(error);
+            }
+        }) { IsBackground = true };
+        worker.Start();
+        try
+        {
+            LinuxFiles.ProhibitPrivilegeGain();
+            startupGuarded.SetResult();
+        }
+        catch (IOException error)
+        {
+            startupGuarded.SetException(error);
+        }
+        return launch.Task.Unwrap();
     }
 
     private static async Task VerifyPinnedRunnerAsync(CancellationToken cancellationToken)
