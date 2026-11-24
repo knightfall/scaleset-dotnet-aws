@@ -19,7 +19,7 @@ Build the standalone TypeScript AWS CDK v2 entry point (`cdk/bin/controller.ts`)
   - Deduplicate `ecsClusters` `create` entries if controller host and Fargate runners share a cluster. Never grant runner `ecs:RunTask`/`StopTask` when only controller hosting uses ECS.
   - In `dry-run` mode: omit GitHub `secretsmanager:GetSecretValue`, DynamoDB mutations, SQS receive/delete, and all EC2/ECS runner launch/stop/`PassRole` permissions.
 - **Runtime retirement preflight gate**:
-  - Require `preflight retire` verification against the DynamoDB table's catalog/generation/tombstones (verified against MiniStack / AWS Emulator DynamoDB in `T25` and targeting the deployment table at deploy time) before a CDK deployment removes IAM grants or EventBridge rules for a removed/disabled profile; reject fixture/context-flag bypasses.
+  - Require `preflight retire` verification against the DynamoDB table's catalog, generation and tombstones before a CDK deployment removes IAM grants or EventBridge rules. This covers removed or disabled profiles and retained IDs that lose an existing permission or event scope. Use the deployment table at deploy time and verify the full transition in `T25` against local AWS emulation.
 
 ### Deployment command
 
@@ -29,7 +29,7 @@ Use the AWS CLI v2 and the repository's Release build of the controller. The dep
 npm --prefix cdk run deploy:controller -- --config /path/to/controller.yaml --generation 42
 ```
 
-The command compiles the candidate once. For an existing stack, it reads the current S3 version and verifies its digest and table against the current stack outputs. It runs `preflight retire` before preparing a change set and again before executing that exact change set. New stacks require confirmed stack absence and either a new table name or an existing imported table with an empty deployment partition. An active-to-dry-run update removes active grants and requires the same retirement checks.
+The command compiles the candidate once. For an existing stack, it reads the current S3 version and verifies its digest and table against the current stack outputs. It runs `preflight retire` before preparing a change set and again before executing that exact change set. New stacks require confirmed stack absence and either a new table name or an existing imported table with an empty deployment partition. The same checks apply when a mode change, runner cluster, task definition, role, Launch Template, network, or credential change would remove an existing grant from a profile.
 
 Use the deployment command for stack updates. Direct CDK or CloudFormation deployment requires independent enforcement of the same gate. Offline synthesis uses `node bin/controller.ts --config <controller.yaml> --generation <generation>` as the CDK app under `cdk synth --strict --no-lookups`.
 

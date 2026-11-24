@@ -47,7 +47,7 @@ public sealed partial class DynamoDbLifecycleStore
         }
 
         var previouslyGranted = GrantedProfiles(current).ToDictionary(profile => profile.Id, StringComparer.Ordinal);
-        var nextGranted = GrantedProfiles(candidate).Select(profile => profile.Id).ToHashSet(StringComparer.Ordinal);
+        var nextGranted = GrantedProfiles(candidate).ToDictionary(profile => profile.Id, StringComparer.Ordinal);
         var blocked = new SortedSet<string>(StringComparer.Ordinal);
         foreach (var (id, profile) in previouslyGranted)
         {
@@ -56,7 +56,8 @@ public sealed partial class DynamoDbLifecycleStore
             {
                 return new RetirementPreflightResult(RetirementPreflightStatus.CatalogUnavailable, [id]);
             }
-            if (!nextGranted.Contains(id) && stored.State != CatalogProfileState.Tombstoned)
+            if (stored.State != CatalogProfileState.Tombstoned &&
+                (!nextGranted.TryGetValue(id, out var next) || !CoversDeployedGrants(current, profile, candidate, next)))
             {
                 blocked.Add(id);
             }
@@ -90,4 +91,40 @@ public sealed partial class DynamoDbLifecycleStore
             RunnerGroupId = stored.Binding.RunnerGroupId,
         }, stored.Binding);
     }
+
+    private static bool CoversDeployedGrants(
+        RuntimeConfiguration current, RunnerProfile profile, RuntimeConfiguration candidate, RunnerProfile next)
+    {
+        var before = profile.Provisioner;
+        var after = next.Provisioner;
+        var inherited = current.GitHub[profile.GitHub.Connection];
+        var replacement = candidate.GitHub[next.GitHub.Connection];
+        var oldNetwork = current.Networks[before.Network];
+        var newNetwork = candidate.Networks[after.Network];
+        if (before.BootstrapRoleArn != after.BootstrapRoleArn || before.BootstrapProtocol != after.BootstrapProtocol ||
+            inherited.SecretArn != replacement.SecretArn ||
+            oldNetwork.VpcId != newNetwork.VpcId || !oldNetwork.Subnets.All(newNetwork.Subnets.Contains) ||
+            !oldNetwork.SecurityGroupIds.All(newNetwork.SecurityGroupIds.Contains))
+        {
+            return false;
+        }
+        return (before, after) switch
+        {
+            (Ec2ProvisionerConfiguration ec2, Ec2ProvisionerConfiguration nextEc2) =>
+                ec2.LaunchTemplateId == nextEc2.LaunchTemplateId && ec2.InstanceProfileArn == nextEc2.InstanceProfileArn,
+            (FargateProvisionerConfiguration fargate, FargateProvisionerConfiguration nextFargate) =>
+                fargate.TaskDefinitionArn == nextFargate.TaskDefinitionArn && fargate.ExecutionRoleArn == nextFargate.ExecutionRoleArn &&
+                ClusterScope(current, fargate) == ClusterScope(candidate, nextFargate),
+            _ => false,
+        };
+    }
+
+    private static (string Arn, bool Created) ClusterScope(RuntimeConfiguration configuration, FargateProvisionerConfiguration profile) =>
+        configuration.EcsClusters[profile.Cluster] switch
+        {
+            ImportEcsClusterConfiguration imported => (imported.Arn, false),
+            CreateEcsClusterConfiguration created => ($"arn:{profile.BootstrapRoleArn.Split(':')[1]}:ecs:" +
+                $"{configuration.Aws.Region}:{configuration.Aws.Account}:cluster/{created.Name}", true),
+            _ => throw new InvalidOperationException("The configured ECS cluster type is unsupported."),
+        };
 }

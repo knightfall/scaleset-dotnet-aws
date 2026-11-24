@@ -55,6 +55,24 @@ public sealed class ControllerLifecycleTests
         var premature = await store.VerifyRetirementAsync(configuration, 1, candidate, 2, cancellation);
         Assert.Equal(RetirementPreflightStatus.RetirementRequired, premature.Status);
         Assert.Equal([ProfileId], premature.Profiles);
+        Assert.Equal(RetirementPreflightStatus.Verified,
+            (await store.VerifyRetirementAsync(configuration, 1, configuration, 2, cancellation)).Status);
+
+        var clusterChange = document.DeepClone();
+        clusterChange["spec"]!["ecsClusters"]!["replacement"] = new JsonObject { ["type"] = "create", ["name"] = "replacement-cluster" };
+        clusterChange["spec"]!["profiles"]![1]!["provisioner"]!["cluster"] = "replacement";
+        var changedCluster = RuntimeConfigurationLoader.Load(JsonSerializer.SerializeToUtf8Bytes(clusterChange));
+        var blockedCluster = await store.VerifyRetirementAsync(configuration, 1, changedCluster, 2, cancellation);
+        Assert.Equal(RetirementPreflightStatus.RetirementRequired, blockedCluster.Status);
+        Assert.Equal(["retained-linux"], blockedCluster.Profiles);
+
+        var roleChange = document.DeepClone();
+        var changedProvisioner = roleChange["spec"]!["profiles"]![1]!["provisioner"]!;
+        changedProvisioner["bootstrapRoleArn"] = changedProvisioner["bootstrapRoleArn"]!.GetValue<string>() + "-replacement";
+        var changedRole = RuntimeConfigurationLoader.Load(JsonSerializer.SerializeToUtf8Bytes(roleChange));
+        var blockedRole = await store.VerifyRetirementAsync(configuration, 1, changedRole, 2, cancellation);
+        Assert.Equal(RetirementPreflightStatus.RetirementRequired, blockedRole.Status);
+        Assert.Equal(["retained-linux"], blockedRole.Profiles);
         var profile = new LifecycleProfile(first.Deployment, ProfileId);
         var catalog = Assert.IsType<CatalogProfile>(await store.ReadCatalogProfileAsync(profile, cancellation));
         Assert.Equal(CatalogProfileState.Draining, catalog.State);
