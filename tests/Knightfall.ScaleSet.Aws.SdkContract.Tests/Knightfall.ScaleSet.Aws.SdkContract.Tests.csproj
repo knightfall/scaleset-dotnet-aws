@@ -7,6 +7,16 @@
     <UseMicrosoftTestingPlatformRunner>true</UseMicrosoftTestingPlatformRunner>
   </PropertyGroup>
   <ItemGroup>
+    <ProjectReference Include="../Knightfall.ScaleSet.Aws.ListenerConsumer/Knightfall.ScaleSet.Aws.ListenerConsumer.csproj" />
+    <PackageReference Include="AWSSDK.Core" />
+    <PackageReference Include="AWSSDK.DynamoDBv2" />
+    <PackageReference Include="AWSSDK.EC2" />
+    <PackageReference Include="AWSSDK.ECS" />
+    <PackageReference Include="AWSSDK.IdentityManagement" />
+    <PackageReference Include="AWSSDK.S3" />
+    <PackageReference Include="AWSSDK.SecretsManager" />
+    <PackageReference Include="AWSSDK.SecurityToken" />
+    <PackageReference Include="AWSSDK.SQS" />
     <PackageReference Include="Knightfall.ScaleSet.Client" />
     <PackageReference Include="Knightfall.ScaleSet.Listener" />
     <PackageReference Include="xunit.v3" />
