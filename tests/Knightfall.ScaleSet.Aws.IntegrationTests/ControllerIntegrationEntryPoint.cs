@@ -9,6 +9,7 @@ namespace Knightfall.ScaleSet.Aws.IntegrationTests;
 internal static class ControllerIntegrationEntryPoint
 {
     internal const string ChildMode = "--controller-host-fixture";
+    internal const string MixedChildMode = "--controller-mixed-fixture";
 
     public static async Task<int> Main(string[] args)
     {
@@ -16,7 +17,7 @@ internal static class ControllerIntegrationEntryPoint
         {
             return await SimulatedFargateJob.RunChildAsync().ConfigureAwait(false);
         }
-        if (args is [ChildMode, var portValue, var fingerprint, "run", ..])
+        if (args is [ChildMode or MixedChildMode, var portValue, var fingerprint, "run", ..])
         {
             if (!ushort.TryParse(portValue, NumberStyles.None, CultureInfo.InvariantCulture, out ushort port) || port == 0 ||
                 fingerprint.Length != 64 || !fingerprint.All(Uri.IsHexDigit) ||
@@ -26,7 +27,8 @@ internal static class ControllerIntegrationEntryPoint
             {
                 return 2;
             }
-            using var github = GitHubProtocolHost.CreateClient(port, fingerprint);
+            using var github = GitHubProtocolHost.CreateClient(port, fingerprint,
+                args[0] == MixedChildMode ? MixedRuntimeFixture.GitHubHosts : null);
             return await RunCommand.RunAsync(args[3..], Console.Out, Console.Error,
                 context => ActiveControllerRuntime.RunAsync(context, github)).ConfigureAwait(false);
         }

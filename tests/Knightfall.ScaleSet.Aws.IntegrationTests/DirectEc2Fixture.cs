@@ -26,6 +26,11 @@ internal sealed class DirectEc2Fixture(
 
     internal string TemplateId => templateId;
 
+    internal string InstanceProfileArn => instanceProfileArn;
+
+    internal NetworkConfiguration Network => new(vpc,
+        [new(subnetA, region + "a"), new(subnetB, region + "b")], [securityGroup]);
+
     internal DirectEc2AwsWire Wire { get; } = new(endpoint, subnetA);
 
     internal static async Task<DirectEc2Fixture> CreateAsync(Uri endpoint, AWSCredentials credentials, AmazonEC2Client ec2,

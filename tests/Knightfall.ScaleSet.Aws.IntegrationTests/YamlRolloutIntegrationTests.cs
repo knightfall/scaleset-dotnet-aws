@@ -17,6 +17,7 @@ using Xunit;
 
 namespace Knightfall.ScaleSet.Aws.IntegrationTests;
 
+[Collection(nameof(GitHubLifecycleIntegrationTests))]
 public sealed class YamlRolloutIntegrationTests
 {
     private const string RetiringProfile = "linux-shell";
@@ -127,6 +128,10 @@ public sealed class YamlRolloutIntegrationTests
         Assert.NotNull(held.ClosureHeldAt);
         Assert.Null(held.RetiredAt);
         await RequirePreflightAsync(draining, 3, removed, 4, expectedRefusal: true, token);
+        await PublishEmptyInventoryAsync(store, retained, owner.Fence, clock, token);
+        await using var telemetry = await YamlRolloutTelemetryEvidence.StartAsync(draining.Configuration, store, owner,
+            clock.Proof(), Reserve, clock, token);
+        await telemetry.AssertBeforeRetirementAsync(retiring, retained, second.Fence, token);
         var needSession = await retirement.AdvanceAsync(retiring, new ActiveControllerAuthority(owner, clock.Proof()), token);
         Assert.Equal(ProfileRetirementStatus.SessionRetirementRequired, needSession.Status);
         Assert.Equal(sessionId, needSession.Session?.SessionId);
@@ -141,6 +146,7 @@ public sealed class YamlRolloutIntegrationTests
         Assert.Equal(CatalogProfileState.Tombstoned, tombstone.State);
         Assert.NotNull(tombstone.RetiredAt);
         Assert.Equivalent(drainingRow.Binding, tombstone.Binding, strict: true);
+        await telemetry.AssertAfterRetirementAsync(retiring, retained, token);
         await RequirePreflightAsync(draining, 3, removed, 4, expectedRefusal: false, token);
         await ReleaseAsync(store, owner, clock, token);
         var removal = await AcquireAndApplyAsync(store, removed.Configuration, 4, clock, token);
