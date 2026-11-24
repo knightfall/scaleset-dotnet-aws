@@ -4,18 +4,18 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { Template } from "aws-cdk-lib/assertions";
-import { compileConfig } from "../lib/config/compiler.ts";
+import { compileConfig } from "../../lib/config/compiler.ts";
 import type {
   Ec2Provisioner,
   EcsClusterConfig,
   RunnerControllerRuntime,
   RunnerProfile,
-} from "../lib/config/types.ts";
-import { synthesizeController } from "../lib/infrastructure/controller-stack.ts";
+} from "../../lib/config/types.ts";
+import { synthesizeController } from "../../lib/infrastructure/controller-stack.ts";
 import {
   ec2Profiles,
   fargateProfiles,
-} from "../lib/infrastructure/runner-iam.ts";
+} from "../../lib/infrastructure/runner-iam.ts";
 
 type Spec = RunnerControllerRuntime["spec"];
 type ClusterKind = EcsClusterConfig["type"];
@@ -30,7 +30,7 @@ interface Statement {
 
 const fixture = compileConfig(
   readFileSync(
-    new URL("../../testdata/config/mixed-ec2-fargate.yaml", import.meta.url),
+    new URL("../../../testdata/config/mixed-ec2-fargate.yaml", import.meta.url),
     "utf8",
   ),
 );

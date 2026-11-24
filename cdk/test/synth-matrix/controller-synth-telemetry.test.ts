@@ -12,15 +12,15 @@ import { join } from "node:path";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 import { Template } from "aws-cdk-lib/assertions";
-import { compileConfig } from "../lib/config/compiler.ts";
-import { synthesizeController } from "../lib/infrastructure/controller-stack.ts";
-import { resolveControllerTelemetry } from "../lib/infrastructure/controller-telemetry.ts";
-import type { ControllerTelemetrySettings } from "../lib/infrastructure/controller-telemetry.ts";
-import { deployController } from "../lib/infrastructure/deploy-controller.ts";
-import { controllerStackName } from "../lib/infrastructure/deployment-input.ts";
+import { compileConfig } from "../../lib/config/compiler.ts";
+import { synthesizeController } from "../../lib/infrastructure/controller-stack.ts";
+import { resolveControllerTelemetry } from "../../lib/infrastructure/controller-telemetry.ts";
+import type { ControllerTelemetrySettings } from "../../lib/infrastructure/controller-telemetry.ts";
+import { deployController } from "../../lib/infrastructure/deploy-controller.ts";
+import { controllerStackName } from "../../lib/infrastructure/deployment-input.ts";
 
 const configPath = fileURLToPath(
-  new URL("../../testdata/config/ec2-only-pinned.yaml", import.meta.url),
+  new URL("../../../testdata/config/ec2-only-pinned.yaml", import.meta.url),
 );
 const compiled = compileConfig(readFileSync(configPath, "utf8"));
 const { aws } = compiled.runtime.spec;
@@ -347,7 +347,10 @@ test("typed telemetry rejects unknown fields, plaintext headers and malformed ho
 test("telemetry and explicit Fargate preflight coexist in the same controller container", () => {
   const configuration = compileConfig(
     readFileSync(
-      new URL("../../testdata/config/mixed-ec2-fargate.yaml", import.meta.url),
+      new URL(
+        "../../../testdata/config/mixed-ec2-fargate.yaml",
+        import.meta.url,
+      ),
       "utf8",
     ),
   );
@@ -397,7 +400,10 @@ test("the synth CLI consumes an explicit telemetry document and ignores ambient 
   const run = (entry: string) =>
     spawnSync(
       process.execPath,
-      [fileURLToPath(new URL(`../bin/${entry}.ts`, import.meta.url)), ...args],
+      [
+        fileURLToPath(new URL(`../../bin/${entry}.ts`, import.meta.url)),
+        ...args,
+      ],
       {
         encoding: "utf8",
         env: {

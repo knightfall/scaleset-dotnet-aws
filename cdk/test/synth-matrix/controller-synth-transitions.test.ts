@@ -11,21 +11,24 @@ import { join } from "node:path";
 import { test } from "node:test";
 import { Match, Template } from "aws-cdk-lib/assertions";
 import { stringify } from "yaml";
-import { compileConfig } from "../lib/config/compiler.ts";
-import type { ControllerConfig, RunnerProfile } from "../lib/config/types.ts";
-import { parseYaml } from "../lib/config/yaml.ts";
-import { synthesizeController } from "../lib/infrastructure/controller-stack.ts";
-import { deployController } from "../lib/infrastructure/deploy-controller.ts";
-import type { CommandResult } from "../lib/infrastructure/deploy-controller.ts";
+import { compileConfig } from "../../lib/config/compiler.ts";
+import type {
+  ControllerConfig,
+  RunnerProfile,
+} from "../../lib/config/types.ts";
+import { parseYaml } from "../../lib/config/yaml.ts";
+import { synthesizeController } from "../../lib/infrastructure/controller-stack.ts";
+import { deployController } from "../../lib/infrastructure/deploy-controller.ts";
+import type { CommandResult } from "../../lib/infrastructure/deploy-controller.ts";
 import {
   controllerStackName,
   deploymentIdentity,
   trackingTableName,
-} from "../lib/infrastructure/deployment-input.ts";
+} from "../../lib/infrastructure/deployment-input.ts";
 
 const source = parseYaml(
   readFileSync(
-    new URL("../../testdata/config/mixed-ec2-fargate.yaml", import.meta.url),
+    new URL("../../../testdata/config/mixed-ec2-fargate.yaml", import.meta.url),
     "utf8",
   ),
 ) as ControllerConfig;

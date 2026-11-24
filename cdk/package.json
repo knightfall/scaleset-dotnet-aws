@@ -17,8 +17,8 @@
     "lint": "eslint --max-warnings 0 .",
     "format:check": "prettier --check .",
     "typecheck": "tsc --noEmit",
-    "test": "node --test 'test/**/*.test.ts'",
-    "test:synth-matrix": "node --test 'test/controller-synth-*.test.ts'",
+    "test": "node --test 'test/*.test.ts' && npm run test:synth-matrix",
+    "test:synth-matrix": "node --test 'test/synth-matrix/*.test.ts'",
     "synth": "cdk synth --strict --no-lookups --app 'node bin/controller.ts --config ../testdata/config/mixed-ec2-fargate.yaml --generation 1'",
     "deploy:controller": "node bin/deploy-controller.ts"
   },
