@@ -2,8 +2,9 @@
 
 The release process distributes the controller as two Linux OCI archives through
 [GitHub Releases](https://github.com/knightfall/scaleset-dotnet-aws/releases).
-Each architecture has an SPDX image SBOM. The release also includes the license,
-a source-bound manifest, and SHA-256 checksums. Use the
+Each architecture has an SPDX image SBOM and a Grype advisory report. The
+release also includes the license, a source-bound manifest, and SHA-256
+checksums. Use the
 [deployment runbook](../operator-runbook.md) to import the selected image into
 the operator's ECR repository and qualify it for deployment.
 
@@ -33,27 +34,31 @@ own ECR registry when importing an archive. [GitHub artifact attestations](https
 ## Select a verified candidate
 
 1. Select a commit on `main` whose [CI push run](https://github.com/knightfall/scaleset-dotnet-aws/actions/workflows/ci.yml) passed. Review the changes and qualification notes. Choose a `vMAJOR.MINOR.PATCH` tag, with an optional prerelease suffix such as `-alpha.1`.
-2. Select the successful [Controller release candidate](https://github.com/knightfall/scaleset-dotnet-aws/actions/workflows/release-candidate.yml) run at that same commit. The workflow builds on native GitHub-hosted amd64 and arm64 runners, verifies each OCI archive against its tested assembly, smoke-tests each image on a read-only filesystem with networking disabled, and inventories the tested images with Syft. The sealing job records the exact commit, run ID and attempt in `release.json`, attests that manifest, and uploads the combined artifact for 30 days.
-3. [Download and verify the candidate](VERIFYING.md#inspect-an-actions-candidate) to inspect its manifest and payloads before approving. If the build needs a retry, rerun all candidate jobs or dispatch a new candidate from the same main head. The sealed artifact binds both architecture builds to one run attempt.
+2. Select the successful [Controller release candidate](https://github.com/knightfall/scaleset-dotnet-aws/actions/workflows/release-candidate.yml) run at that same commit. Native GitHub-hosted amd64 and arm64 jobs verify and smoke-test the OCI archives, scan them with Grype, and inventory them with Syft. An unavailable advisory database, a failed scan, or a High or Critical match blocks sealing. The sealing job records both OCI and scan identities, commit, run ID, and attempt in `release.json`, attests the manifest, and uploads the combined artifact for 30 days. Review the [image advisory record](IMAGE-SECURITY.md) when the base or scan results change.
+3. [Download and verify the candidate](VERIFYING.md#inspect-an-actions-candidate). Record its run ID, attempt and verified manifest SHA-256 for dispatch. If the build needs a retry, rerun all candidate jobs or dispatch a new candidate from the same main head and verify that attempt before selecting it.
 4. Create the release tag at the selected commit with the authorized release identity. Check the tag, CI run, and candidate run before dispatch. Dispatch from `main` while it points to that commit.
 
 ```sh
 repo=knightfall/scaleset-dotnet-aws
 tag=v0.1.0-alpha.1  # Example version. Select the actual approved release tag.
 candidate_run_id=123456789  # Replace with the selected main candidate run ID.
+candidate_attempt=1        # Replace with the inspected run attempt.
+candidate_manifest_sha256="<sha256-from-the-inspected-manifest>"
 
 gh workflow run release.yml --repo "$repo" --ref main \
-  -f "tag=$tag" -f "candidate_run_id=$candidate_run_id"
+  -f "tag=$tag" -f "candidate_run_id=$candidate_run_id" \
+  -f "candidate_attempt=$candidate_attempt" -f "candidate_manifest_sha256=$candidate_manifest_sha256"
 ```
 
 ## Approve publication
 
-Review the dispatch commit, tag and candidate ID in the workflow run, then
-approve the `production` job. The job checks the exact remote tag, successful
-main CI and candidate run, selects the unexpired artifact by ID, verifies its
-provenance and checks every payload against the attested manifest. It publishes
-those same bytes to the existing tag. A tag with a prerelease suffix produces
-a GitHub prerelease.
+The verification job checks the tag, exact main CI and candidate attempt,
+build provenance and payload digests before `production` approval. Compare
+its run summary with the recorded commit, tag, candidate run, attempt, artifact
+ID and manifest digest. The protected job downloads that exact artifact ID,
+rechecks the approved manifest SHA-256 and every payload, then publishes those
+bytes to the existing tag. A tag with a prerelease suffix produces a GitHub
+prerelease.
 
 The workflow only accepts a tag at the dispatch commit. Review and dispatch
 again if main advanced before dispatch. Use a new version to supersede a

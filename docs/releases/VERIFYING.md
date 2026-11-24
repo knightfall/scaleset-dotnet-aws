@@ -22,24 +22,28 @@ GitHub verifies the release attestation and asset digests. The checksum file als
 supports subsequent offline checks once the release assets have been
 authenticated. [GitHub CLI release verification](https://cli.github.com/manual/gh_release_verify)
 
-## Verify the candidate provenance
+## Verify the published manifest and payloads
 
-Resolve the release tag to its commit in the remote repository or a trusted
-checkout. For an annotated tag, use the commit it points to. Then verify the
-build manifest against that commit.
+Resolve the release tag to its commit at the upstream GitHub repository. For an
+annotated tag, use the commit it points to. Run the following from a trusted
+checkout of that exact commit. The verifier reads the authenticated manifest and
+checks the exact asset set and every payload digest, including the OCI archives
+and their SBOMs. Complete this check before loading an archive or pushing to ECR.
 
 ```sh
-commit="<expected-40-character-commit>"
+commit="<verified-40-character-tag-commit>"
+test "$(git rev-parse HEAD)" = "$commit" || exit 1
 gh attestation verify "$download_dir/release.json" --repo "$repo" \
   --signer-workflow "$repo/.github/workflows/release-candidate.yml" \
-  --source-ref refs/heads/main --source-digest "$commit" --deny-self-hosted-runners
+  --source-ref refs/heads/main --source-digest "$commit" --deny-self-hosted-runners || exit 1
+python3 .github/release/candidate.py verify "$download_dir" --commit "$commit" || exit 1
 ```
 
 ### Inspect an Actions candidate
 
 Run these commands from the reviewed checkout with the commit, run ID, and
-attempt shown on the Actions run page. The build attestation is checked before
-the local verifier reads the payloads.
+attempt shown on the Actions run page. Record the manifest SHA-256 after the
+attestation and payload checks succeed. Use that digest for publish dispatch.
 
 ```sh
 repo=knightfall/scaleset-dotnet-aws
@@ -48,13 +52,16 @@ candidate_run_id=123456789  # Replace with the selected run ID.
 candidate_attempt=1        # Replace with the selected run attempt.
 download_dir=$(mktemp -d)
 
+test "$(git rev-parse HEAD)" = "$commit" || exit 1
 gh run download "$candidate_run_id" --repo "$repo" \
   --name "controller-candidate-$commit-$candidate_attempt" --dir "$download_dir" || exit 1
 gh attestation verify "$download_dir/release.json" --repo "$repo" \
   --signer-workflow "$repo/.github/workflows/release-candidate.yml" \
   --source-ref refs/heads/main --source-digest "$commit" --deny-self-hosted-runners || exit 1
 python3 .github/release/candidate.py verify "$download_dir" \
-  --commit "$commit" --run-id "$candidate_run_id" --attempt "$candidate_attempt"
+  --commit "$commit" --run-id "$candidate_run_id" --attempt "$candidate_attempt" || exit 1
+candidate_manifest_sha256=$(shasum -a 256 "$download_dir/release.json" | cut -d ' ' -f 1)
+printf '%s\n' "$candidate_manifest_sha256"
 ```
 
 ## Choose the deployment archive
@@ -63,6 +70,7 @@ python3 .github/release/candidate.py verify "$download_dir" \
 digest. Choose `linux-x64` for ECS x86-64 or `linux-arm64` for ECS Arm.
 The corresponding `.spdx.json` inventories that image. After importing the
 archive into ECR, bind the confirmed ECR manifest digest in the controller
-YAML. Follow the [registry and runtime verification steps](../operator-runbook.md#pin-the-registry-manifest).
+YAML. Each `.grype.json` records the architecture's scan and database evidence
+at build time. Follow the [registry and runtime verification steps](../operator-runbook.md#pin-the-registry-manifest).
 
 [GitHub CLI build provenance verification](https://cli.github.com/manual/gh_attestation_verify)

@@ -11,35 +11,47 @@ on:
         description: Successful Controller release candidate run ID at this commit
         required: true
         type: string
+      candidate_attempt:
+        description: Exact successful candidate attempt inspected for release
+        required: true
+        type: string
+      candidate_manifest_sha256:
+        description: SHA-256 of the inspected and attested release.json
+        required: true
+        type: string
 
 permissions: {}
+
+env:
+  RELEASE_TAG: ${{ inputs.tag }}
+  CANDIDATE_RUN_ID: ${{ inputs.candidate_run_id }}
+  CANDIDATE_ATTEMPT: ${{ inputs.candidate_attempt }}
+  CANDIDATE_MANIFEST_SHA256: ${{ inputs.candidate_manifest_sha256 }}
 
 concurrency:
   group: publish-controller-release
   cancel-in-progress: false
 
 jobs:
-  publish:
+  inspect:
+    name: Verify the exact candidate before approval
     if: github.repository == 'knightfall/scaleset-dotnet-aws' && github.ref == 'refs/heads/main'
-    environment: production
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 10
     permissions:
       actions: read
       attestations: read
-      contents: write
-    env:
-      RELEASE_TAG: ${{ inputs.tag }}
-      CANDIDATE_RUN_ID: ${{ inputs.candidate_run_id }}
+      contents: read
+    outputs:
+      artifact_id: ${{ steps.preflight.outputs.artifact_id }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Verify protections, tag and exact candidate and CI runs
+      - name: Verify the tag and exact candidate and CI runs
         id: preflight
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_SETTINGS_READ_TOKEN: ${{ secrets.RELEASE_SETTINGS_READ_TOKEN }}
         run: bash .github/release/preflight.sh
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
@@ -48,19 +60,53 @@ jobs:
           github-token: ${{ github.token }}
           path: ${{ runner.temp }}/candidate
           merge-multiple: true
+      - name: Verify and display the candidate for the production reviewer
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ARTIFACT_ID: ${{ steps.preflight.outputs.artifact_id }}
+        run: |
+          bash .github/release/verify-bundle.sh "$RUNNER_TEMP/candidate"
+          {
+            printf '### Verified controller release candidate\n\n'
+            printf -- '- Tag `%s` at commit `%s`\n' "$RELEASE_TAG" "$GITHUB_SHA"
+            printf -- '- Candidate run `%s`, attempt `%s`, artifact `%s`\n' \
+              "$CANDIDATE_RUN_ID" "$CANDIDATE_ATTEMPT" "$ARTIFACT_ID"
+            printf -- '- Manifest SHA-256 `%s`\n' "$CANDIDATE_MANIFEST_SHA256"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  publish:
+    needs: inspect
+    environment: production
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      actions: read
+      attestations: read
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Verify production protections
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_SETTINGS_READ_TOKEN: ${{ secrets.RELEASE_SETTINGS_READ_TOKEN }}
+        run: bash .github/release/production.sh
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          artifact-ids: ${{ needs.inspect.outputs.artifact_id }}
+          run-id: ${{ inputs.candidate_run_id }}
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/candidate
+          merge-multiple: true
       - name: Verify provenance and all release bytes
         env:
           GH_TOKEN: ${{ github.token }}
-          CANDIDATE_ATTEMPT: ${{ steps.preflight.outputs.attempt }}
-        run: |
-          gh attestation verify "$RUNNER_TEMP/candidate/release.json" --repo "$GITHUB_REPOSITORY" \
-            --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release-candidate.yml" \
-            --source-ref refs/heads/main --source-digest "$GITHUB_SHA" --deny-self-hosted-runners
-          python3 .github/release/candidate.py verify "$RUNNER_TEMP/candidate" \
-            --commit "$GITHUB_SHA" --run-id "$CANDIDATE_RUN_ID" --attempt "$CANDIDATE_ATTEMPT"
+        run: bash .github/release/verify-bundle.sh "$RUNNER_TEMP/candidate"
       - name: Publish verified assets to the existing tag
         env:
           GH_TOKEN: ${{ github.token }}
+          ARTIFACT_ID: ${{ needs.inspect.outputs.artifact_id }}
         run: |
           source .github/release/tag.sh
           require_release_tag "$RELEASE_TAG" "$GITHUB_SHA"
@@ -69,4 +115,6 @@ jobs:
             flags+=(--prerelease --latest=false)
           fi
           gh release create "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
-            --verify-tag --generate-notes "${flags[@]}" "$RUNNER_TEMP/candidate"/*
+            --verify-tag --generate-notes \
+            --notes "Verified controller candidate run $CANDIDATE_RUN_ID, attempt $CANDIDATE_ATTEMPT, artifact $ARTIFACT_ID. Manifest SHA-256: \`$CANDIDATE_MANIFEST_SHA256\`." \
+            "${flags[@]}" "$RUNNER_TEMP/candidate"/*

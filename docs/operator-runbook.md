@@ -44,8 +44,9 @@ python3 tests/oci/verify_controller_image.py "$archive" "$arch" --assembly \
   src/Knightfall.ScaleSet.Aws.Controller/bin/Release/net10.0/Knightfall.ScaleSet.Aws.Controller.dll
 ```
 
-For a downloaded release, use `download_dir` and `commit` from the verification
-steps. Select the architecture configured in your YAML.
+For a downloaded release, complete the [attested manifest and payload checks](releases/VERIFYING.md#verify-the-published-manifest-and-payloads)
+before importing any image. Use `download_dir` and `commit` from that verified
+release. Select the architecture configured in your YAML.
 
 ```sh
 rid=linux-arm64
