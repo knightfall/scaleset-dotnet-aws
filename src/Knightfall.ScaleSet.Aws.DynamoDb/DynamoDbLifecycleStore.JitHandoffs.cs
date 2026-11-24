@@ -1,3 +1,4 @@
+using System.Collections.Immutable;
 using System.Security.Cryptography;
 using System.Text.Json;
 using Amazon.DynamoDBv2.Model;
@@ -19,6 +20,38 @@ public sealed partial class DynamoDbLifecycleStore
         {
             return null;
         }
+        return DecodeHandoff(profile, allocationId, item);
+    }
+
+    /// <summary>Reads one strongly consistent page of outstanding handoffs for terminal cleanup.</summary>
+    public async Task<JitHandoffPage> ReadOutstandingJitHandoffPageAsync(
+        LifecycleProfile profile, string? continuation, CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(profile);
+        const string prefix = "HANDOFF#";
+        var page = await ReadBasePageAsync(profile.PartitionKey, prefix, continuation, cancellationToken).ConfigureAwait(false);
+        var outstanding = ImmutableArray.CreateBuilder<JitHandoffSnapshot>();
+        foreach (var item in page.Items)
+        {
+            string key = Text(item, "SK");
+            if (!key.StartsWith(prefix, StringComparison.Ordinal) ||
+                !Guid.TryParseExact(key.AsSpan(prefix.Length), "D", out var allocation) || allocation == Guid.Empty)
+            {
+                throw InvalidRecord();
+            }
+            var expected = LifecycleKey.Handoff(profile, allocation);
+            RequireKey(item, expected.PartitionKey, expected.SortKey);
+            var handoff = DecodeHandoff(profile, allocation, item);
+            if (handoff.State != JitHandoffState.ResourceTerminated)
+            {
+                outstanding.Add(handoff);
+            }
+        }
+        return new JitHandoffPage(outstanding.ToImmutable(), page.Continuation);
+    }
+
+    private static JitHandoffSnapshot DecodeHandoff(LifecycleProfile profile, Guid allocationId, Dictionary<string, AttributeValue> item)
+    {
         try
         {
             CheckNoExpiration(item);
