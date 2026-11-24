@@ -165,7 +165,15 @@ public sealed partial class DynamoDbEffectDispatcher
             };
         }
 
-        return await SendAsync(lease, clockEvidence, guard, permission, provider, token).ConfigureAwait(false);
+        try
+        {
+            return await SendAsync(lease, clockEvidence, guard, permission, provider, token).ConfigureAwait(false);
+        }
+        catch when (trackedEc2Launch && !permission.HasStartedSending)
+        {
+            _ = await AbandonNoSendAsync(lease, permission).ConfigureAwait(false);
+            throw;
+        }
     }
 
     private async Task<EffectDispatchStatus> SendAsync(
@@ -181,7 +189,7 @@ public sealed partial class DynamoDbEffectDispatcher
         if (effect is null || effect.Revision != permission.Revision || effect.Entry.State != EffectState.Executing ||
             effect.TransitionId != permission.BeginTransitionId || effect.Entry.Attempt != permission.Attempt || !effect.Entry.Envelope.Matches(envelope))
         {
-            return await AbandonNoSendAsync(lease, permission, cancellationToken).ConfigureAwait(false);
+            return await AbandonNoSendAsync(lease, permission).ConfigureAwait(false);
         }
 
         var allocation = await _store.ReadExecutorAsync(envelope.Profile, guard.AllocationId, cancellationToken).ConfigureAwait(false);
@@ -190,9 +198,14 @@ public sealed partial class DynamoDbEffectDispatcher
         if (allocation?.Revision != guard.AllocationRevision || !AllocationAllows(envelope.Request, allocation, _clock.GetUtcNow()) ||
             catalog is null || catalog.Revision != guard.Catalog.Revision || catalog.TransitionId != guard.Catalog.TransitionId ||
             catalog.AppliedGeneration != guard.Catalog.AppliedGeneration || current is null ||
-            Window(current, clockEvidence) is not { } window || !permission.TryConsume(out var remaining))
+            Window(current, clockEvidence) is not { } window)
         {
-            return await AbandonNoSendAsync(lease, permission, cancellationToken).ConfigureAwait(false);
+            return await AbandonNoSendAsync(lease, permission).ConfigureAwait(false);
+        }
+        cancellationToken.ThrowIfCancellationRequested();
+        if (!permission.TryConsume(out var remaining))
+        {
+            return await AbandonNoSendAsync(lease, permission).ConfigureAwait(false);
         }
 
         var started = _clock.GetUtcNow();
@@ -208,11 +221,11 @@ public sealed partial class DynamoDbEffectDispatcher
         return outcome == LifecycleWriteOutcome.Committed ? EffectDispatchStatus.Settled : EffectDispatchStatus.AwaitingEvidence;
     }
 
-    private async Task<EffectDispatchStatus> AbandonNoSendAsync(
-        ControllerLease lease, EffectSendAuthorization permission, CancellationToken cancellationToken)
+    private async Task<EffectDispatchStatus> AbandonNoSendAsync(ControllerLease lease, EffectSendAuthorization permission)
     {
         if (permission.Envelope.Request is Ec2LaunchEffectRequest { OwnershipTags: not null } &&
-            await _journal.AbandonUnsentEffectAsync(lease, permission, cancellationToken).ConfigureAwait(false) == LifecycleWriteOutcome.Committed)
+            await _journal.FinalizeInterruptedEffectAsync(lease, permission, _timing.WriteReserve).ConfigureAwait(false) ==
+                LifecycleWriteOutcome.Committed)
         {
             return EffectDispatchStatus.Settled;
         }

@@ -327,6 +327,54 @@ public sealed class Ec2LaunchJournalTests
         Assert.Empty(pending.Launches);
     }
 
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task CancellationAfterPersistingBeginReleasesTheProvenUnsentLaunch(bool cancelBeginResponse)
+    {
+        var cancellation = TestContext.Current.CancellationToken;
+        using var table = await MiniStackTable.CreateAsync(cancellation);
+        var fixture = await CreateFixtureAsync(table, cancellation);
+        var first = Launch(fixture, Guid.NewGuid(), 0, 'a', Guid.NewGuid());
+        await PlanAsync(fixture, first, cancellation);
+        var provider = new Provider(fixture.Clock);
+        var opKey = LifecycleKey.Operation(fixture.Profile, first.IntentId);
+        var begin = cancelBeginResponse
+            ? table.Wire.PauseAfterNextSuccessfulTransactionWrite(opKey)
+            : table.Wire.PauseNextTransactionWrite(opKey);
+        using var request = CancellationTokenSource.CreateLinkedTokenSource(cancellation);
+        var dispatch = DispatchAsync(fixture, first, provider, request.Token);
+
+        MiniStackWire.PausedRequest? postBegin = null;
+        try
+        {
+            await begin.Captured.WaitAsync(TimeSpan.FromSeconds(10), cancellation);
+            if (!cancelBeginResponse)
+            {
+                postBegin = table.Wire.PauseNextRead(opKey);
+                begin.Resume();
+                await postBegin.Captured.WaitAsync(TimeSpan.FromSeconds(10), cancellation);
+            }
+            Assert.Equal(EffectState.Executing, (await ReadAsync(fixture, first, cancellation)).Entry.State);
+        }
+        finally
+        {
+            await request.CancelAsync();
+            postBegin?.Resume();
+            begin.Resume();
+        }
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => dispatch);
+        Assert.Equal(1, provider.Checks);
+        Assert.Empty(provider.Sends);
+        var settled = await ReadAsync(fixture, first, cancellation);
+        Assert.Equal(EffectResolutionKind.AbandonedBeforeSend, settled.Entry.Resolution?.Kind);
+        Assert.Equal(settled.Entry.Attempt?.Id, settled.Entry.Resolution?.AttemptId);
+        var pending = Assert.IsType<PendingEc2LaunchPage>(await fixture.Store.ReadPendingEc2LaunchesAsync(
+            fixture.Profile, fixture.Lease.Fence, null, cancellation));
+        Assert.Empty(pending.Launches);
+    }
+
     [Fact]
     public async Task AChangedAllocationAfterConfirmedBeginReleasesOnlyTheOriginalNeverSentAttempt()
     {

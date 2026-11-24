@@ -198,30 +198,36 @@ public sealed partial class DynamoDbEffectJournal
         }
         var entry = current.Entry.Begin(attemptId, lease.Fence.Epoch, now, requestedDeadline, LeaseDeadline(lease, now, leaseReserve));
         var attempt = entry.Attempt!;
-        var outcome = guard is null
-            ? await WriteAsync(lease, entry, current.Revision, transitionId, cancellationToken).ConfigureAwait(false)
-            : await _store.WriteDispatchedEffectAsync(entry.Envelope.Profile, lease.Fence, transitionId,
-                new EffectWrite(entry.Envelope.IntentId, current.Revision, entry.State, entry.WritePayload()),
-                guard, attempt.Deadline, cancellationToken).ConfigureAwait(false);
+        var permission = new EffectSendAuthorization(entry.Envelope, attempt, checked(current.Revision + 1), transitionId, lease.Fence,
+            _timeProvider, beganAt, upperUtcNow);
+        LifecycleWriteOutcome outcome;
+        try
+        {
+            outcome = guard is null
+                ? await WriteAsync(lease, entry, current.Revision, transitionId, cancellationToken).ConfigureAwait(false)
+                : await _store.WriteDispatchedEffectAsync(entry.Envelope.Profile, lease.Fence, transitionId,
+                    new EffectWrite(entry.Envelope.IntentId, current.Revision, entry.State, entry.WritePayload()),
+                    guard, attempt.Deadline, cancellationToken).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested &&
+            entry.Envelope.Request is Ec2LaunchEffectRequest { OwnershipTags: not null })
+        {
+            // An exact committed Begin can be discarded because no authorization reached the caller.
+            _ = await FinalizeInterruptedEffectAsync(lease, permission, leaseReserve).ConfigureAwait(false);
+            throw;
+        }
         if (outcome != LifecycleWriteOutcome.Committed)
         {
             return new EffectBeginOutcome(outcome, null);
         }
-        var permission = new EffectSendAuthorization(entry.Envelope, attempt, checked(current.Revision + 1), transitionId, lease.Fence,
-            _timeProvider, beganAt, upperUtcNow);
-        if (cancellationToken.IsCancellationRequested)
-        {
-            await FinalizeInterruptedRunnerEffectAsync(lease, permission, leaseReserve).ConfigureAwait(false);
-            return new EffectBeginOutcome(outcome, null);
-        }
-        if (permission.EstimateUtcNow() < attempt.Deadline)
+        if (!cancellationToken.IsCancellationRequested && permission.EstimateUtcNow() < attempt.Deadline)
         {
             return new EffectBeginOutcome(outcome, permission);
         }
         if (EffectJournalEntry.AllowsAbandonmentBeforeSend(entry.Envelope))
         {
             // The known commit completed too late, before any caller could use the send authorization.
-            var abandoned = await AbandonUnsentEffectAsync(lease, permission, cancellationToken).ConfigureAwait(false);
+            var abandoned = await FinalizeInterruptedEffectAsync(lease, permission, leaseReserve).ConfigureAwait(false);
             return new EffectBeginOutcome(outcome, null) { AbandonedBeforeSend = abandoned == LifecycleWriteOutcome.Committed };
         }
         return new EffectBeginOutcome(outcome, null);

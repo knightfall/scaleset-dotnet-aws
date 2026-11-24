@@ -10,17 +10,30 @@ public sealed partial class DynamoDbEffectJournal
     public async Task FinalizeInterruptedRunnerEffectAsync(
         ControllerLease lease, EffectSendAuthorization authorization, TimeSpan writeReserve)
     {
-        var envelope = authorization.Envelope;
-        if (lease.Mode != ControllerLeaseMode.Active || lease.Fence != authorization.Lease ||
-            envelope.Request is not (GitHubJitGenerateEffectRequest or GitHubRunnerRemoveEffectRequest))
+        if (authorization.Envelope.Request is GitHubJitGenerateEffectRequest or GitHubRunnerRemoveEffectRequest)
         {
-            return;
+            _ = await FinalizeInterruptedEffectAsync(lease, authorization, writeReserve).ConfigureAwait(false);
+        }
+    }
+
+    internal async Task<LifecycleWriteOutcome> FinalizeInterruptedEffectAsync(
+        ControllerLease lease, EffectSendAuthorization authorization, TimeSpan writeReserve)
+    {
+        var envelope = authorization.Envelope;
+        if (lease.Mode != ControllerLeaseMode.Active || lease.Fence != authorization.Lease)
+        {
+            return LifecycleWriteOutcome.LeaseRejected;
+        }
+        if (!EffectJournalEntry.AllowsAbandonmentBeforeSend(envelope) ||
+            (authorization.HasStartedSending && envelope.Request is Ec2LaunchEffectRequest))
+        {
+            return LifecycleWriteOutcome.Conflict;
         }
         var remaining = lease.ValidUntil - authorization.EstimateUtcNow();
         var budget = remaining < writeReserve ? remaining : writeReserve;
         if (budget <= TimeSpan.Zero)
         {
-            return;
+            return LifecycleWriteOutcome.LeaseRejected;
         }
 
         using var cleanup = new CancellationTokenSource(budget, _timeProvider);
@@ -28,8 +41,7 @@ public sealed partial class DynamoDbEffectJournal
         {
             if (!authorization.HasStartedSending)
             {
-                _ = await AbandonUnsentRunnerEffectAsync(lease, authorization, cleanup.Token).ConfigureAwait(false);
-                return;
+                return await AbandonUnsentEffectAsync(lease, authorization, cleanup.Token).ConfigureAwait(false);
             }
             var current = await ReadAsync(envelope.Profile, envelope.IntentId, cleanup.Token).ConfigureAwait(false);
             if (current is { Entry.State: EffectState.Executing } &&
@@ -37,9 +49,10 @@ public sealed partial class DynamoDbEffectJournal
                 current.Entry.Attempt == authorization.Attempt && current.Entry.Envelope.Matches(envelope))
             {
                 var uncertain = current.Entry.MarkUncertain(authorization.Attempt.Id);
-                _ = await _store.WriteExactEffectAsync(lease.Fence, Guid.NewGuid(), current, uncertain,
+                return await _store.WriteExactEffectAsync(lease.Fence, Guid.NewGuid(), current, uncertain,
                     authorization.EstimateUtcNow(), cleanup.Token).ConfigureAwait(false);
             }
+            return LifecycleWriteOutcome.Conflict;
         }
         catch (OperationCanceledException) when (cleanup.IsCancellationRequested)
         {
@@ -49,6 +62,7 @@ public sealed partial class DynamoDbEffectJournal
         {
             // An unavailable store cannot confirm the exact transition.
         }
+        return LifecycleWriteOutcome.Indeterminate;
     }
 
     /// <summary>Settles an exact initial GitHub runner effect whose send authorization can still be discarded.</summary>
