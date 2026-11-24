@@ -20,7 +20,7 @@ const uint group = 1500;
 const uint user = 1500;
 const string instanceArn = "arn:aws:ec2:ap-southeast-2:111122223333:instance/i-0123456789abcdef1";
 const UnixFileMode Private = UnixFileMode.UserRead | UnixFileMode.UserWrite;
-using var cancel = new CancellationTokenSource(TimeSpan.FromSeconds(15));
+using var cancel = new CancellationTokenSource(TimeSpan.FromSeconds(20));
 
 Directory.CreateDirectory(privateState, Private | UnixFileMode.UserExecute);
 Directory.CreateDirectory(Path.Combine(runtime, "bin"));
@@ -93,7 +93,7 @@ using var key = JitRecipientKey.Create();
 var identity = new JitHandoffIdentity("fixture", "test", "github.com/test/test", 12, Guid.NewGuid(), instanceArn, Guid.NewGuid(),
     "AROAFIXTUREIDENTITY0001:i-0123456789abcdef1");
 var binding = JitOfferBinding.Create(identity, key.Hello.BootNonce, DateTimeOffset.UtcNow.AddMinutes(1));
-const string runner = "ss-fixture";
+string runner = "ss-" + binding.OfferId[..48];
 var members = new Dictionary<string, string>(StringComparer.Ordinal)
 {
     [".runner"] = Convert.ToBase64String(JsonSerializer.SerializeToUtf8Bytes(new { AgentId = 17, AgentName = runner, Ephemeral = true, WorkFolder = "_work" })),
@@ -103,17 +103,36 @@ var members = new Dictionary<string, string>(StringComparer.Ordinal)
 byte[] jit = Encoding.ASCII.GetBytes(Convert.ToBase64String(JsonSerializer.SerializeToUtf8Bytes(members)));
 var envelope = JitOfferCryptography.Seal(binding, key.Hello, jit, TimeProvider.System);
 using var plaintext = key.Open(envelope, identity, TimeProvider.System);
-var readyIds = new List<long>();
-var completion = await new LinuxOneJobRunner(boundary).RunAsync(plaintext, runner, (id, _) =>
+var readyStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+var releaseReady = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+var observations = new List<(long RunnerId, bool Exited)>();
+var execution = RunnerBootstrap.RunOneJobAsync(new LinuxOneJobRunner(boundary), plaintext, key.Hello, binding.OfferId,
+    async (observation, token) =>
+    {
+        observations.Add((observation.RunnerId, observation.Exited));
+        if (!observation.Exited)
+        {
+            readyStarted.TrySetResult();
+            await releaseReady.Task.WaitAsync(token);
+            throw new IOException("Synthetic readiness status failure.");
+        }
+    }, TimeProvider.System, cancel.Token);
+try
 {
-    readyIds.Add(id);
-    return Task.CompletedTask;
-}, cancel.Token);
+    await readyStarted.Task.WaitAsync(cancel.Token);
+    // The listener has no work after the two ready lines. Hold status beyond the pipe drain budget.
+    await Task.Delay(TimeSpan.FromSeconds(6), cancel.Token);
+}
+finally
+{
+    releaseReady.TrySetResult();
+}
 
-if (completion is not { RunnerId: 17, ExitCode: 0 } || readyIds.Count != 1 || readyIds[0] != 17 ||
+var completion = await execution;
+if (completion is not { RunnerId: 17, ExitCode: 0 } || !observations.SequenceEqual([(17L, false), (17L, true)]) ||
     Directory.EnumerateFiles(runtime, ".*credentials*").Any() || File.Exists(Path.Combine(runtime, ".runner")))
 {
-    throw new InvalidOperationException("The Linux one-job launcher did not complete and erase its volatile configuration.");
+    throw new InvalidOperationException("The Linux launcher did not report the exact runner exit and erase its volatile configuration.");
 }
 try
 {

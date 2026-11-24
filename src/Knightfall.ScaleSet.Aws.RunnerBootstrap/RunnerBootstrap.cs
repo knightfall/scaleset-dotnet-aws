@@ -87,11 +87,83 @@ public sealed class RunnerBootstrap(
         }
         using (plaintext)
         {
-            var result = await runner.RunAsync(plaintext, "ss-" + offer.Binding.OfferId[..48],
-                (id, token) => ReportAsync(hello, offer.Binding.OfferId, id, exited: false, token), cancellationToken)
+            var result = await RunOneJobAsync(runner, plaintext, hello, offer.Binding.OfferId, observe, clock, cancellationToken)
                 .ConfigureAwait(false);
-            await ReportAsync(hello, offer.Binding.OfferId, result.RunnerId, exited: true, cancellationToken).ConfigureAwait(false);
             return result.ExitCode == 0 ? RunnerBootstrapOutcome.Completed : RunnerBootstrapOutcome.RunnerFailed;
+        }
+    }
+
+    internal static async Task<OneJobCompletion> RunOneJobAsync(IOneJobRunner runner, JitPlaintext plaintext, JitHello hello,
+        string offerId, Func<BootstrapRunnerObservation, CancellationToken, Task>? observe, TimeProvider clock,
+        CancellationToken cancellationToken)
+    {
+        var ready = new TaskCompletionSource<long?>(TaskCreationOptions.RunContinuationsAsynchronously);
+        using var runnerLifetime = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        Task readiness = ReportReadinessAsync();
+        OneJobCompletion? completion = null;
+        try
+        {
+            completion = await runner.RunAsync(plaintext, "ss-" + offerId[..48], (id, _) =>
+            {
+                // The output drain only signals readiness. Status I/O has its own lifetime.
+                ready.TrySetResult(id);
+                return Task.CompletedTask;
+            }, cancellationToken).ConfigureAwait(false);
+        }
+        finally
+        {
+            ready.TrySetResult(null);
+            if (completion is null)
+            {
+                await runnerLifetime.CancelAsync().ConfigureAwait(false);
+            }
+            await readiness.ConfigureAwait(false);
+        }
+
+        await ReportAsync(completion.RunnerId, exited: true, cancellationToken).ConfigureAwait(false);
+        return completion;
+
+        async Task ReportReadinessAsync()
+        {
+            if (await ready.Task.ConfigureAwait(false) is { } id)
+            {
+                await ReportAsync(id, exited: false, runnerLifetime.Token).ConfigureAwait(false);
+            }
+        }
+
+        async Task ReportAsync(long runnerId, bool exited, CancellationToken token)
+        {
+            if (observe is null)
+            {
+                return;
+            }
+
+            using var budget = new CancellationTokenSource(TimeSpan.FromSeconds(30), clock);
+            using var reporting = CancellationTokenSource.CreateLinkedTokenSource(token, budget.Token);
+            Task? publication = null;
+            try
+            {
+                reporting.Token.ThrowIfCancellationRequested();
+                publication = observe(new BootstrapRunnerObservation(hello, offerId, runnerId, exited), reporting.Token);
+                await publication.WaitAsync(reporting.Token).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (reporting.IsCancellationRequested)
+            {
+                if (publication is not null)
+                {
+                    _ = publication.ContinueWith(static task => _ = task.Exception, CancellationToken.None,
+                        TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
+                }
+                if (budget.IsCancellationRequested)
+                {
+                    Console.Error.WriteLine("Bootstrap status timed out.");
+                }
+            }
+            catch (Exception)
+            {
+                // Telemetry must never replace the outcome of the observed one-job process.
+                Console.Error.WriteLine("Bootstrap status was unavailable.");
+            }
         }
     }
 
@@ -116,7 +188,4 @@ public sealed class RunnerBootstrap(
             return new BootstrapOfferReceipt(BootstrapOfferStatus.NotAvailable);
         }
     }
-
-    private Task ReportAsync(JitHello hello, string offerId, long runnerId, bool exited, CancellationToken cancellationToken) =>
-        observe is null ? Task.CompletedTask : observe(new BootstrapRunnerObservation(hello, offerId, runnerId, exited), cancellationToken);
 }
