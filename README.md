@@ -1,12 +1,13 @@
 # scaleset-dotnet-aws
 
-A planned .NET 10 controller for GitHub Actions runner scale sets on AWS,
-using the released `Knightfall.ScaleSet.Client` and `Knightfall.ScaleSet.Listener`
-packages. The controller will run on ECS Fargate and provision ephemeral runners
-on Direct EC2 or standalone Fargate tasks.
+A .NET 10 controller for GitHub Actions runner scale sets on AWS. The controller
+runs on ECS Fargate and provisions ephemeral runners on Direct EC2 or standalone
+Fargate tasks using the released `Knightfall.ScaleSet.Client` and
+`Knightfall.ScaleSet.Listener` packages.
 
-The repository contains the planning baseline and build toolchain. The
-controller and deployment infrastructure are tracked in the task index.
+The implementation, CDK infrastructure, and local integration suites are in
+this repository. The operator guides cover deployment, recovery, and the checks
+required in each target environment.
 
 - [Implementation plan](docs/implementation-plan.md): architecture, configuration,
   lifecycle rules, and verification boundaries.
@@ -17,6 +18,13 @@ controller and deployment infrastructure are tracked in the task index.
 - [Task index](docs/tasks/README.md): 26 tasks across six milestones, with
   dependencies, deliverables, and acceptance criteria.
 - [Agent instructions](AGENTS.md): repository layout and engineering conventions.
+
+## Operate a deployment
+
+- Use the [operator runbook](docs/operator-runbook.md) to prepare, apply, roll back, and decommission a deployment.
+- Start with the [profile binding template](docs/profile-bindings.md) and check the runner identity, isolation, quota, and secret bindings.
+- Configure exporters and monitor individual profiles with the [telemetry guide](docs/operator-telemetry.md).
+- Record target validation against the [emulator and qualification boundaries](docs/emulator-boundaries.md).
 
 ## Build and test
 

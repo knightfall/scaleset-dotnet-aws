@@ -99,6 +99,11 @@ Exercise mixed EC2 + Fargate profiles, read-only dry-run request auditing, uncle
 
 Deliver the operator deployment/rollback runbook, profile binding template, CDK apply/destroy checklist, AMI OS/IMDS isolation verification checklist, and explicit **emulator-boundary record** explaining why conservative fail-closed defaults stay enabled.
 
+- [Deployment, rollback, and decommission runbook](../operator-runbook.md)
+- [Profile binding template and target checks](../profile-bindings.md)
+- [Telemetry configuration, views, and alert recipes](../operator-telemetry.md)
+- [Local evidence and target qualification boundaries](../emulator-boundaries.md)
+
 ### Requirements
 
 - Document the end-to-end deployment sequence (`config:emit` -> `dotnet publish /t:PublishContainer` ECR digest push -> CDK synth/diff -> `preflight table` / `preflight clock` -> ECS Fargate deploy -> `/readyz` & OTLP checks) and drain/`preflight retire`/rollback runbooks.
