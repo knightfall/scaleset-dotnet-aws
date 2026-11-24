@@ -49,8 +49,14 @@ internal sealed class SafeTelemetryLogSink(TelemetryPrivacy privacy, TelemetryEx
     public void Dispose()
     {
         Stop();
-        (_remote as IDisposable)?.Dispose();
-        (_console as IDisposable)?.Dispose();
+        try
+        {
+            (_remote as IDisposable)?.Dispose();
+        }
+        finally
+        {
+            (_console as IDisposable)?.Dispose();
+        }
     }
 
     private LogEvent Sanitize(LogEvent log, string category)

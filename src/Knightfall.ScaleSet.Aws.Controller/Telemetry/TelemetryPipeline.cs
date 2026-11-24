@@ -106,14 +106,18 @@ public sealed class TelemetryPipeline : IAsyncDisposable
         try
         {
             var remaining = ShutdownBudget - _clock.GetElapsedTime(started);
-            return remaining > TimeSpan.Zero && await cleanup.WaitAsync(remaining).ConfigureAwait(false);
+            if (remaining > TimeSpan.Zero && await cleanup.WaitAsync(remaining).ConfigureAwait(false))
+            {
+                return true;
+            }
         }
         catch (TimeoutException)
         {
-            // The underlying transports already have a joint cancellation
-            // deadline. The host does not implicitly dispose them again.
-            return false;
+            // The transports already have a joint cancellation deadline.
+            // Cleanup still observes library faults after this wait expires.
         }
+        _exports.ReportShutdownFailure();
+        return false;
     }
 
     private async Task<bool> CompleteShutdownAsync(long started)
@@ -130,18 +134,32 @@ public sealed class TelemetryPipeline : IAsyncDisposable
 
         try
         {
-            await Task.WhenAll(traces, metrics, logs).ConfigureAwait(false);
-            if (_providers is not null)
+            try
             {
-                await _providers.DisposeAsync().ConfigureAwait(false);
+                await Task.WhenAll(traces, metrics, logs).ConfigureAwait(false);
+                return traces.Result && metrics.Result;
             }
-            return traces.Result && metrics.Result;
+            finally
+            {
+                try
+                {
+                    if (_providers is not null)
+                    {
+                        await _providers.DisposeAsync().ConfigureAwait(false);
+                    }
+                }
+                finally
+                {
+                    await _transportShutdown.CancelAsync().ConfigureAwait(false);
+                    _exports.Dispose();
+                    _transportShutdown.Dispose();
+                }
+            }
         }
-        finally
+        catch (Exception ex) when (ex is IOException or HttpRequestException or TimeoutException or
+            OperationCanceledException or InvalidOperationException or AggregateException)
         {
-            await _transportShutdown.CancelAsync().ConfigureAwait(false);
-            _exports.Dispose();
-            _transportShutdown.Dispose();
+            return false;
         }
     }
 

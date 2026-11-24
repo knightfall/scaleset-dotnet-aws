@@ -35,7 +35,7 @@ internal static class TelemetryViews
             return instrument.Name switch
             {
                 "scaleset.client.requests" or "scaleset.client.request.duration" => View("dependency", "method", "status_class"),
-                "scaleset.client.retries" => View("dependency", "method", "status_class", "retry_kind"),
+                "scaleset.client.retries" => View("dependency", "method", "retry_kind"),
                 _ => MetricStreamConfiguration.Drop,
             };
         }

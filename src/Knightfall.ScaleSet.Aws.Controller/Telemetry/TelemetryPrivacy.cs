@@ -50,10 +50,14 @@ internal sealed class TelemetryPrivacy(FrozenDictionary<string, string> profiles
                 data.SetTag(key, key == "reason" && TelemetryNames.Components.Contains(data.Source.Name) ? "other" : null);
             }
         }
-        if (data.Source.Name == TelemetryNames.Http)
+        data.DisplayName = data.Source.Name switch
         {
-            data.DisplayName = data.GetTagItem("http.request.method") as string ?? "HTTP";
-        }
+            TelemetryNames.Http => data.GetTagItem("http.request.method") as string ?? "HTTP",
+            TelemetryNames.Client => "scaleset.client.request",
+            TelemetryNames.Listener when data.DisplayName == "scaleset.listener.step" => "scaleset.listener.step",
+            TelemetryNames.Listener => "scaleset.listener.operation",
+            _ => TelemetryNames.IsApplicationSpan(data.DisplayName) ? data.DisplayName : "scaleset.aws.operation",
+        };
     }
 
     private static bool AllowsTag(string source, string key, object? value, string? profile)
@@ -69,9 +73,25 @@ internal sealed class TelemetryPrivacy(FrozenDictionary<string, string> profiles
                 _ => false,
             };
         }
-        if (key == "http.request.method" && source == TelemetryNames.Client)
+        if (source == TelemetryNames.Client)
         {
-            return value is string method && TelemetryNames.IsHttpMethod(method);
+            return key switch
+            {
+                "http.request.method" => value is string method && TelemetryNames.IsHttpMethod(method),
+                "url.scheme" => value is "http" or "https",
+                "scaleset.dependency" => value is "github" or "actions" or "queue" or "other",
+                _ => false,
+            };
+        }
+        if (source == TelemetryNames.Listener)
+        {
+            return key switch
+            {
+                "scaleset.listener.operation" => value is "ReadCheckpoint" or "PersistReceived" or "Poll" or "HandleDelivery" or
+                    "PersistProcessed" or "PersistAcknowledging" or "Acknowledge" or "PersistSettled",
+                "scaleset.listener.outcome" => value is "completed" or "deferred" or "canceled" or "failed",
+                _ => false,
+            };
         }
         return key switch
         {
@@ -80,8 +100,6 @@ internal sealed class TelemetryPrivacy(FrozenDictionary<string, string> profiles
             "operation" => value is string operation && TelemetryNames.Operations.Contains(operation),
             "outcome" => value is string outcome && TelemetryNames.Outcomes.Contains(outcome),
             "reason" => value is string reason && TelemetryNames.Reasons.Contains(reason),
-            "dependency" when source == TelemetryNames.Client => value is "github" or "actions",
-            "status_class" when source == TelemetryNames.Client => value is "1xx" or "2xx" or "3xx" or "4xx" or "5xx" or "none",
             _ => false,
         };
     }

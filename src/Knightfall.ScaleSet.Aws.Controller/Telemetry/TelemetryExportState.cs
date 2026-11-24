@@ -49,6 +49,8 @@ internal sealed class TelemetryExportState(TextWriter diagnostics, TimeProvider 
 
     internal void ReportDrop(TelemetrySignal signal) => Diagnose($"OTLP {signal} queue is full. Telemetry was dropped.");
 
+    internal void ReportShutdownFailure() => Diagnose("OTLP shutdown did not complete successfully.");
+
     internal ExportReceipt? First(TelemetrySignal signal)
     {
         var task = _first[(int)signal].Task;

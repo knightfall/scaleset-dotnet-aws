@@ -14,5 +14,6 @@
     <Project Path="tests/Knightfall.ScaleSet.Aws.ListenerConsumer/Knightfall.ScaleSet.Aws.ListenerConsumer.csproj" />
     <Project Path="tests/Knightfall.ScaleSet.Aws.Providers.Tests/Knightfall.ScaleSet.Aws.Providers.Tests.csproj" />
     <Project Path="tests/Knightfall.ScaleSet.Aws.SdkContract.Tests/Knightfall.ScaleSet.Aws.SdkContract.Tests.csproj" />
+    <Project Path="tests/Knightfall.ScaleSet.Aws.Telemetry.Tests/Knightfall.ScaleSet.Aws.Telemetry.Tests.csproj" />
   </Folder>
 </Solution>

@@ -68,6 +68,20 @@ internal static class TelemetryNames
         "offer_authenticated", "listener_connected", "runner_exit_without_readiness",
     }.ToFrozenSet(StringComparer.Ordinal);
 
+    internal static bool IsApplicationSpan(string name)
+    {
+        const string prefix = "scaleset.aws.";
+        if (!name.StartsWith(prefix, StringComparison.Ordinal))
+        {
+            return false;
+        }
+        string suffix = name[prefix.Length..];
+        int delimiter = suffix.IndexOf('.');
+        return delimiter > 0 && suffix[..delimiter] is "plan" or "reconcile" or "ec2" or "fargate" or "listener" or
+            "github" or "dynamodb" or "handoff" or "startup" or "provider" or "telemetry" &&
+            Operations.Contains(suffix[(delimiter + 1)..]);
+    }
+
     internal static bool IsHttpMethod(string value) =>
         value is "GET" or "HEAD" or "POST" or "PUT" or "DELETE" or "CONNECT" or "OPTIONS" or "TRACE" or "PATCH" or "_OTHER";
 }
