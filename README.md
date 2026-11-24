@@ -28,3 +28,20 @@ make check
 CI uses the same command to restore locked dependencies, build and test the .NET
 solution in Release, check CDK linting, formatting, and types, run the CDK tests,
 and synthesize the CDK baseline offline.
+
+## Compile a configuration
+
+Run `npm --prefix cdk ci` to install the pinned compiler dependencies. Use
+the EC2 reference configuration to emit a runtime artifact.
+
+```sh
+npm --prefix cdk run config:emit -- ../testdata/config/ec2-only-latest.yaml /tmp/runner-runtime.json
+```
+
+The compiler prints the SHA-256 of the exact UTF-8 file it writes. It applies
+`dry-run` mode and no demand source by default. Specify pinned GitHub
+scale-set IDs and EC2 launch-template versions as quoted positive decimal
+strings to preserve their precision.
+
+GitHub routing values retain their authored spelling. Scope, group, scale-set,
+and label comparisons use the pinned Unicode 17.0 simple case-folding data.

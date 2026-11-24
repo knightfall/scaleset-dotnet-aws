@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/knightfall/scaleset-dotnet-aws/main/cdk/config/schema/controller-runtime-v1alpha1.json",
+  "title": "RunnerControllerRuntime v1alpha1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["apiVersion", "kind", "metadata", "spec"],
+  "properties": {
+    "apiVersion": { "const": "scaleset-aws/v1alpha1" },
+    "kind": { "const": "RunnerControllerRuntime" },
+    "metadata": { "$ref": "controller-common-v1alpha1.json#/$defs/metadata" },
+    "spec": {
+      "type": "object",
+      "allOf": [{ "$ref": "controller-common-v1alpha1.json#/$defs/spec" }],
+      "required": ["mode", "dryRun"],
+      "properties": {
+        "mode": true,
+        "dryRun": {
+          "type": "object",
+          "required": ["demand", "inspectAws"],
+          "properties": {
+            "demand": true,
+            "inspectAws": true
+          }
+        }
+      }
+    }
+  }
+}

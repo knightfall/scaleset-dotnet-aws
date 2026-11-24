@@ -1,0 +1,751 @@
+[
+  {
+    "name": "duplicate YAML keys",
+    "fault": "yaml syntax",
+    "yaml": "key: first\nkey: second\n",
+    "code": "yaml"
+  },
+  {
+    "name": "YAML anchor",
+    "fault": "yaml syntax",
+    "yaml": "key: &reference first\n",
+    "code": "yaml"
+  },
+  {
+    "name": "YAML alias",
+    "fault": "yaml syntax",
+    "yaml": "key: *missing\n",
+    "code": "yaml"
+  },
+  {
+    "name": "YAML merge key",
+    "fault": "yaml syntax",
+    "yaml": "<<: { key: first }\n",
+    "code": "yaml"
+  },
+  {
+    "name": "custom YAML tag",
+    "fault": "yaml syntax",
+    "yaml": "key: !local first\n",
+    "code": "yaml"
+  },
+  {
+    "name": "non-string YAML map key",
+    "fault": "yaml syntax",
+    "yaml": "42: first\n",
+    "code": "yaml"
+  },
+  {
+    "name": "sequence YAML map key",
+    "fault": "yaml syntax",
+    "yaml": "? [first, second]\n: value\n",
+    "code": "yaml"
+  },
+  {
+    "name": "multiple YAML documents",
+    "fault": "yaml syntax",
+    "yaml": "---\nkey: first\n---\nkey: second\n",
+    "code": "yaml"
+  },
+  {
+    "name": "unsupported apiVersion",
+    "fault": "configuration",
+    "code": "schema",
+    "edits": [
+      {
+        "path": "/apiVersion",
+        "value": "scaleset-aws/v2"
+      }
+    ]
+  },
+  {
+    "name": "unsupported kind",
+    "fault": "configuration",
+    "code": "schema",
+    "edits": [
+      {
+        "path": "/kind",
+        "value": "RunnerFleet"
+      }
+    ]
+  },
+  {
+    "name": "missing environment name",
+    "fault": "configuration",
+    "code": "schema",
+    "edits": [
+      {
+        "path": "/metadata/name"
+      }
+    ]
+  },
+  {
+    "name": "unknown environment field",
+    "fault": "configuration",
+    "code": "schema",
+    "edits": [
+      {
+        "path": "/metadata/environment",
+        "value": "bogus"
+      }
+    ]
+  },
+  {
+    "name": "account must be a string",
+    "fault": "configuration",
+    "code": "schema",
+    "edits": [
+      {
+        "path": "/spec/aws/account",
+        "value": 111122223333
+      }
+    ]
+  },
+  {
+    "name": "unsupported mode",
+    "fault": "configuration",
+    "code": "schema",
+    "edits": [
+      {
+        "path": "/spec/mode",
+        "value": "unmanaged"
+      }
+    ]
+  },
+  {
+    "name": "unsupported controller hosting",
+    "fault": "configuration",
+    "code": "schema",
+    "edits": [
+      {
+        "path": "/spec/controller/hosting/type",
+        "value": "ecs-ec2"
+      }
+    ]
+  },
+  {
+    "name": "controller hosting memory cannot be zero",
+    "fault": "configuration",
+    "code": "schema",
+    "edits": [
+      {
+        "path": "/spec/controller/hosting/memoryMiB",
+        "value": 0
+      }
+    ]
+  },
+  {
+    "name": "missing controller hosting network",
+    "fault": "configuration",
+    "code": "schema",
+    "edits": [
+      {
+        "path": "/spec/controller/hosting/network"
+      }
+    ]
+  },
+  {
+    "name": "controller image missing digest",
+    "fault": "configuration",
+    "code": "schema",
+    "edits": [
+      {
+        "path": "/spec/controller/image",
+        "value": "111122223333.dkr.ecr.ap-southeast-2.amazonaws.com/scaleset-dotnet-controller:latest"
+      }
+    ]
+  },
+  {
+    "name": "controller image in another account",
+    "fault": "configuration",
+    "code": "semantic",
+    "edits": [
+      {
+        "path": "/spec/controller/image",
+        "value": "999900001111.dkr.ecr.ap-southeast-2.amazonaws.com/scaleset-dotnet-controller@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      }
+    ]
+  },
+  {
+    "name": "unknown controller hosting network",
+    "fault": "configuration",
+    "code": "semantic",
+    "edits": [
+      {
+        "path": "/spec/controller/hosting/network",
+        "value": "unknown-net"
+      }
+    ]
+  },
+  {
+    "name": "unknown controller hosting cluster",
+    "fault": "configuration",
+    "code": "semantic",
+    "edits": [
+      {
+        "path": "/spec/controller/hosting/cluster",
+        "value": "unknown-cluster"
+      }
+    ]
+  },
+  {
+    "name": "imported tracking table missing name",
+    "fault": "configuration",
+    "code": "schema",
+    "edits": [
+      {
+        "path": "/spec/tracking/table/type",
+        "value": "import"
+      }
+    ]
+  },
+  {
+    "name": "created ECS cluster cannot contain an imported ARN",
+    "fault": "configuration",
+    "code": "schema",
+    "edits": [
+      {
+        "path": "/spec/ecsClusters/control-plane/arn",
+        "value": "arn:aws:ecs:ap-southeast-2:111122223333:cluster/ambiguous"
+      }
+    ]
+  },
+  {
+    "name": "snapshot source missing version",
+    "fault": "configuration",
+    "code": "schema",
+    "edits": [
+      {
+        "path": "/spec/dryRun/demand",
+        "value": {
+          "type": "snapshot",
+          "s3Uri": "s3://config-fixtures/demand.json",
+          "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      }
+    ]
+  },
+  {
+    "name": "snapshot cannot use both local and versioned S3 paths",
+    "fault": "configuration",
+    "code": "schema",
+    "edits": [
+      {
+        "path": "/spec/dryRun/demand",
+        "value": {
+          "type": "snapshot",
+          "path": "/input/demand.json",
+          "s3Uri": "s3://config-fixtures/demand.json",
+          "versionId": "recorded-version",
+          "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      }
+    ]
+  },
+  {
+    "name": "inline GitHub token",
+    "fault": "configuration",
+    "code": "inline-credentials-unsupported",
+    "edits": [
+      {
+        "path": "/spec/github/engineering/auth/token",
+        "value": "fixture-only-inline-token"
+      }
+    ],
+    "redacted": [
+      "fixture-only-inline-token"
+    ],
+    "errorPath": "/spec/github/engineering/auth/token"
+  },
+  {
+    "name": "inline GitHub private key",
+    "fault": "configuration",
+    "code": "inline-credentials-unsupported",
+    "edits": [
+      {
+        "path": "/spec/github/engineering/auth/privateKey",
+        "value": "fixture-only-inline-private-key"
+      }
+    ],
+    "redacted": [
+      "fixture-only-inline-private-key"
+    ],
+    "errorPath": "/spec/github/engineering/auth/privateKey"
+  },
+  {
+    "name": "custom GHES host",
+    "fault": "configuration",
+    "code": "ghes-unsupported",
+    "edits": [
+      {
+        "path": "/spec/github/engineering/scopeURL",
+        "value": "https://github.example.test/engineering"
+      }
+    ],
+    "errorPath": "/spec/github/engineering/scopeURL"
+  },
+  {
+    "name": "custom GitHub CA",
+    "fault": "configuration",
+    "code": "custom-ca-unsupported",
+    "edits": [
+      {
+        "path": "/spec/github/engineering/caBundlePath",
+        "value": "/etc/github/ca.pem"
+      }
+    ],
+    "errorPath": "/spec/github/engineering/caBundlePath"
+  },
+  {
+    "name": "enterprise scope cannot use GitHub App auth",
+    "fault": "configuration",
+    "code": "semantic",
+    "edits": [
+      {
+        "path": "/spec/github/engineering/scopeURL",
+        "value": "https://github.com/enterprises/engineering"
+      }
+    ]
+  },
+  {
+    "name": "organization scope cannot use enterprise PAT auth",
+    "fault": "configuration",
+    "code": "semantic",
+    "edits": [
+      {
+        "path": "/spec/github/engineering/auth/type",
+        "value": "enterprise-pat"
+      }
+    ]
+  },
+  {
+    "name": "GitHub scope with escaped separator",
+    "fault": "configuration",
+    "code": "semantic",
+    "edits": [
+      {
+        "path": "/spec/github/engineering/scopeURL",
+        "value": "https://github.com/engineering%2Ftools"
+      }
+    ]
+  },
+  {
+    "name": "GitHub scope with percent-escaped authority",
+    "fault": "configuration",
+    "code": "semantic",
+    "edits": [
+      {
+        "path": "/spec/github/engineering/scopeURL",
+        "value": "https://%67ithub.com/example-engineering"
+      }
+    ]
+  },
+  {
+    "name": "GitHub scope has a query",
+    "fault": "configuration",
+    "code": "semantic",
+    "edits": [
+      {
+        "path": "/spec/github/engineering/scopeURL",
+        "value": "https://github.com/engineering?ref=main"
+      }
+    ]
+  },
+  {
+    "name": "GitHub secret in another AWS Region",
+    "fault": "configuration",
+    "code": "semantic",
+    "edits": [
+      {
+        "path": "/spec/github/engineering/auth/secretArn",
+        "value": "arn:aws:secretsmanager:us-east-1:111122223333:secret:github-app-engineering-a1b2c3"
+      }
+    ]
+  },
+  {
+    "name": "no runner profiles",
+    "fault": "configuration",
+    "code": "schema",
+    "edits": [
+      {
+        "path": "/spec/profiles",
+        "value": []
+      }
+    ]
+  },
+  {
+    "name": "only disabled runner profiles",
+    "fault": "configuration",
+    "code": "semantic",
+    "edits": [
+      {
+        "path": "/spec/profiles/0/state",
+        "value": "disabled"
+      }
+    ]
+  },
+  {
+    "name": "duplicate profile ID",
+    "fault": "configuration",
+    "code": "semantic",
+    "edits": [
+      {
+        "path": "/spec/profiles/1/id",
+        "value": "linux-ec2-docker"
+      }
+    ],
+    "base": "mixed-ec2-fargate"
+  },
+  {
+    "name": "missing platform",
+    "fault": "configuration",
+    "code": "schema",
+    "edits": [
+      {
+        "path": "/spec/profiles/0/platform"
+      }
+    ]
+  },
+  {
+    "name": "idle reserve cannot be negative",
+    "fault": "configuration",
+    "code": "schema",
+    "edits": [
+      {
+        "path": "/spec/profiles/0/capacity/idleReserve",
+        "value": -1
+      }
+    ]
+  },
+  {
+    "name": "idle reserve cannot exceed max runners",
+    "fault": "configuration",
+    "code": "semantic",
+    "edits": [
+      {
+        "path": "/spec/profiles/0/capacity/idleReserve",
+        "value": 13
+      }
+    ],
+    "errorPath": "/spec/profiles/0/capacity/idleReserve"
+  },
+  {
+    "name": "max runners cannot be zero",
+    "fault": "configuration",
+    "code": "schema",
+    "edits": [
+      {
+        "path": "/spec/profiles/0/capacity/maxRunners",
+        "value": 0
+      }
+    ]
+  },
+  {
+    "name": "startup timeout cannot be zero",
+    "fault": "configuration",
+    "code": "schema",
+    "edits": [
+      {
+        "path": "/spec/profiles/0/capacity/startupTimeoutSeconds",
+        "value": 0
+      }
+    ]
+  },
+  {
+    "name": "unresolved GitHub connection",
+    "fault": "configuration",
+    "code": "semantic",
+    "edits": [
+      {
+        "path": "/spec/profiles/0/github/connection",
+        "value": "unknown-github"
+      }
+    ]
+  },
+  {
+    "name": "scale set name absent from labels",
+    "fault": "configuration",
+    "code": "semantic",
+    "edits": [
+      {
+        "path": "/spec/profiles/0/github/labels",
+        "value": [
+          "unrelated"
+        ]
+      }
+    ]
+  },
+  {
+    "name": "case-insensitive labels on one resolved scope overlap across connections",
+    "fault": "configuration",
+    "code": "semantic",
+    "edits": [
+      {
+        "path": "/spec/github/alias",
+        "value": {
+          "scopeURL": "https://www.github.com/EXAMPLE-ENGINEERING/",
+          "auth": {
+            "type": "github-app",
+            "secretArn": "arn:aws:secretsmanager:ap-southeast-2:111122223333:secret:github-app-engineering-a1b2c3"
+          }
+        }
+      },
+      {
+        "path": "/spec/profiles/1/github/connection",
+        "value": "alias"
+      },
+      {
+        "path": "/spec/profiles/1/github/labels",
+        "value": [
+          "linux-ec2-build",
+          "Linux-EC2-Docker"
+        ]
+      }
+    ],
+    "base": "mixed-ec2-fargate",
+    "errorPath": "/spec/profiles/1/github/labels"
+  },
+  {
+    "name": "Unicode case-equivalent labels overlap within one scope",
+    "fault": "configuration",
+    "code": "semantic",
+    "base": "mixed-ec2-fargate",
+    "edits": [
+      {
+        "path": "/spec/profiles/0/github/labels",
+        "value": ["linux-ec2-docker", "Σ"]
+      },
+      {
+        "path": "/spec/profiles/1/github/labels",
+        "value": ["linux-ec2-build", "ς"]
+      }
+    ],
+    "errorPath": "/spec/profiles/1/github/labels"
+  },
+  {
+    "name": "duplicate remote group and scale set binding",
+    "fault": "configuration",
+    "code": "semantic",
+    "edits": [
+      {
+        "path": "/spec/profiles/1/github/runnerGroup",
+        "value": "Linux-EC2"
+      },
+      {
+        "path": "/spec/profiles/1/github/scaleSet",
+        "value": "linux-ec2-docker"
+      },
+      {
+        "path": "/spec/profiles/1/github/labels",
+        "value": [
+          "linux-ec2-docker"
+        ]
+      }
+    ],
+    "base": "mixed-ec2-fargate"
+  },
+  {
+    "name": "scale set ID exceeds signed Int64",
+    "fault": "configuration",
+    "code": "semantic",
+    "edits": [
+      {
+        "path": "/spec/profiles/0/github/scaleSetId",
+        "value": "9223372036854775808"
+      }
+    ]
+  },
+  {
+    "name": "scale set ID must be a string",
+    "fault": "configuration",
+    "code": "schema",
+    "edits": [
+      {
+        "path": "/spec/profiles/0/github/scaleSetId",
+        "value": 11
+      }
+    ]
+  },
+  {
+    "name": "registered scale set ID cannot be used with create-if-missing",
+    "fault": "configuration",
+    "code": "semantic",
+    "edits": [
+      {
+        "path": "/spec/profiles/0/github/scaleSetId",
+        "value": "22"
+      },
+      {
+        "path": "/spec/profiles/0/github/registration",
+        "value": "create-if-missing"
+      }
+    ]
+  },
+  {
+    "name": "missing provisioner network",
+    "fault": "configuration",
+    "code": "schema",
+    "edits": [
+      {
+        "path": "/spec/profiles/0/provisioner/network"
+      }
+    ]
+  },
+  {
+    "name": "unresolved provisioner network",
+    "fault": "configuration",
+    "code": "semantic",
+    "edits": [
+      {
+        "path": "/spec/profiles/0/provisioner/network",
+        "value": "unknown-net"
+      }
+    ]
+  },
+  {
+    "name": "unsupported launch template alias",
+    "fault": "configuration",
+    "code": "schema",
+    "edits": [
+      {
+        "path": "/spec/profiles/0/provisioner/launchTemplateVersion/name",
+        "value": "$Current"
+      }
+    ]
+  },
+  {
+    "name": "pinned launch template version zero",
+    "fault": "configuration",
+    "code": "schema",
+    "edits": [
+      {
+        "path": "/spec/profiles/0/provisioner/launchTemplateVersion",
+        "value": {
+          "type": "pinned",
+          "version": "0"
+        }
+      }
+    ]
+  },
+  {
+    "name": "pinned launch template version must be a string",
+    "fault": "configuration",
+    "code": "schema",
+    "edits": [
+      {
+        "path": "/spec/profiles/0/provisioner/launchTemplateVersion",
+        "value": {
+          "type": "pinned",
+          "version": 3
+        }
+      }
+    ]
+  },
+  {
+    "name": "launch template version contains both union variants",
+    "fault": "configuration",
+    "code": "schema",
+    "edits": [
+      {
+        "path": "/spec/profiles/0/provisioner/launchTemplateVersion/version",
+        "value": "3"
+      }
+    ]
+  },
+  {
+    "name": "EC2 provisioner contains an ECS field",
+    "fault": "configuration",
+    "code": "schema",
+    "edits": [
+      {
+        "path": "/spec/profiles/0/provisioner/cluster",
+        "value": "control-plane"
+      }
+    ]
+  },
+  {
+    "name": "EC2 instance profile in another account",
+    "fault": "configuration",
+    "code": "semantic",
+    "edits": [
+      {
+        "path": "/spec/profiles/0/provisioner/instanceProfileArn",
+        "value": "arn:aws:iam::999900001111:instance-profile/runner-linux-bootstrap"
+      }
+    ]
+  },
+  {
+    "name": "unknown Fargate cluster",
+    "fault": "configuration",
+    "code": "semantic",
+    "edits": [
+      {
+        "path": "/spec/profiles/0/provisioner/cluster",
+        "value": "unknown-cluster"
+      }
+    ],
+    "base": "fargate-only",
+    "errorPath": "/spec/profiles/0/provisioner/cluster"
+  },
+  {
+    "name": "Fargate provisioner contains an EC2 field",
+    "fault": "configuration",
+    "code": "schema",
+    "edits": [
+      {
+        "path": "/spec/profiles/0/provisioner/launchTemplateId",
+        "value": "lt-0123456789abcdef0"
+      }
+    ],
+    "base": "fargate-only"
+  },
+  {
+    "name": "Fargate task definition missing revision",
+    "fault": "configuration",
+    "code": "schema",
+    "edits": [
+      {
+        "path": "/spec/profiles/0/provisioner/taskDefinitionArn",
+        "value": "arn:aws:ecs:ap-southeast-2:111122223333:task-definition/linux-shell-runner"
+      }
+    ],
+    "base": "fargate-only"
+  },
+  {
+    "name": "Fargate task definition in another AWS Region",
+    "fault": "configuration",
+    "code": "semantic",
+    "edits": [
+      {
+        "path": "/spec/profiles/0/provisioner/taskDefinitionArn",
+        "value": "arn:aws:ecs:us-east-1:111122223333:task-definition/linux-shell-runner:7"
+      }
+    ],
+    "base": "fargate-only"
+  },
+  {
+    "name": "Fargate platform cannot be Windows",
+    "fault": "configuration",
+    "code": "semantic",
+    "edits": [
+      {
+        "path": "/spec/profiles/0/platform/os",
+        "value": "windows"
+      }
+    ],
+    "base": "fargate-only"
+  },
+  {
+    "name": "same pinned remote scale set ID with independent labels and groups",
+    "fault": "configuration",
+    "code": "semantic",
+    "base": "mixed-ec2-fargate",
+    "edits": [
+      {
+        "path": "/spec/profiles/0/github/scaleSetId",
+        "value": "9223372036854775807"
+      }
+    ],
+    "errorPath": "/spec/profiles/1/github/scaleSetId"
+  }
+]

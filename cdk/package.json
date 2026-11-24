@@ -13,6 +13,7 @@
     }
   },
   "scripts": {
+    "config:emit": "node bin/emit-runtime.ts",
     "lint": "eslint --max-warnings 0 .",
     "format:check": "prettier --check .",
     "typecheck": "tsc --noEmit",
@@ -20,8 +21,10 @@
     "synth": "cdk synth --strict --no-lookups --app 'node test/fixtures/synth-app.ts'"
   },
   "dependencies": {
+    "ajv": "8.20.0",
     "aws-cdk-lib": "2.278.0",
-    "constructs": "10.8.1"
+    "constructs": "10.8.1",
+    "yaml": "2.9.1"
   },
   "devDependencies": {
     "@types/node": "24.19.2",
