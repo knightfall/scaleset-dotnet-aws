@@ -12,6 +12,7 @@
     <ProjectReference Include="../../src/Knightfall.ScaleSet.Aws.Controller/Knightfall.ScaleSet.Aws.Controller.csproj" />
     <ProjectReference Include="../../src/Knightfall.ScaleSet.Aws.DynamoDb/Knightfall.ScaleSet.Aws.DynamoDb.csproj" />
     <ProjectReference Include="../../src/Knightfall.ScaleSet.Aws.GitHub/Knightfall.ScaleSet.Aws.GitHub.csproj" />
+    <ProjectReference Include="../../src/Knightfall.ScaleSet.Aws.RunnerBootstrap/Knightfall.ScaleSet.Aws.RunnerBootstrap.csproj" />
     <PackageReference Include="xunit.v3" />
     <Compile Include="../Knightfall.ScaleSet.Aws.Lifecycle.Tests/MiniStackTable.cs" Link="MiniStackTable.cs" />
     <Compile Include="../Knightfall.ScaleSet.Aws.Telemetry.Tests/OtlpLoopback.cs" Link="Telemetry/OtlpLoopback.cs" />
