@@ -5,6 +5,7 @@
   <ItemGroup>
     <InternalsVisibleTo Include="Knightfall.ScaleSet.Aws.Lifecycle.Tests" />
     <ProjectReference Include="../Knightfall.ScaleSet.Aws.Core/Knightfall.ScaleSet.Aws.Core.csproj" />
+    <ProjectReference Include="../Knightfall.ScaleSet.Aws.Handoff/Knightfall.ScaleSet.Aws.Handoff.csproj" />
     <PackageReference Include="AWSSDK.Core" />
     <PackageReference Include="AWSSDK.DynamoDBv2" />
   </ItemGroup>

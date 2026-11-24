@@ -39,6 +39,8 @@ public sealed class LifecycleStorageTests
             (LifecycleKey.RunnerInventory(profile), "PROFILE#d#p", "RUNNER-INVENTORY"),
             (LifecycleKey.ActiveRunner(profile, "allocation-1"), "PROFILE#d#p", "ACTIVE-RUNNER#allocation-1"),
             (LifecycleKey.Drain(profile), "PROFILE#d#p", "DRAIN"),
+            (LifecycleKey.Handoff(profile, session), "PROFILE#d#p", $"HANDOFF#{session:D}"),
+            (LifecycleKey.HandoffHead(profile), "PROFILE#d#p", "HANDOFFS"),
         ];
 
         Assert.Equal(Enum.GetValues<LifecycleItemKind>(), expected.Select(row => row.Key.Kind));

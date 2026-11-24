@@ -367,7 +367,8 @@ public sealed partial class DynamoDbLifecycleStore
         ArgumentNullException.ThrowIfNull(key);
         if (key.Kind is LifecycleItemKind.Lease or LifecycleItemKind.Operation or LifecycleItemKind.ActiveOperation or
             LifecycleItemKind.Effects or LifecycleItemKind.EffectRebuild or LifecycleItemKind.Hello or LifecycleItemKind.Offer or
-            LifecycleItemKind.Status or LifecycleItemKind.Session or LifecycleItemKind.Drain or LifecycleItemKind.ActiveRunner)
+            LifecycleItemKind.Status or LifecycleItemKind.Session or LifecycleItemKind.Drain or LifecycleItemKind.ActiveRunner or
+            LifecycleItemKind.Handoff or LifecycleItemKind.HandoffHead)
         {
             throw new ArgumentException("This lifecycle key requires its dedicated protocol.", nameof(key));
         }

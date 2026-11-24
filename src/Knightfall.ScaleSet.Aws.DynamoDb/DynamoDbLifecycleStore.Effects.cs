@@ -158,6 +158,15 @@ public sealed partial class DynamoDbLifecycleStore
             RequireAppliedCatalog(leaseCondition, guard.Catalog);
             actions.Add(CatalogProfileCondition(guard.Catalog));
             actions.Add(RecordRevisionCondition(new LifecycleRecordCondition(LifecycleKey.Runner(profile, guard.AllocationId), guard.AllocationRevision)));
+            if (guard.Handoff is not null)
+            {
+                actions.AddRange(BuildHandoffBeginConditions(guard.Handoff));
+            }
+            if (guard.Removal is { } removal)
+            {
+                actions.Add(ExactJitHandoffCondition(removal));
+                actions.Add(OfferAbsentCondition(removal));
+            }
         }
         if (delta > 0)
         {

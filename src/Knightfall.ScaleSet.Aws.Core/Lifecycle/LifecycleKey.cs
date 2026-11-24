@@ -24,6 +24,8 @@ public enum LifecycleItemKind
     RunnerInventory = 19,
     ActiveRunner = 20,
     Drain = 21,
+    Handoff = 22,
+    HandoffHead = 23,
 }
 
 public sealed record LifecycleProfile
@@ -110,6 +112,12 @@ public sealed record LifecycleKey
 
     public static LifecycleKey Drain(LifecycleProfile profile) =>
         ProfileItem(profile, "DRAIN", LifecycleItemKind.Drain);
+
+    public static LifecycleKey Handoff(LifecycleProfile profile, Guid allocationId) =>
+        ProfileItem(profile, "HANDOFF#" + GuidIdentity(allocationId, nameof(allocationId)), LifecycleItemKind.Handoff);
+
+    public static LifecycleKey HandoffHead(LifecycleProfile profile) =>
+        ProfileItem(profile, "HANDOFFS", LifecycleItemKind.HandoffHead);
 
     public static LifecycleKey RunnerIdentity(LifecycleProfile profile, long runnerId)
     {

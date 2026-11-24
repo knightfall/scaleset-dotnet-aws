@@ -7,7 +7,9 @@ public sealed record EffectJournalSnapshot(long Revision, Guid TransitionId, Eff
 
 public sealed record EffectBeginOutcome(LifecycleWriteOutcome Outcome, EffectSendAuthorization? Permission);
 
-internal sealed record EffectDispatchGuard(CatalogProfile Catalog, EffectIndexHead Index, string AllocationId, long? AllocationRevision);
+internal sealed record EffectDispatchGuard(
+    CatalogProfile Catalog, EffectIndexHead Index, string AllocationId, long? AllocationRevision,
+    JitHandoffSnapshot? Handoff = null, JitHandoffSnapshot? Removal = null);
 
 /// <summary>Evidence that an attempt was durably begun under its recorded lease epoch.</summary>
 /// <remarks>A caller must retain current ownership and respect the attempt deadline when sending.</remarks>
@@ -47,7 +49,7 @@ public sealed class EffectSendAuthorization
     }
 }
 
-public sealed class DynamoDbEffectJournal
+public sealed partial class DynamoDbEffectJournal
 {
     private readonly DynamoDbLifecycleStore _store;
     private readonly TimeProvider _timeProvider;
@@ -125,6 +127,11 @@ public sealed class DynamoDbEffectJournal
         long beganAt = _timeProvider.GetTimestamp();
         var current = await ReadCurrentAsync(lease, expected, transitionId, cancellationToken).ConfigureAwait(false);
         if (current is null)
+        {
+            return new EffectBeginOutcome(LifecycleWriteOutcome.Conflict, null);
+        }
+        if ((current.Entry.Envelope.Request is GitHubJitGenerateEffectRequest && guard?.Handoff is null) ||
+            (current.Entry.Envelope.Request is GitHubRunnerRemoveEffectRequest && guard?.Removal is null))
         {
             return new EffectBeginOutcome(LifecycleWriteOutcome.Conflict, null);
         }

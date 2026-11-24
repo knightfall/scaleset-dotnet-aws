@@ -7,11 +7,13 @@
     <UseMicrosoftTestingPlatformRunner>true</UseMicrosoftTestingPlatformRunner>
   </PropertyGroup>
   <ItemGroup>
+    <ProjectReference Include="../../src/Knightfall.ScaleSet.Aws.Controller/Knightfall.ScaleSet.Aws.Controller.csproj" />
     <ProjectReference Include="../../src/Knightfall.ScaleSet.Aws.DynamoDb/Knightfall.ScaleSet.Aws.DynamoDb.csproj" />
     <ProjectReference Include="../../src/Knightfall.ScaleSet.Aws.GitHub/Knightfall.ScaleSet.Aws.GitHub.csproj" />
     <Compile Include="../Knightfall.ScaleSet.Aws.SdkContract.Tests/Aws/AwsWireTransport.cs" Link="AwsWireTransport.cs" />
     <Compile Include="../Knightfall.ScaleSet.Aws.SdkContract.Tests/GitHub/GitHubWire.cs" Link="GitHubWire.cs" />
     <PackageReference Include="xunit.v3" />
     <None Include="../../testdata/config/runtime/fargate-only.json" Link="fargate-only.json" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="../../testdata/config/runtime/ec2-only-pinned.json" Link="ec2-only-pinned.json" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 </Project>

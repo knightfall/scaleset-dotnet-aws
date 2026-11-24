@@ -292,7 +292,7 @@ public sealed class ControllerLifecycleTests
         return Assert.IsType<ControllerLease>(activated.Lease);
     }
 
-    private static async Task<RuntimeConfiguration> ConfigurationAsync(bool draining, CancellationToken cancellationToken)
+    internal static async Task<RuntimeConfiguration> ConfigurationAsync(bool draining, CancellationToken cancellationToken)
     {
         var image = await File.ReadAllTextAsync(Path.Combine(AppContext.BaseDirectory, "fargate-only.json"), cancellationToken);
         var document = JsonNode.Parse(image)!;
@@ -306,7 +306,7 @@ public sealed class ControllerLifecycleTests
         return RuntimeConfigurationLoader.Load(JsonSerializer.SerializeToUtf8Bytes(document));
     }
 
-    private static async Task<GitHubScaleSetConnection> ConnectAsync(RuntimeConfiguration configuration, TimeProvider clock, HttpClient http,
+    internal static async Task<GitHubScaleSetConnection> ConnectAsync(RuntimeConfiguration configuration, TimeProvider clock, HttpClient http,
         CancellationToken cancellationToken)
     {
         string value = JsonSerializer.Serialize(new
