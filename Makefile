@@ -29,4 +29,4 @@ check-lifecycle:
 check-integration:
 	dotnet restore $(INTEGRATION_TESTS) --locked-mode
 	dotnet build $(INTEGRATION_TESTS) --configuration Release --no-restore
-	$(MINISTACK_PYTHON) tests/ministack/run.py dotnet test --project $(INTEGRATION_TESTS) --configuration Release --no-build
+	$(MINISTACK_PYTHON) tests/ministack/run.py --with-iam dotnet test --project $(INTEGRATION_TESTS) --configuration Release --no-build

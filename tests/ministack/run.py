@@ -1,6 +1,6 @@
 """Run a test command with the pinned MiniStack process on an isolated loopback endpoint."""
 
-from contextlib import closing, contextmanager
+from contextlib import ExitStack, closing, contextmanager
 from http.client import HTTPConnection, HTTPException
 import os
 from pathlib import Path
@@ -95,12 +95,38 @@ def wait_for_health(process, port, interruption):
     raise RuntimeError("MiniStack did not become healthy in 30 seconds.")
 
 
-def run(command, interruption):
+@contextmanager
+def start_emulator(executable, directory, environment, interruption, account, authenticated):
+    directory.mkdir()
+    port = loopback_port()
+    endpoint = f"http://127.0.0.1:{port}"
+    emulator_environment = dict(
+        environment, BIND_HOST="127.0.0.1", GATEWAY_PORT=str(port),
+        MINISTACK_HOST="127.0.0.1", MINISTACK_ACCOUNT_ID=account, PERSIST_STATE="0",
+        AUTH="true" if authenticated else "false", AWS_ACCESS_KEY_ID=account,
+    )
+    log_path = directory / "ministack.log"
+    interruption.check()
+    with log_path.open("w", encoding="utf-8") as log, managed_process(
+        [executable, "-I", "-m", "ministack"], cwd=directory,
+        env=emulator_environment, stdout=log, stderr=subprocess.STDOUT,
+    ) as process:
+        try:
+            wait_for_health(process, port, interruption)
+        except RuntimeError:
+            print(log_path.read_text(encoding="utf-8"), file=sys.stderr)
+            raise
+        mode = " IAM" if authenticated else ""
+        print(f"MiniStack{mode} ready at {endpoint}", flush=True)
+        yield endpoint
+
+
+def run(command, interruption, with_iam=False):
     environment = {
         key: value
         for key, value in os.environ.items()
         if not key.upper().startswith(("AWS_", "MINISTACK_"))
-        and key.upper() != "SCALESET_MINISTACK_ENDPOINT"
+        and key.upper() not in {"SCALESET_MINISTACK_ENDPOINT", "SCALESET_MINISTACK_IAM_ENDPOINT"}
     }
     local_environment = {
         key: value
@@ -131,40 +157,34 @@ def run(command, interruption):
             dict(environment, PIP_CONFIG_FILE=os.devnull), interruption, check=True,
         )
 
-        port = loopback_port()
-        endpoint = f"http://127.0.0.1:{port}"
-        emulator_environment = dict(
-            local_environment, BIND_HOST="127.0.0.1", GATEWAY_PORT=str(port),
-            MINISTACK_HOST="127.0.0.1", PERSIST_STATE="0", AUTH="false",
-        )
-        log_path = directory / "ministack.log"
-        interruption.check()
-        with log_path.open("w", encoding="utf-8") as log, managed_process(
-            [executable, "-I", "-m", "ministack"], cwd=directory,
-            env=emulator_environment, stdout=log, stderr=subprocess.STDOUT,
-        ) as process:
-            try:
-                wait_for_health(process, port, interruption)
-                print(f"MiniStack ready at {endpoint}", flush=True)
-                return run_command(
-                    command, dict(local_environment, AWS_ENDPOINT_URL=endpoint,
-                                  SCALESET_MINISTACK_ENDPOINT=endpoint),
-                    interruption,
-                )
-            except RuntimeError:
-                print(log_path.read_text(encoding="utf-8"), file=sys.stderr)
-                raise
+        with ExitStack() as stack:
+            endpoint = stack.enter_context(start_emulator(
+                executable, directory / "standard", local_environment, interruption,
+                account="000000000000", authenticated=False,
+            ))
+            test_environment = dict(local_environment, AWS_ENDPOINT_URL=endpoint,
+                                    SCALESET_MINISTACK_ENDPOINT=endpoint)
+            if with_iam:
+                test_environment["SCALESET_MINISTACK_IAM_ENDPOINT"] = stack.enter_context(start_emulator(
+                    executable, directory / "iam", local_environment, interruption,
+                    account="111122223333", authenticated=True,
+                ))
+            return run_command(command, test_environment, interruption)
 
 
 if __name__ == "__main__":
     if sys.version_info < (3, 11):
         sys.exit("Use Python 3.11 or newer for the pinned MiniStack test environment.")
-    if len(sys.argv) < 2:
-        sys.exit("Usage: python3 tests/ministack/run.py <test-command> [args...]")
+    arguments = sys.argv[1:]
+    with_iam = arguments[:1] == ["--with-iam"]
+    if with_iam:
+        arguments = arguments[1:]
+    if not arguments:
+        sys.exit("Usage: python3 tests/ministack/run.py [--with-iam] <test-command> [args...]")
 
     interruption = Interruption()
     signal.signal(signal.SIGINT, interruption.request)
     signal.signal(signal.SIGTERM, interruption.request)
-    status = run(sys.argv[1:], interruption)
+    status = run(arguments, interruption, with_iam=with_iam)
     interruption.check()
     sys.exit(status)
