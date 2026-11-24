@@ -160,6 +160,21 @@ public sealed partial class DynamoDbEffectDispatcher
             return LifecycleWriteOutcome.LeaseRejected;
         }
 
+        if (effect.Entry.Envelope.Request is FargateLaunchEffectRequest { OwnershipTags: not null } &&
+            provider is IFargateReplayEffectProvider fargate)
+        {
+            var progress = await ReplayFargateLaunchAsync(current, clockEvidence, effect.Entry.Envelope.Profile,
+                effect.Entry.Envelope.IntentId, fargate, CancellationToken.None, cancellationToken).ConfigureAwait(false);
+            return progress switch
+            {
+                EffectDispatchStatus.Settled => LifecycleWriteOutcome.Committed,
+                EffectDispatchStatus.Conflict => LifecycleWriteOutcome.Conflict,
+                EffectDispatchStatus.OwnershipUnavailable => LifecycleWriteOutcome.LeaseRejected,
+                EffectDispatchStatus.RebuildRequired => LifecycleWriteOutcome.RebuildRequired,
+                _ => null,
+            };
+        }
+
         var started = _clock.GetUtcNow();
         var evidence = await ObserveFreshAsync(current, clockEvidence, effect, provider, attempt, cancellationToken).ConfigureAwait(false);
         return evidence is null ? null : await ResolveObservedAsync(current, clockEvidence, effect, evidence, started, cancellationToken)

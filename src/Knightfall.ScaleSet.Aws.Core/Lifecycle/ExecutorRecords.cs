@@ -67,7 +67,8 @@ public enum ExecutorJobPhase
 }
 
 public sealed record ExecutorResourceObservation(
-    ExecutorResourceState State, DateTimeOffset ObservedAt, DateTimeOffset? StartedAt, Guid EvidenceId);
+    ExecutorResourceState State, DateTimeOffset ObservedAt, DateTimeOffset? StartedAt, Guid EvidenceId,
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] long? ProviderVersion = null);
 
 public sealed record ExecutorProcessObservation(
     long RunnerId, ExecutorProcessState State, DateTimeOffset ObservedAt, Guid EvidenceId);

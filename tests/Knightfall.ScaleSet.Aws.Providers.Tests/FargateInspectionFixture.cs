@@ -5,6 +5,7 @@ using System.Web;
 using Amazon.EC2;
 using Amazon.ECS;
 using Amazon.IdentityManagement;
+using Amazon.SQS;
 using Knightfall.ScaleSet.Aws.Core.Configuration;
 using Knightfall.ScaleSet.Aws.Core.Lifecycle;
 using Knightfall.ScaleSet.Aws.Providers.Fargate;
@@ -28,6 +29,7 @@ internal sealed class FargateInspectionFixture : IDisposable
     internal const string Subnet2 = "subnet-0123456789abcdef3";
     internal const string Vpc = "vpc-0123456789abcdef0";
     internal const string SecurityGroup = "sg-0123456789abcdef1";
+    internal const string QueueUrl = "https://sqs.ap-southeast-2.amazonaws.com/111122223333/runner-events";
     internal const string TaskPrefix = "arn:aws:ecs:ap-southeast-2:111122223333:task/engineering-shell/";
     internal const string FirstTask = TaskPrefix + "0123456789abcdef0123456789abcdef";
     internal const string SecondTask = TaskPrefix + "0123456789abcdef0123456789abcdee";
@@ -44,11 +46,14 @@ internal sealed class FargateInspectionFixture : IDisposable
     private readonly AmazonEC2Client _network;
     private readonly FixtureClock _clock = new();
 
-    internal FargateInspectionFixture()
+    internal FargateInspectionFixture(int maxErrorRetry = 0, int maxStaleConnectionRetries = 0)
     {
         _wire = new AwsWireTransport(Respond);
         var ecs = _wire.Configure(new AmazonECSConfig());
         ecs.AuthenticationRegion = Region;
+        ecs.MaxErrorRetry = maxErrorRetry;
+        ecs.MaxStaleConnectionRetries = maxStaleConnectionRetries;
+        ecs.AllowAutoRedirect = false;
         _ecs = new AmazonECSClient(AwsWireTransport.Credentials, ecs);
         _iam = new AmazonIdentityManagementServiceClient(AwsWireTransport.Credentials, _wire.Configure(new AmazonIdentityManagementServiceConfig()));
         var network = _wire.Configure(new AmazonEC2Config());
@@ -58,6 +63,7 @@ internal sealed class FargateInspectionFixture : IDisposable
     }
 
     internal FargateProfileInspector Inspector { get; }
+    internal AmazonSQSClient CreateSqs() => new(AwsWireTransport.Credentials, _wire.Configure(new AmazonSQSConfig()));
     internal IReadOnlyList<AwsWireRequest> Requests => _wire.Requests;
     internal DateTimeOffset UtcNow
     {
@@ -73,6 +79,9 @@ internal sealed class FargateInspectionFixture : IDisposable
     internal Func<JsonElement, string> Settings { get; set; } = static _ => SettingsReply();
     internal Func<JsonElement, string> ListTasks { get; set; } = static _ => """{"taskArns":[]}""";
     internal Func<JsonElement, string> DescribeTasks { get; set; } = static _ => """{"tasks":[]}""";
+    internal Func<JsonElement, HttpResponseMessage> RunTask { get; set; } = static _ => Ecs("""{"tasks":[]}""");
+    internal Func<JsonElement, HttpResponseMessage> StopTask { get; set; } = static _ => Ecs("{}");
+    internal Func<JsonElement, string> ReceiveMessage { get; set; } = static _ => "{}";
     internal int? Ip1 { get; set; } = 3;
     internal int? Ip2 { get; set; } = 4;
     internal string SubnetVpc { get; set; } = Vpc;
@@ -80,7 +89,8 @@ internal sealed class FargateInspectionFixture : IDisposable
     internal bool WrongIamArn { get; set; }
 
     internal static async Task<RuntimeConfiguration> ConfigurationAsync(CancellationToken cancellationToken,
-        bool fargate = true, bool dryRun = false, bool inspectAws = false, bool createRunnerCluster = false)
+        bool fargate = true, bool dryRun = false, bool inspectAws = false, bool createRunnerCluster = false,
+        string runnerClusterName = "engineering-shell")
     {
         string file = fargate ? "fargate-only.json" : "ec2-only-latest.json";
         var document = JsonNode.Parse(await File.ReadAllTextAsync(Path.Combine(AppContext.BaseDirectory, file), cancellationToken))!;
@@ -91,7 +101,7 @@ internal sealed class FargateInspectionFixture : IDisposable
         }
         if (createRunnerCluster)
         {
-            document["spec"]!["ecsClusters"]!["runner-shell"] = new JsonObject { ["type"] = "create", ["name"] = "engineering-shell" };
+            document["spec"]!["ecsClusters"]!["runner-shell"] = new JsonObject { ["type"] = "create", ["name"] = runnerClusterName };
         }
         return RuntimeConfigurationLoader.Load(System.Text.Encoding.UTF8.GetBytes(document.ToJsonString()));
     }
@@ -131,6 +141,8 @@ internal sealed class FargateInspectionFixture : IDisposable
             ["clusterArn"] = Cluster,
             ["taskDefinitionArn"] = DefinitionArn,
             ["lastStatus"] = state,
+            ["desiredStatus"] = state == "STOPPED" ? "STOPPED" : "RUNNING",
+            ["version"] = 1,
             ["launchType"] = "FARGATE",
             ["enableExecuteCommand"] = enableExec,
             ["startedBy"] = startedBy ?? (allocationId is Guid allocation ? FargateProfileInspector.StartedBy(allocation) : "some-service"),
@@ -166,6 +178,10 @@ internal sealed class FargateInspectionFixture : IDisposable
         "DescribeTaskDefinition" => Ecs(new JsonObject { ["taskDefinition"] = TaskDefinition.DeepClone() }.ToJsonString()),
         "ListTasks" => Ecs(ListTasks(Body(request))),
         "DescribeTasks" => Ecs(DescribeTasks(Body(request))),
+        "RunTask" => RunTask(Body(request)),
+        "StopTask" => StopTask(Body(request)),
+        "ReceiveMessage" => AwsWireTransport.Json(ReceiveMessage(Body(request))),
+        "DeleteMessage" => AwsWireTransport.Json("{}"),
         "GetRole" => AwsWireTransport.Xml(Role(Query(request)["RoleName"]!)),
         "DescribeSubnets" => AwsWireTransport.Xml(Subnets()),
         "DescribeSecurityGroups" => AwsWireTransport.Xml(Groups()),

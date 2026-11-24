@@ -45,9 +45,17 @@ public sealed class EffectEnvelope
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(generation);
         ArgumentNullException.ThrowIfNull(request);
         var normalized = request.Normalize();
-        if (normalized is Ec2LaunchEffectRequest { OwnershipTags: not null } launch)
+        if (normalized is Ec2LaunchEffectRequest { OwnershipTags: not null } ec2)
         {
-            launch.ValidateOwnership(profile);
+            ec2.ValidateOwnership(profile);
+        }
+        if (normalized is FargateLaunchEffectRequest { OwnershipTags: not null } fargate)
+        {
+            FargateEffectProof.ValidateOwnership(profile, fargate);
+            if (providerReplayDeadline is null)
+            {
+                throw new ArgumentException("A tracked Fargate launch requires an immutable replay cutoff.", nameof(providerReplayDeadline));
+            }
         }
         if (earliestPossibleFirstSend == default)
         {

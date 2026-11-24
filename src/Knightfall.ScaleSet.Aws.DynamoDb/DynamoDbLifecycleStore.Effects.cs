@@ -80,8 +80,10 @@ public sealed partial class DynamoDbLifecycleStore
         EffectWrite write,
         EffectDispatchGuard guard,
         DateTimeOffset attemptDeadline,
-        CancellationToken cancellationToken) =>
-        WriteEffectAsync(profile, lease, transitionId, write, LeaseAccess.Active, cancellationToken, guard, attemptDeadline);
+        CancellationToken cancellationToken,
+        EffectJournalSnapshot? replayOf = null) =>
+        WriteEffectAsync(profile, lease, transitionId, write, LeaseAccess.Active, cancellationToken, guard, attemptDeadline,
+            exactPrevious: replayOf);
 
     internal Task<LifecycleWriteOutcome> WriteExactEffectAsync(
         DeploymentLeaseFence lease, Guid transitionId, EffectJournalSnapshot expected, EffectJournalEntry replacement,
@@ -124,7 +126,7 @@ public sealed partial class DynamoDbLifecycleStore
         {
             return LifecycleWriteOutcome.Conflict;
         }
-        if (guard is not null && (head != guard.Index || existing?.State != EffectState.Planned))
+        if (guard is not null && (head != guard.Index || existing?.State != (exactPrevious?.Entry.State ?? EffectState.Planned)))
         {
             return LifecycleWriteOutcome.Conflict;
         }

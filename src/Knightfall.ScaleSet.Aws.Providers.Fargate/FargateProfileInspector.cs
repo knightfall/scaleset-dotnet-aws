@@ -45,7 +45,7 @@ public sealed partial class FargateProfileInspector
 
         try
         {
-            if (!await IsClusterActiveAsync(target, cancellationToken).ConfigureAwait(false))
+            if (!await IsClusterActiveAsync(target.Scope.ClusterArn, cancellationToken).ConfigureAwait(false))
             {
                 return Failed(FargatePreflightStatus.ClusterMismatch);
             }
@@ -100,12 +100,12 @@ public sealed partial class FargateProfileInspector
         }
     }
 
-    private async Task<bool> IsClusterActiveAsync(InspectionTarget target, CancellationToken cancellationToken)
+    private async Task<bool> IsClusterActiveAsync(string clusterArn, CancellationToken cancellationToken)
     {
-        var reply = await _ecs.DescribeClustersAsync(new DescribeClustersRequest { Clusters = [target.Scope.ClusterArn] }, cancellationToken)
+        var reply = await _ecs.DescribeClustersAsync(new DescribeClustersRequest { Clusters = [clusterArn] }, cancellationToken)
             .ConfigureAwait(false);
         return reply.Failures is not { Count: > 0 } && reply.Clusters is [{ Status: "ACTIVE" } cluster] &&
-            cluster.ClusterArn == target.Scope.ClusterArn;
+            cluster.ClusterArn == clusterArn;
     }
 
     private async Task<bool> HasLongArnsAsync(InspectionTarget target, CancellationToken cancellationToken)
@@ -180,7 +180,7 @@ public sealed partial class FargateProfileInspector
         var scope = new FargateProfileScope(aws.Account, aws.Region, RunnerOwnershipTags.DeploymentIdentity(configuration),
             profile.Id, cluster, provisioner.TaskDefinitionArn);
         return new InspectionTarget(scope, profile, provisioner, configuration.Networks[provisioner.Network],
-            $"arn:{partition}:iam::{aws.Account}:", regionScope + "task/" + cluster[(cluster.LastIndexOf('/') + 1)..] + "/");
+            $"arn:{partition}:iam::{aws.Account}:");
     }
 
     private static bool ValidPlatform(TaskDefinition definition, RunnerPlatformConfiguration platform)
@@ -316,5 +316,9 @@ public sealed partial class FargateProfileInspector
         (error is OperationCanceledException && !cancellationToken.IsCancellationRequested);
 
     private sealed record InspectionTarget(FargateProfileScope Scope, RunnerProfile Profile, FargateProvisionerConfiguration Provisioner,
-        RunnerNetwork Network, string PrincipalArnPrefix, string TaskArnPrefix);
+        RunnerNetwork Network, string PrincipalArnPrefix)
+    {
+        public InventoryTarget Inventory { get; } = new(Scope, Provisioner.BootstrapProtocol, Provisioner.RunnerContainer,
+            [.. Network.Subnets.Select(subnet => subnet.Id)]);
+    }
 }

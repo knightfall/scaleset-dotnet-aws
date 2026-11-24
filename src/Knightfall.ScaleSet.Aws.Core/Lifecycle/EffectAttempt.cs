@@ -81,6 +81,20 @@ public sealed class EffectJournalEntry
         return NewAttempt(EffectState.Executing, attempt, EarlierSendUncertain || State == EffectState.Uncertain);
     }
 
+    public EffectJournalEntry BeginFargateReplay(Guid attemptId, long leaseEpoch, DateTimeOffset lowerUtcNow,
+        DateTimeOffset upperUtcNow, DateTimeOffset requestedDeadline, DateTimeOffset leaseDeadline)
+    {
+        if (Envelope.Request is not FargateLaunchEffectRequest { OwnershipTags: not null } ||
+            State is not (EffectState.Executing or EffectState.Uncertain) || Attempt is not { } previousAttempt || previousAttempt.LeaseEpoch != leaseEpoch ||
+            LatestAuthorizedDeadline is not { } priorDeadline || lowerUtcNow < priorDeadline || lowerUtcNow > upperUtcNow)
+        {
+            throw new InvalidOperationException("Only an exact expired Fargate send attempt in the same lease epoch may be replayed.");
+        }
+
+        var previous = State == EffectState.Executing ? MarkUncertain(previousAttempt.Id) : this;
+        return previous.Begin(attemptId, leaseEpoch, upperUtcNow, requestedDeadline, leaseDeadline);
+    }
+
     public EffectJournalEntry RenewAttemptDeadline(
         Guid attemptId,
         long leaseEpoch,
@@ -274,14 +288,18 @@ public sealed class EffectJournalEntry
         {
             return evidence.Kind == EffectResolutionKind.Applied && resource.ObservedAt <= evidence.ObservedAt && Envelope.Request switch
             {
-                Ec2LaunchEffectRequest { OwnershipTags: not null } launch => Ec2LaunchProof.Matches(Envelope.Profile, launch, binding, resource),
+                Ec2LaunchEffectRequest { OwnershipTags: not null } ec2 => Ec2LaunchProof.Matches(Envelope.Profile, ec2, binding, resource),
                 Ec2TerminateEffectRequest terminate => Ec2LaunchProof.Matches(Envelope.Profile, terminate, binding, resource),
+                FargateLaunchEffectRequest { OwnershipTags: not null } fargate => FargateEffectProof.Matches(Envelope.Profile, fargate, binding, resource),
+                FargateStopEffectRequest stop => FargateEffectProof.Matches(Envelope.Profile, stop, binding, resource),
                 _ => false,
             };
         }
         return evidence is { ExecutorBinding: null, ResourceObservation: null } &&
             (Envelope.Request is not Ec2LaunchEffectRequest { OwnershipTags: not null } ||
-             evidence.Kind is not (EffectResolutionKind.Applied or EffectResolutionKind.Rejected));
+             evidence.Kind is not (EffectResolutionKind.Applied or EffectResolutionKind.Rejected)) &&
+            (Envelope.Request is not (FargateLaunchEffectRequest { OwnershipTags: not null } or FargateStopEffectRequest { Incarnation: not null }) ||
+                evidence.Kind == EffectResolutionKind.CanceledBeforeSend);
     }
 
     private bool ValidState()
