@@ -462,6 +462,10 @@ public sealed class GitHubListenerLane : IDisposable
             _recoveryRequired = true;
             return new GitHubListenerLaneResult(GitHubListenerLaneStatus.RecoveryRequired);
         }
+        if (error is IOException)
+        {
+            return new GitHubListenerLaneResult(GitHubListenerLaneStatus.StorageUnavailable);
+        }
         var safe = GitHubOperationException.From(error);
         _cooldown.Record(_connection.SecretArn, safe);
         return new GitHubListenerLaneResult(GitHubListenerLaneStatus.Failed, RetryAt: _cooldown.Read(_connection.SecretArn), Failure: safe);

@@ -2,6 +2,7 @@ using System.Globalization;
 using System.Net;
 using Amazon.DynamoDBv2;
 using Amazon.DynamoDBv2.Model;
+using Amazon.Runtime;
 using Knightfall.ScaleSet.Aws.Core.Lifecycle;
 
 namespace Knightfall.ScaleSet.Aws.DynamoDb;
@@ -114,12 +115,13 @@ public sealed partial class DynamoDbLifecycleStore
 
     private async Task<Dictionary<string, AttributeValue>?> ReadItemAsync(LifecycleKey key, CancellationToken cancellationToken)
     {
-        var reply = await _client.GetItemAsync(new GetItemRequest
+        var request = new GetItemRequest
         {
             TableName = _tableName,
             Key = Key(key),
             ConsistentRead = true,
-        }, cancellationToken).ConfigureAwait(false);
+        };
+        var reply = await ReadWithOutageMappingAsync(token => _client.GetItemAsync(request, token), cancellationToken).ConfigureAwait(false);
 
         if (reply.Item is not { Count: > 0 } item)
         {
@@ -144,7 +146,7 @@ public sealed partial class DynamoDbLifecycleStore
         {
             throw new ArgumentException("The cursor does not belong to this record prefix.", nameof(after));
         }
-        var reply = await _client.QueryAsync(new QueryRequest
+        var request = new QueryRequest
         {
             TableName = _tableName,
             ConsistentRead = true,
@@ -157,7 +159,8 @@ public sealed partial class DynamoDbLifecycleStore
                 [":prefix"] = StringValue(prefix),
             },
             ExclusiveStartKey = after is null ? null : Key(partition, after),
-        }, cancellationToken).ConfigureAwait(false);
+        };
+        var reply = await ReadWithOutageMappingAsync(token => _client.QueryAsync(request, token), cancellationToken).ConfigureAwait(false);
 
         if (reply.Items is { Count: > HistoryPageSize })
         {
@@ -177,6 +180,31 @@ public sealed partial class DynamoDbLifecycleStore
 
         return new BasePage(reply.Items ?? [], next);
     }
+
+    private static async Task<T> ReadWithOutageMappingAsync<T>(Func<CancellationToken, Task<T>> read, CancellationToken cancellationToken)
+    {
+        try
+        {
+            return await read(cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception error) when (IsReadOutage(error))
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            throw new IOException("The lifecycle DynamoDB read is temporarily unavailable.");
+        }
+    }
+
+    private static bool IsReadOutage(Exception error) => error switch
+    {
+        AmazonServiceException service => IsTransientReadStatus(service.StatusCode) || service.Retryable is { Throttling: true } ||
+            service.ErrorCode is "ProvisionedThroughputExceededException" or "ProvisionedThroughputExceeded" or
+                "RequestLimitExceeded" or "RequestLimitExceededException" or "ThrottlingException",
+        HttpRequestException { StatusCode: null } => true,
+        HttpRequestException { StatusCode: { } status } => IsTransientReadStatus(status),
+        _ => false,
+    };
+
+    private static bool IsTransientReadStatus(HttpStatusCode status) => (int)status is 429 or >= 500 and <= 599;
 
     private TransactionAction LeaseCondition(
         DeploymentLeaseFence lease, LeaseAccess access = LeaseAccess.Active, DateTimeOffset? validThrough = null)

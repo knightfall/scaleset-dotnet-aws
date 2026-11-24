@@ -132,6 +132,66 @@ public sealed class GitHubListenerSupervisorTests
         Assert.Equal(1, pollCalls);
     }
 
+    [Theory]
+    [InlineData(HttpStatusCode.BadRequest, "ProvisionedThroughputExceededException")]
+    [InlineData(HttpStatusCode.InternalServerError, "InternalServerError")]
+    [InlineData(null, null)]
+    public async Task StorageOutageAfterSuccessfulAckResumesTheSamePumpWithoutRepeatingDelete(HttpStatusCode? status, string? code)
+    {
+        var cancellation = TestContext.Current.CancellationToken;
+        using var table = await MiniStackTable.CreateAsync(cancellation);
+        var clock = new ContractClock();
+        var store = new DynamoDbLifecycleStore(table.Client, table.Name, clock);
+        var configuration = await ConfigurationAsync(cancellation);
+        var lease = await AcquireActiveAsync(store, configuration, clock, MiniStackTable.FirstTask, cancellation);
+        var profile = new LifecycleProfile(lease.Deployment, FirstProfile);
+        using var wire = new GitHubWire((request, _) =>
+        {
+            if (request.Method == HttpMethod.Post && request.Uri.AbsolutePath == SessionsPath(GitHubWire.SetId))
+            {
+                return GitHubWire.Reply(HttpStatusCode.OK, SessionJson(request, FirstSession, FirstQueue));
+            }
+            if (request.Method == HttpMethod.Get && request.Uri.AbsolutePath == FirstQueue)
+            {
+                return GitHubWire.Reply(HttpStatusCode.OK, DeliveryJson(0));
+            }
+            if (request.Method == HttpMethod.Delete && request.Uri.AbsolutePath == FirstQueue + "/0")
+            {
+                table.Wire.FailNextGetItem(LifecycleKey.Lease(lease.Deployment), status, code);
+                return Task.FromResult(new HttpResponseMessage(HttpStatusCode.NoContent));
+            }
+            throw new InvalidOperationException("Unexpected fixture operation.");
+        });
+        using var http = new HttpClient(wire, disposeHandler: false);
+        var supervisor = new GitHubListenerSupervisor(store, clock, Timing);
+        using var lane = supervisor.Register(Definition(configuration, FirstProfile,
+            await ConnectAsync(configuration, http, clock, cancellation), lease, clock));
+        Assert.Equal(ScaleSetListenerStepStatus.Initialized, (await lane.StepAsync(cancellation)).Step?.Status);
+
+        var unavailable = await lane.StepAsync(cancellation);
+        Assert.Equal(GitHubListenerLaneStatus.StorageUnavailable, unavailable.Status);
+        Assert.Null(unavailable.Failure);
+        var active = Assert.IsType<SessionRecord>(await store.ReadSessionAsync(profile, cancellation));
+        var checkpointStore = new GitHubListenerCheckpointStore(store, Assert.IsType<OwnedSessionFence>(active.Fence));
+        var pending = Assert.IsType<ScaleSetListenerCheckpoint>(
+            await checkpointStore.ReadAsync(checkpointStore.SessionKey, cancellation));
+        Assert.Equal(ScaleSetListenerPendingPhase.Acknowledging, pending.Pending?.Phase);
+        Assert.Null(pending.LastAcknowledgedMessageId);
+
+        var recovered = await lane.StepAsync(cancellation);
+        Assert.Equal(GitHubListenerLaneStatus.Stepped, recovered.Status);
+        Assert.Equal(ScaleSetListenerStepStatus.MessageAcknowledged, recovered.Step?.Status);
+        var settled = Assert.IsType<ScaleSetListenerCheckpoint>(
+            await checkpointStore.ReadAsync(checkpointStore.SessionKey, cancellation));
+        Assert.Equal(pending.Revision + 1, settled.Revision);
+        Assert.Null(settled.Pending);
+        Assert.Equal(0, settled.LastAcknowledgedMessageId);
+        Assert.Equal(active, await store.ReadSessionAsync(profile, cancellation));
+        Assert.Single(wire.Requests, request => request.Method == HttpMethod.Post && request.Uri.AbsolutePath == SessionsPath(GitHubWire.SetId));
+        Assert.Single(wire.Requests, request => request.Method == HttpMethod.Get && request.Uri.AbsolutePath == FirstQueue);
+        Assert.Single(wire.Requests, request => request.Method == HttpMethod.Delete && request.Uri.AbsolutePath == FirstQueue + "/0");
+    }
+
     [Fact(Timeout = 30_000)]
     public async Task ConcurrentUnauthorizedAndRateLimitShareOneCooldownAcrossProfiles()
     {

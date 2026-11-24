@@ -189,6 +189,7 @@ internal sealed class MiniStackWire : DelegatingHandler
     private int _dropSuccessfulTransaction;
     private TransactionBarrier? _transactionBarrier;
     private PausedRead? _pausedRead;
+    private FailedGetItem? _failedGetItem;
 
     internal IReadOnlyList<MiniStackCall> Requests => _requests.ToArray();
 
@@ -206,6 +207,9 @@ internal sealed class MiniStackWire : DelegatingHandler
     internal void DropNextSuccessfulTransactionResponse() => Interlocked.Exchange(ref _dropSuccessfulTransaction, 1);
 
     internal void HoldNextTwoTransactions() => _transactionBarrier = new TransactionBarrier();
+
+    internal void FailNextGetItem(LifecycleKey key, HttpStatusCode? status, string? errorCode) =>
+        Interlocked.Exchange(ref _failedGetItem, new FailedGetItem(key, status, errorCode));
 
     internal PausedRead PauseNextRead(LifecycleKey key)
     {
@@ -226,6 +230,25 @@ internal sealed class MiniStackWire : DelegatingHandler
         var call = new MiniStackCall(operation, document.RootElement.Clone());
         _requests.Enqueue(call);
 
+        if (operation == "GetItem" && _failedGetItem is { } fault &&
+            MatchesKey(call.Request.GetProperty("Key"), fault.Key) &&
+            ReferenceEquals(Interlocked.CompareExchange(ref _failedGetItem, null, fault), fault))
+        {
+            if (fault.Status is not { } status)
+            {
+                throw new HttpRequestException(HttpRequestError.ConnectionError, "synthetic storage diagnostic",
+                    new SocketException((int)SocketError.ConnectionReset));
+            }
+            string failurePayload = JsonSerializer.Serialize(new
+            {
+                __type = "com.amazonaws.dynamodb.v20120810#" + fault.ErrorCode,
+                message = "synthetic storage diagnostic",
+            });
+            return new HttpResponseMessage(status)
+            {
+                Content = new StringContent(failurePayload, Encoding.UTF8, "application/x-amz-json-1.0"),
+            };
+        }
         if (operation == "TransactWriteItems" && Interlocked.Exchange(ref _dropTransactionBeforeSend, 0) == 1)
         {
             throw new HttpRequestException("Lost request before MiniStack received the transaction.",
@@ -261,6 +284,12 @@ internal sealed class MiniStackWire : DelegatingHandler
         return actual;
     }
 
+    private static bool MatchesKey(JsonElement item, LifecycleKey key) =>
+        item.GetProperty("PK").GetProperty("S").GetString() == key.PartitionKey &&
+        item.GetProperty("SK").GetProperty("S").GetString() == key.SortKey;
+
+    private sealed record FailedGetItem(LifecycleKey Key, HttpStatusCode? Status, string? ErrorCode);
+
     internal sealed class PausedRead(LifecycleKey key)
     {
         private readonly TaskCompletionSource _captured = new(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -268,9 +297,7 @@ internal sealed class MiniStackWire : DelegatingHandler
 
         internal Task Captured => _captured.Task;
 
-        internal bool Matches(JsonElement item) =>
-            item.GetProperty("PK").GetProperty("S").GetString() == key.PartitionKey &&
-            item.GetProperty("SK").GetProperty("S").GetString() == key.SortKey;
+        internal bool Matches(JsonElement item) => MatchesKey(item, key);
 
         internal async Task AwaitResumeAsync(CancellationToken cancellationToken)
         {
