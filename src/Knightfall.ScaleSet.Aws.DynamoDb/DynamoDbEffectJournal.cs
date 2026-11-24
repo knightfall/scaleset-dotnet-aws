@@ -182,12 +182,17 @@ public sealed partial class DynamoDbEffectJournal
             : await _store.WriteDispatchedEffectAsync(entry.Envelope.Profile, lease.Fence, transitionId,
                 new EffectWrite(entry.Envelope.IntentId, current.Revision, entry.State, entry.WritePayload()),
                 guard, attempt.Deadline, cancellationToken).ConfigureAwait(false);
-        if (outcome != LifecycleWriteOutcome.Committed || cancellationToken.IsCancellationRequested)
+        if (outcome != LifecycleWriteOutcome.Committed)
         {
             return new EffectBeginOutcome(outcome, null);
         }
         var permission = new EffectSendAuthorization(entry.Envelope, attempt, checked(current.Revision + 1), transitionId, lease.Fence,
             _timeProvider, beganAt, upperUtcNow);
+        if (cancellationToken.IsCancellationRequested)
+        {
+            await FinalizeInterruptedRunnerEffectAsync(lease, permission, leaseReserve).ConfigureAwait(false);
+            return new EffectBeginOutcome(outcome, null);
+        }
         if (permission.EstimateUtcNow() < attempt.Deadline)
         {
             return new EffectBeginOutcome(outcome, permission);

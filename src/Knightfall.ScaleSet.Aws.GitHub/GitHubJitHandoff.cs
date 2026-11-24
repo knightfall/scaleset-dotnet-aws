@@ -132,8 +132,16 @@ public sealed partial class GitHubJitHandoff
         {
             return new GitHubJitResult(GitHubJitStatus.RecoveryRequired);
         }
-        return await GenerateAsync(authority.Clock, lease, catalog!, executor, handoff, permission, connection, token)
-            .ConfigureAwait(false);
+        try
+        {
+            return await GenerateAsync(authority.Clock, lease, catalog!, executor, handoff, permission, connection, token)
+                .ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (token.IsCancellationRequested)
+        {
+            await _journal.FinalizeInterruptedRunnerEffectAsync(lease, permission, _timing.WriteReserve).ConfigureAwait(false);
+            throw;
+        }
     }
 
     private async Task<GitHubJitResult> GenerateAsync(

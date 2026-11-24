@@ -124,13 +124,19 @@ public sealed partial class GitHubJitHandoff
         {
             return null;
         }
-        var executing = await _journal.ReadAsync(profile, intentId, cancellationToken).ConfigureAwait(false);
-        if (!MatchesAttempt(executing, authorized))
+        try
         {
-            return null;
+            var executing = await _journal.ReadAsync(profile, intentId, cancellationToken).ConfigureAwait(false);
+            return MatchesAttempt(executing, authorized)
+                ? await SendRemovalAsync(live, clock, catalog, executor, executing!, authorized, connection, cancellationToken)
+                    .ConfigureAwait(false)
+                : null;
         }
-        return await SendRemovalAsync(live, clock, catalog, executor, executing!, authorized, connection, cancellationToken)
-            .ConfigureAwait(false);
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            await _journal.FinalizeInterruptedRunnerEffectAsync(live, authorized, _timing.WriteReserve).ConfigureAwait(false);
+            throw;
+        }
     }
 
     private async Task<EffectJournalSnapshot?> SendRemovalAsync(

@@ -5,6 +5,50 @@ namespace Knightfall.ScaleSet.Aws.DynamoDb;
 
 public sealed partial class DynamoDbEffectJournal
 {
+    public async Task FinalizeInterruptedRunnerEffectAsync(
+        ControllerLease lease, EffectSendAuthorization authorization, TimeSpan writeReserve)
+    {
+        var envelope = authorization.Envelope;
+        if (lease.Mode != ControllerLeaseMode.Active || lease.Fence != authorization.Lease ||
+            envelope.Request is not (GitHubJitGenerateEffectRequest or GitHubRunnerRemoveEffectRequest))
+        {
+            return;
+        }
+        var remaining = lease.ValidUntil - authorization.EstimateUtcNow();
+        var budget = remaining < writeReserve ? remaining : writeReserve;
+        if (budget <= TimeSpan.Zero)
+        {
+            return;
+        }
+
+        using var cleanup = new CancellationTokenSource(budget, _timeProvider);
+        try
+        {
+            if (!authorization.HasStartedSending)
+            {
+                _ = await AbandonUnsentRunnerEffectAsync(lease, authorization, cleanup.Token).ConfigureAwait(false);
+                return;
+            }
+            var current = await ReadAsync(envelope.Profile, envelope.IntentId, cleanup.Token).ConfigureAwait(false);
+            if (current is { Entry.State: EffectState.Executing } &&
+                current.Revision == authorization.Revision && current.TransitionId == authorization.BeginTransitionId &&
+                current.Entry.Attempt == authorization.Attempt && current.Entry.Envelope.Matches(envelope))
+            {
+                var uncertain = current.Entry.MarkUncertain(authorization.Attempt.Id);
+                _ = await _store.WriteExactRunnerEffectAsync(lease.Fence, Guid.NewGuid(), current, uncertain,
+                    authorization.EstimateUtcNow(), cleanup.Token).ConfigureAwait(false);
+            }
+        }
+        catch (OperationCanceledException) when (cleanup.IsCancellationRequested)
+        {
+            // Persisted attempts remain available to fenced recovery.
+        }
+        catch (IOException)
+        {
+            // An unavailable store cannot confirm the exact transition.
+        }
+    }
+
     /// <summary>Settles an exact initial GitHub runner effect whose send authorization can still be discarded.</summary>
     public async Task<LifecycleWriteOutcome> AbandonUnsentRunnerEffectAsync(
         ControllerLease lease, EffectSendAuthorization authorization, CancellationToken cancellationToken)
