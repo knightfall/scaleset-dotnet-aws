@@ -19,5 +19,6 @@
     <Compile Include="../Knightfall.ScaleSet.Aws.Telemetry.Tests/OtlpMessage.cs" Link="Telemetry/OtlpMessage.cs" />
     <None Include="../../testdata/config/runtime/fargate-only.json" Link="fargate-only.json" CopyToOutputDirectory="PreserveNewest" />
     <None Include="../../testdata/config/runtime/ec2-only-pinned.json" Link="ec2-only-pinned.json" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="../../testdata/config/runtime/mixed-ec2-fargate.json" Link="mixed-ec2-fargate.json" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 </Project>
