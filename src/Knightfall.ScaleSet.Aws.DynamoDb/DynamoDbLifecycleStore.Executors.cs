@@ -34,7 +34,9 @@ public sealed partial class DynamoDbLifecycleStore
         }
         if (state.Binding.Profile != profile || state.Binding.AllocationId != allocationId || state.RunnerId <= 0 ||
             (state.Process is not null && state.Process.RunnerId != state.RunnerId) ||
-            (state.Job is not null && state.Job.RunnerId != state.RunnerId))
+            (state.Job is not null && state.Job.RunnerId != state.RunnerId) ||
+            (state.AdmissionClosure is { } closure && (!Enum.IsDefined(closure) || state.Binding.Provider is not FargateExecutorIdentity ||
+                (closure == FargateAdmissionClosure.Unused ? state.RunnerId is not null : state.RunnerId is null))))
         {
             throw InvalidRecord();
         }
@@ -239,7 +241,8 @@ public sealed partial class DynamoDbLifecycleStore
             {
                 return LifecycleWriteOutcome.Conflict;
             }
-            if (bindingRunnerId is not null && current.State.RunnerId is long existing && existing != bindingRunnerId)
+            if (bindingRunnerId is not null && (current.State.AdmissionClosure == FargateAdmissionClosure.Unused ||
+                (current.State.RunnerId is long existing && existing != bindingRunnerId)))
             {
                 return LifecycleWriteOutcome.Conflict;
             }

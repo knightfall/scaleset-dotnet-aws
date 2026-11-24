@@ -211,7 +211,7 @@ public sealed partial class GitHubJitHandoff
         CatalogProfile? catalog, ExecutorSnapshot? executor, JitHandoffIdentity identity, DateTimeOffset observedAt, DateTimeOffset now) =>
         catalog is { State: CatalogProfileState.Active or CatalogProfileState.Draining, Binding.BootstrapProtocol: "v1" } &&
         catalog.Binding.ScopeIdentity == identity.ScopeIdentity && catalog.Binding.ScaleSetId == identity.ScaleSetId &&
-        executor is { State: { HasConflict: false, RunnerId: null, Resource: { State: ExecutorResourceState.Running } resource } } &&
+        executor is { State: { HasConflict: false, RunnerId: null, AdmissionClosure: null, Resource: { State: ExecutorResourceState.Running } resource } } &&
         executor.Binding.AllocationId == identity.AllocationId.ToString("D") && executor.Binding.Incarnation == identity.Incarnation &&
         executor.Binding.ResourceArn == identity.ResourceArn &&
         Fresh(observedAt, now) && Fresh(resource.ObservedAt, now);

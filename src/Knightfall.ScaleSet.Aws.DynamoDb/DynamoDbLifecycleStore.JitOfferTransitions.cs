@@ -39,7 +39,7 @@ public sealed partial class DynamoDbLifecycleStore
         }
         var executor = await ReadExecutorAsync(profile, handoff.Identity.AllocationId.ToString("D"), cancellationToken).ConfigureAwait(false);
         if (executor is null || !MatchesJitExecutor(executor, handoff.Identity) || !MatchesJitProvider(catalog, executor) ||
-            executor.State is not { HasConflict: false, Resource.State: ExecutorResourceState.Running })
+            executor.State is not { AdmissionClosure: null, HasConflict: false, Resource.State: ExecutorResourceState.Running })
         {
             return new JitHandoffChange(LifecycleWriteOutcome.Conflict);
         }

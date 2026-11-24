@@ -77,6 +77,12 @@ public sealed record ExecutorJobObservation(
     long RequestId, long RunnerId, ExecutorJobPhase Phase, Guid SessionId, long MessageId, DateTimeOffset ObservedAt,
     bool HasConflict = false);
 
+public enum FargateAdmissionClosure
+{
+    Unused = 1,
+    OfferRevoked = 2,
+}
+
 public sealed record ExecutorState(
     ExecutorBinding Binding,
     long? RunnerId = null,
@@ -86,7 +92,8 @@ public sealed record ExecutorState(
     DateTimeOffset? StartedAt = null,
     DateTimeOffset? LastResourcePresentAt = null,
     DateTimeOffset? LastProcessReadyAt = null,
-    bool HasConflict = false);
+    bool HasConflict = false,
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] FargateAdmissionClosure? AdmissionClosure = null);
 
 public sealed record ExecutorSnapshot(ExecutorState State, long Revision, Guid TransitionId)
 {

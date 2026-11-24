@@ -25,7 +25,7 @@ public sealed partial class DynamoDbEffectJournal
             return LifecycleWriteOutcome.LeaseRejected;
         }
         if (!EffectJournalEntry.AllowsAbandonmentBeforeSend(envelope) ||
-            (authorization.HasStartedSending && envelope.Request is Ec2LaunchEffectRequest))
+            (authorization.HasStartedSending && envelope.Request is Ec2LaunchEffectRequest or FargateStopEffectRequest))
         {
             return LifecycleWriteOutcome.Conflict;
         }
@@ -135,8 +135,23 @@ public sealed partial class DynamoDbEffectJournal
         current.Entry.Resolution.ObservedAt == discard.ObservedAt;
 
     /// <summary>Restores the exact runner removal to planned after durable proof that its attempt was never sent.</summary>
-    public async Task<LifecycleWriteOutcome> RearmAbandonedRunnerRemovalAsync(
+    public Task<LifecycleWriteOutcome> RearmAbandonedRunnerRemovalAsync(
         ControllerLease lease, EffectJournalSnapshot expected, CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(expected);
+        return expected.Entry.Envelope.Request is GitHubRunnerRemoveEffectRequest
+            ? RearmAbandonedEffectAsync(lease, expected, cancellationToken)
+            : Task.FromResult(LifecycleWriteOutcome.Conflict);
+    }
+
+    internal Task<LifecycleWriteOutcome> RearmAbandonedFargateStopAsync(
+        ControllerLease lease, EffectJournalSnapshot expected, EffectDispatchGuard guard, CancellationToken cancellationToken) =>
+        expected.Entry.Envelope.Request is FargateStopEffectRequest { Incarnation: not null }
+            ? RearmAbandonedEffectAsync(lease, expected, cancellationToken, guard)
+            : Task.FromResult(LifecycleWriteOutcome.Conflict);
+
+    private async Task<LifecycleWriteOutcome> RearmAbandonedEffectAsync(
+        ControllerLease lease, EffectJournalSnapshot expected, CancellationToken cancellationToken, EffectDispatchGuard? guard = null)
     {
         ArgumentNullException.ThrowIfNull(lease);
         ArgumentNullException.ThrowIfNull(expected);
@@ -144,7 +159,7 @@ public sealed partial class DynamoDbEffectJournal
         {
             return LifecycleWriteOutcome.LeaseRejected;
         }
-        if (expected.Entry.RearmAbandonedRunnerRemoval() is not { } planned)
+        if (expected.Entry.RearmAbandonedBeforeSend() is not { } planned)
         {
             return LifecycleWriteOutcome.Conflict;
         }
@@ -161,7 +176,7 @@ public sealed partial class DynamoDbEffectJournal
         {
             return LifecycleWriteOutcome.Conflict;
         }
-        var outcome = await _store.WriteExactEffectAsync(owner.Fence, transition, current, planned, null, cancellationToken)
+        var outcome = await _store.WriteExactEffectAsync(owner.Fence, transition, current, planned, null, cancellationToken, guard)
             .ConfigureAwait(false);
         if (outcome is LifecycleWriteOutcome.Conflict or LifecycleWriteOutcome.Indeterminate)
         {
@@ -183,7 +198,7 @@ public sealed partial class DynamoDbEffectJournal
         ArgumentNullException.ThrowIfNull(handoff);
         if (intent.Entry.Envelope.Request is not GitHubJitGenerateEffectRequest request ||
             !DynamoDbLifecycleStore.MatchesJitRequest(intent.Entry.Envelope, handoff) ||
-            executor.State is not { Resource.State: ExecutorResourceState.Running, HasConflict: false, RunnerId: null })
+            executor.State is not { Resource.State: ExecutorResourceState.Running, HasConflict: false, RunnerId: null, AdmissionClosure: null })
         {
             return new EffectBeginOutcome(LifecycleWriteOutcome.Conflict, null);
         }

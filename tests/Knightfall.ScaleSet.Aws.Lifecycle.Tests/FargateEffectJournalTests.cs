@@ -2,6 +2,7 @@ using Knightfall.ScaleSet.Aws.Core.Catalog;
 using Knightfall.ScaleSet.Aws.Core.Configuration;
 using Knightfall.ScaleSet.Aws.Core.Lifecycle;
 using Knightfall.ScaleSet.Aws.DynamoDb;
+using Knightfall.ScaleSet.Aws.Handoff;
 using Xunit;
 
 namespace Knightfall.ScaleSet.Aws.Lifecycle.Tests;
@@ -15,6 +16,7 @@ public sealed class FargateEffectJournalTests
     private const string ExecutionRole = "arn:aws:iam::111122223333:role/fargate-shell-execution";
     private const string RunnerSubnet = "subnet-0123456789abcdef2";
     private const string NextOwnerTask = "arn:aws:ecs:us-east-1:000000000000:task/controller/00000000000000000000000000000002";
+    private const string BootstrapUser = "AROAFIXTUREHANDOFF001:11111111111111111111111111111111";
     private const long RunnerId = 17;
     private static readonly DateTimeOffset Now = MiniStackTable.Now;
     private static readonly TimeSpan Reserve = TimeSpan.FromSeconds(2);
@@ -200,9 +202,7 @@ public sealed class FargateEffectJournalTests
         var binding = Bind(launch);
         await SeedStopCandidateAsync(fixture, binding, completed, token);
         fixture.Clock.Now = fixture.Clock.Now.AddSeconds(1);
-        var request = new FargateStopEffectRequest(Guid.Parse(binding.AllocationId), Cluster, TaskArn, Definition, binding.Incarnation);
-        var stop = EffectEnvelope.Create(fixture.Profile, EffectIntentIdentity.ForAllocation(request)!, 1, request,
-            fixture.Clock.Now, null);
+        var stop = Stop(fixture, binding);
         await PlanAsync(fixture, stop, token);
         var provider = new FixtureProvider(fixture.Clock)
         {
@@ -216,6 +216,187 @@ public sealed class FargateEffectJournalTests
         Assert.Equal(completed ? ExecutorResourceState.IrreversiblyTerminated : ExecutorResourceState.Running, executor.State.Resource?.State);
         Assert.Equal(completed ? ExecutorJobPhase.Completed : ExecutorJobPhase.Started, executor.State.Job?.Phase);
         Assert.Equal(RunnerId, executor.State.RunnerId);
+    }
+
+    [Theory(Timeout = 10_000)]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task UnusedAdmissionClosureAndJitStagingCannotBothCommit(bool closureWins)
+    {
+        var token = TestContext.Current.CancellationToken;
+        using var table = await MiniStackTable.CreateAsync(token);
+        using var recipient = JitRecipientKey.Create();
+        var fixture = await CreateFixtureAsync(table, token);
+        var binding = Bind(Launch(fixture.Profile));
+        var executor = await SeedLiveAsync(fixture, binding, token);
+        var (catalog, identity, runnerName, _) = await SeedHelloAsync(table, fixture, binding, recipient, token);
+        var key = closureWins ? LifecycleKey.Handoff(fixture.Profile, identity.AllocationId) :
+            LifecycleKey.Runner(fixture.Profile, binding.AllocationId);
+        var pause = table.Wire.PauseNextTransactionWrite(key);
+        var freshness = Timing.ObservationFreshness;
+
+        Task<LifecycleWriteOutcome> Close() => fixture.Store.CloseFargateAdmissionAsync(fixture.Lease, executor, freshness, token);
+        Task<JitHandoffChange> Stage() => fixture.Store.StageJitHandoffAsync(fixture.Lease, catalog, executor, identity, runnerName, token);
+        if (closureWins)
+        {
+            var staging = Stage();
+            try
+            {
+                await pause.Captured.WaitAsync(token);
+                Assert.Equal(LifecycleWriteOutcome.Committed, await Close());
+            }
+            finally
+            {
+                pause.Resume();
+            }
+            Assert.Equal(LifecycleWriteOutcome.Conflict, (await staging).Outcome);
+            Assert.Null(await fixture.Store.ReadJitHandoffAsync(fixture.Profile, identity.AllocationId, token));
+            var closed = Assert.IsType<ExecutorSnapshot>(await fixture.Store.ReadExecutorAsync(fixture.Profile, binding.AllocationId, token));
+            Assert.Equal(FargateAdmissionClosure.Unused, closed.State.AdmissionClosure);
+            Assert.Equal(LifecycleWriteOutcome.Conflict, (await fixture.Store.StageJitHandoffAsync(fixture.Lease, catalog, closed,
+                identity, runnerName, token)).Outcome);
+        }
+        else
+        {
+            var closing = Close();
+            try
+            {
+                await pause.Captured.WaitAsync(token);
+                Assert.Equal(LifecycleWriteOutcome.Committed, (await Stage()).Outcome);
+            }
+            finally
+            {
+                pause.Resume();
+            }
+            Assert.Equal(LifecycleWriteOutcome.Conflict, await closing);
+        }
+
+        fixture.Clock.Now = fixture.Clock.Now.AddSeconds(1);
+        var stop = Stop(fixture, binding);
+        await PlanAsync(fixture, stop, token);
+        var provider = TerminalProvider(fixture.Clock, binding);
+        Assert.Equal(closureWins ? EffectDispatchStatus.Settled : EffectDispatchStatus.Ineligible, await DispatchAsync(fixture, stop, provider, token));
+        Assert.Equal(closureWins ? 1 : 0, provider.Sends.Count);
+    }
+
+    [Fact(Timeout = 10_000)]
+    public async Task AcquisitionAfterBeginDiscardsUnsentStopAndCanRearmAfterItCloses()
+    {
+        var token = TestContext.Current.CancellationToken;
+        using var table = await MiniStackTable.CreateAsync(token);
+        var fixture = await CreateFixtureAsync(table, token);
+        var binding = Bind(Launch(fixture.Profile));
+        var executor = await SeedLiveAsync(fixture, binding, token);
+        Assert.Equal(LifecycleWriteOutcome.Committed,
+            await fixture.Store.CloseFargateAdmissionAsync(fixture.Lease, executor, Timing.ObservationFreshness, token));
+        fixture.Clock.Now = fixture.Clock.Now.AddSeconds(1);
+        var stop = Stop(fixture, binding);
+        await PlanAsync(fixture, stop, token);
+        var provider = TerminalProvider(fixture.Clock, binding);
+        var pause = table.Wire.PauseAfterNextSuccessfulTransactionWrite(LifecycleKey.Operation(fixture.Profile, stop.IntentId));
+        var dispatch = DispatchAsync(fixture, stop, provider, token);
+        try
+        {
+            await pause.Captured.WaitAsync(token);
+            await WriteAdmissionBalanceAsync(fixture, 1, token);
+        }
+        finally
+        {
+            pause.Resume();
+        }
+
+        Assert.Equal(EffectDispatchStatus.AwaitingEvidence, await dispatch);
+        Assert.Empty(provider.Sends);
+        var discarded = await ReadAsync(fixture, stop, token);
+        Assert.Equal(EffectResolutionKind.AbandonedBeforeSend, discarded.Entry.Resolution?.Kind);
+        Assert.Equal(EffectDispatchStatus.Ineligible, await DispatchAsync(fixture, stop, provider, token));
+        Assert.Equal(discarded.TransitionId, (await ReadAsync(fixture, stop, token)).TransitionId);
+        await WriteAdmissionBalanceAsync(fixture, 0, token);
+        Assert.Equal(EffectDispatchStatus.Settled, await DispatchAsync(fixture, stop, provider, token));
+        var sent = Assert.Single(provider.Sends);
+        Assert.True(stop.Matches(sent.Envelope));
+        Assert.NotEqual(discarded.Entry.Attempt?.Id, sent.Attempt.Id);
+    }
+
+    [Fact]
+    public async Task StopWithConsumedAuthorizationAndAnAmbiguousResponseCannotRearm()
+    {
+        var token = TestContext.Current.CancellationToken;
+        using var table = await MiniStackTable.CreateAsync(token);
+        var fixture = await CreateFixtureAsync(table, token);
+        var binding = Bind(Launch(fixture.Profile));
+        var executor = await SeedLiveAsync(fixture, binding, token);
+        Assert.Equal(LifecycleWriteOutcome.Committed,
+            await fixture.Store.CloseFargateAdmissionAsync(fixture.Lease, executor, Timing.ObservationFreshness, token));
+        var stop = Stop(fixture, binding);
+        await PlanAsync(fixture, stop, token);
+        var provider = new FixtureProvider(fixture.Clock);
+
+        Assert.Equal(EffectDispatchStatus.AwaitingEvidence, await DispatchAsync(fixture, stop, provider, token));
+        var executing = await ReadAsync(fixture, stop, token);
+        Assert.Equal(EffectState.Executing, executing.Entry.State);
+        Assert.Null(executing.Entry.Resolution);
+        fixture.Clock.Now = fixture.Clock.Now.AddMinutes(1);
+        Assert.Equal(EffectDispatchStatus.AwaitingEvidence, await DispatchAsync(fixture, stop, provider, token));
+        Assert.Equal(executing.TransitionId, (await ReadAsync(fixture, stop, token)).TransitionId);
+        Assert.Equal(executing.Entry.Attempt, Assert.Single(provider.Sends).Attempt);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task RevokedStopNeedsTheExactUnconsumedOfferAndNoOpenAcquisition(bool consumed)
+    {
+        var token = TestContext.Current.CancellationToken;
+        using var table = await MiniStackTable.CreateAsync(token);
+        using var recipient = JitRecipientKey.Create();
+        var fixture = await CreateFixtureAsync(table, token);
+        var binding = Bind(Launch(fixture.Profile));
+        var unused = await SeedLiveAsync(fixture, binding, token);
+        var (catalog, identity, runnerName, bootstrap) = await SeedHelloAsync(table, fixture, binding, recipient, token);
+        var staged = Assert.IsType<JitHandoffSnapshot>((await fixture.Store.StageJitHandoffAsync(fixture.Lease, catalog, unused,
+            identity, runnerName, token)).Handoff);
+        var request = new GitHubJitGenerateEffectRequest(identity.ScopeIdentity, identity.ScaleSetId, identity.AllocationId,
+            identity.ResourceArn, identity.Incarnation, identity.AwsUserId, staged.HelloSha256, staged.OfferId, staged.RunnerName);
+        var generation = EffectEnvelope.Create(fixture.Profile, staged.IntentId, 1, request, fixture.Clock.Now, null);
+        await PlanAsync(fixture, generation, token);
+        var begun = await fixture.Journal.BeginJitAsync(fixture.Lease, catalog, unused, staged, await ReadAsync(fixture, generation, token),
+            fixture.Clock.Now, fixture.Clock.Now.AddSeconds(20), Reserve, token);
+        Assert.True(Assert.IsType<EffectSendAuthorization>(begun.Permission).TryConsume(out _));
+        var attempt = await ReadAsync(fixture, generation, token);
+        var offer = JitOfferCryptography.Seal(JitOfferBinding.Create(identity, staged.Hello.BootNonce, fixture.Clock.Now.AddMinutes(1)),
+            staged.Hello, "synthetic-test-jit"u8, fixture.Clock);
+        var offered = Assert.IsType<JitHandoffSnapshot>((await fixture.Store.PublishJitHandoffAsync(fixture.Lease, catalog, staged,
+            attempt, RunnerId, offer, token)).Handoff);
+        var registered = Assert.IsType<ExecutorSnapshot>(await fixture.Store.ReadExecutorAsync(fixture.Profile, binding.AllocationId, token));
+        var freshness = Timing.ObservationFreshness;
+
+        Assert.Equal(LifecycleWriteOutcome.Conflict, await fixture.Store.CloseFargateAdmissionAsync(fixture.Lease, registered, freshness, token));
+        if (consumed)
+        {
+            Assert.Equal(BootstrapOfferStatus.Consumed, (await bootstrap.TryConsumeOfferAsync(recipient.Hello, token)).Status);
+            Assert.Equal(LifecycleWriteOutcome.Conflict, (await fixture.Store.RevokeJitHandoffAsync(fixture.Lease, offered, token)).Outcome);
+            Assert.Equal(LifecycleWriteOutcome.Conflict, await fixture.Store.CloseFargateAdmissionAsync(fixture.Lease, registered, freshness, token));
+        }
+        else
+        {
+            Assert.Equal(LifecycleWriteOutcome.Committed, (await fixture.Store.RevokeJitHandoffAsync(fixture.Lease, offered, token)).Outcome);
+            await WriteAdmissionBalanceAsync(fixture, 1, token);
+            Assert.Equal(LifecycleWriteOutcome.Conflict, await fixture.Store.CloseFargateAdmissionAsync(fixture.Lease, registered, freshness, token));
+            await WriteAdmissionBalanceAsync(fixture, 0, token);
+            Assert.Equal(LifecycleWriteOutcome.Committed, await fixture.Store.CloseFargateAdmissionAsync(fixture.Lease, registered, freshness, token));
+        }
+
+        fixture.Clock.Now = fixture.Clock.Now.AddSeconds(1);
+        var stop = Stop(fixture, binding);
+        await PlanAsync(fixture, stop, token);
+        var provider = TerminalProvider(fixture.Clock, binding);
+        Assert.Equal(consumed ? EffectDispatchStatus.Ineligible : EffectDispatchStatus.Settled, await DispatchAsync(fixture, stop, provider, token));
+        Assert.Equal(consumed ? 0 : 1, provider.Sends.Count);
+        var current = Assert.IsType<ExecutorSnapshot>(await fixture.Store.ReadExecutorAsync(fixture.Profile, binding.AllocationId, token));
+        Assert.Equal(consumed ? null : FargateAdmissionClosure.OfferRevoked, current.State.AdmissionClosure);
+        Assert.Equal(RunnerId, current.State.RunnerId);
+        Assert.Null(current.State.Job);
     }
 
     private static async Task<Fixture> CreateFixtureAsync(MiniStackTable table, CancellationToken cancellationToken, TimeSpan? leaseDuration = null)
@@ -277,6 +458,43 @@ public sealed class FargateEffectJournalTests
             TaskRole, ExecutionRole, "runner", clientToken ?? Guid.NewGuid(), tags, 1024);
         return EffectEnvelope.Create(profile, EffectIntentIdentity.ForAllocation(request)!, 1, request, Now, Now.AddMinutes(50));
     }
+
+    private static EffectEnvelope Stop(Fixture fixture, ExecutorBinding binding)
+    {
+        var request = new FargateStopEffectRequest(Guid.Parse(binding.AllocationId), Cluster, TaskArn, Definition, binding.Incarnation);
+        return EffectEnvelope.Create(fixture.Profile, EffectIntentIdentity.ForAllocation(request)!, 1, request, fixture.Clock.Now, null);
+    }
+
+    private static async Task<ExecutorSnapshot> SeedLiveAsync(Fixture fixture, ExecutorBinding binding, CancellationToken token)
+    {
+        Assert.Equal(LifecycleWriteOutcome.Committed, await fixture.Store.BindExecutorAsync(fixture.Lease.Fence, binding, token));
+        Assert.Equal(LifecycleWriteOutcome.Committed, await fixture.Store.ObserveResourceAsync(fixture.Lease.Fence, binding,
+            new ExecutorResourceObservation(ExecutorResourceState.Running, Now, Now.AddMinutes(-1), Guid.NewGuid()), token));
+        return Assert.IsType<ExecutorSnapshot>(await fixture.Store.ReadExecutorAsync(fixture.Profile, binding.AllocationId, token));
+    }
+
+    private static async Task<(CatalogProfile Catalog, JitHandoffIdentity Identity, string RunnerName, DynamoDbBootstrapOfferClient Bootstrap)> SeedHelloAsync(
+        MiniStackTable table, Fixture fixture, ExecutorBinding binding, JitRecipientKey recipient, CancellationToken token)
+    {
+        var catalog = Assert.IsType<CatalogProfile>(await fixture.Store.ReadCatalogProfileAsync(fixture.Profile, token));
+        var identity = new JitHandoffIdentity(fixture.Profile.Deployment, fixture.Profile.ProfileId, catalog.Binding.ScopeIdentity, 37,
+            Guid.Parse(binding.AllocationId), binding.ResourceArn, binding.Incarnation, BootstrapUser);
+        var bootstrap = new DynamoDbBootstrapOfferClient(table.Client, table.Name, BootstrapUser, binding.ResourceArn, fixture.Clock);
+        Assert.Equal(LifecycleWriteOutcome.Committed, await bootstrap.RegisterHelloAsync(recipient.Hello, token));
+        return (catalog, identity, "ss-" + JitOfferBinding.GetOfferId(identity)[..48], bootstrap);
+    }
+
+    private static async Task WriteAdmissionBalanceAsync(Fixture fixture, int held, CancellationToken token)
+    {
+        var key = LifecycleKey.Admission(fixture.Profile);
+        var current = await fixture.Store.ReadRecordAsync(key, token);
+        string payload = FormattableString.Invariant($$"""{"heldCount":{{held}}}""");
+        Assert.Equal(LifecycleWriteOutcome.Committed, await fixture.Store.WriteRecordsAsync(fixture.Lease.Fence, Guid.NewGuid(),
+            [new LifecycleRecordWrite(key, current?.Revision, payload)], token));
+    }
+
+    private static FixtureProvider TerminalProvider(FixtureClock clock, ExecutorBinding binding) =>
+        new(clock) { OnSend = envelope => Evidence(clock, envelope, binding, ExecutorResourceState.IrreversiblyTerminated) };
 
     private static ExecutorBinding Bind(EffectEnvelope launch)
     {

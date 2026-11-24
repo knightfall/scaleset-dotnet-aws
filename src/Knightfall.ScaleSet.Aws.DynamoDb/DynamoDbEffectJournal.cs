@@ -12,7 +12,8 @@ public sealed record EffectBeginOutcome(LifecycleWriteOutcome Outcome, EffectSen
 
 internal sealed record EffectDispatchGuard(
     CatalogProfile Catalog, EffectIndexHead Index, string AllocationId, long? AllocationRevision,
-    JitHandoffSnapshot? Handoff = null, JitHandoffSnapshot? Removal = null, Ec2LaunchLineageSnapshot? Ec2Lineage = null);
+    JitHandoffSnapshot? Handoff = null, JitHandoffSnapshot? Removal = null, Ec2LaunchLineageSnapshot? Ec2Lineage = null,
+    LifecycleRecordCondition? FargateStopAdmission = null);
 
 /// <summary>Evidence that an attempt was durably begun under its recorded lease epoch.</summary>
 /// <remarks>A caller must retain current ownership and respect the attempt deadline when sending.</remarks>
@@ -231,7 +232,7 @@ public sealed partial class DynamoDbEffectJournal
                     guard, attempt.Deadline, cancellationToken, replayLowerBound is null ? null : current).ConfigureAwait(false);
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested &&
-            entry.Envelope.Request is Ec2LaunchEffectRequest { OwnershipTags: not null })
+            entry.Envelope.Request is Ec2LaunchEffectRequest { OwnershipTags: not null } or FargateStopEffectRequest { Incarnation: not null })
         {
             // An exact committed Begin can be discarded because no authorization reached the caller.
             _ = await FinalizeInterruptedEffectAsync(lease, permission, leaseReserve).ConfigureAwait(false);

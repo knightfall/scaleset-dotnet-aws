@@ -152,8 +152,8 @@ public sealed class EffectJournalEntry
         return Settle(evidence);
     }
 
-    internal EffectJournalEntry? RearmAbandonedRunnerRemoval() =>
-        State == EffectState.Settled && Envelope.Request is GitHubRunnerRemoveEffectRequest &&
+    internal EffectJournalEntry? RearmAbandonedBeforeSend() =>
+        State == EffectState.Settled && Envelope.Request is GitHubRunnerRemoveEffectRequest or FargateStopEffectRequest { Incarnation: not null } &&
         Resolution is { Kind: EffectResolutionKind.AbandonedBeforeSend } evidence && ValidAbandonment(evidence)
             ? Plan(Envelope) : null;
 
@@ -265,7 +265,7 @@ public sealed class EffectJournalEntry
 
     internal static bool AllowsAbandonmentBeforeSend(EffectEnvelope envelope) =>
         envelope.ProviderReplayDeadline is null && envelope.Request is (GitHubJitGenerateEffectRequest or
-            GitHubRunnerRemoveEffectRequest or Ec2LaunchEffectRequest { OwnershipTags: not null });
+            GitHubRunnerRemoveEffectRequest or Ec2LaunchEffectRequest { OwnershipTags: not null } or FargateStopEffectRequest { Incarnation: not null });
 
     private bool ValidAbandonment(EffectEvidence evidence) =>
         MatchesEvidence(evidence) && evidence.EarliestObservedAt is null && !EarlierSendUncertain &&
