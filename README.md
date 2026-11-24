@@ -29,7 +29,7 @@ required in each target environment.
 
 [GitHub Releases](https://github.com/knightfall/scaleset-dotnet-aws/releases)
 is the distribution point for versioned Linux amd64 and arm64 controller OCI
-archives, image SBOMs and verification evidence. For a source build, use the
+archives, image SBOMs, advisory reports, and verification evidence. For a source build, use the
 [local image instructions](docs/controller-local.md#build-the-oci-archives).
 See [verify a release](docs/releases/VERIFYING.md) before importing an image
 and [publish a release](docs/releases/PUBLISHING.md) for the maintainer process.

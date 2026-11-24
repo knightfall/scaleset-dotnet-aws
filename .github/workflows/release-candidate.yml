@@ -36,11 +36,13 @@ jobs:
             runner: ubuntu-24.04-arm
     env:
       RID: ${{ matrix.rid }}
+      BUILD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
       DOTNET_CLI_TELEMETRY_OPTOUT: '1'
       TESTINGPLATFORM_TELEMETRY_OPTOUT: '1'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ env.BUILD_SHA }}
           persist-credentials: false
       - uses: actions/setup-dotnet@0f4a354dd5547a28c70b7853dbd95d5b67886e73 # v6.1.0
         with:
@@ -70,7 +72,7 @@ jobs:
       - name: Inventory the tested image
         uses: anchore/sbom-action@dfcb83b97731532d72be422cbc51ee64adb6fd56 # v0.24.4
         with:
-          image: docker:scaleset-aws-controller:git-${{ github.sha }}-${{ matrix.rid }}
+          image: docker:scaleset-aws-controller:git-${{ env.BUILD_SHA }}-${{ matrix.rid }}
           syft-version: v1.57.2
           format: spdx-json
           output-file: ${{ runner.temp }}/controller/scaleset-aws-controller-${{ matrix.rid }}.spdx.json
