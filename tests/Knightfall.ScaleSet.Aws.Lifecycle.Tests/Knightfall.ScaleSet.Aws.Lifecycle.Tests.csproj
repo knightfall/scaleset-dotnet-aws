@@ -1,0 +1,13 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <OutputType>Exe</OutputType>
+    <IsPackable>false</IsPackable>
+    <IsTestProject>true</IsTestProject>
+    <UseMicrosoftTestingPlatformRunner>true</UseMicrosoftTestingPlatformRunner>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../../src/Knightfall.ScaleSet.Aws.DynamoDb/Knightfall.ScaleSet.Aws.DynamoDb.csproj" />
+    <PackageReference Include="xunit.v3" />
+  </ItemGroup>
+</Project>

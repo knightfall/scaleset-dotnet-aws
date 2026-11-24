@@ -1,6 +1,10 @@
-.PHONY: check check-dotnet check-cdk
+.PHONY: check check-dotnet check-cdk check-lifecycle
+
+MINISTACK_PYTHON ?= python3
+LIFECYCLE_TESTS = tests/Knightfall.ScaleSet.Aws.Lifecycle.Tests/Knightfall.ScaleSet.Aws.Lifecycle.Tests.csproj
 
 check: check-dotnet check-cdk
+	$(MAKE) check-lifecycle
 
 check-dotnet:
 	dotnet restore Knightfall.ScaleSet.Aws.slnx --locked-mode
@@ -14,3 +18,8 @@ check-cdk:
 	npm --prefix cdk run typecheck
 	npm --prefix cdk test
 	npm --prefix cdk run synth
+
+check-lifecycle:
+	dotnet restore $(LIFECYCLE_TESTS) --locked-mode
+	dotnet build $(LIFECYCLE_TESTS) --configuration Release --no-restore
+	$(MINISTACK_PYTHON) tests/ministack/run.py dotnet test --project $(LIFECYCLE_TESTS) --configuration Release --no-build

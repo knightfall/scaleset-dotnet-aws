@@ -27,7 +27,9 @@ make check
 
 CI uses the same command to restore locked dependencies, build and test the .NET
 solution in Release, check CDK linting, formatting, and types, run the CDK tests,
-and synthesize the CDK baseline offline.
+and synthesize the CDK baseline offline. The lifecycle tests run against a pinned
+MiniStack process on loopback and require Python 3.11 or newer. To select a local
+interpreter, run `make check MINISTACK_PYTHON=python3.11`.
 
 ## Compile a configuration
 
