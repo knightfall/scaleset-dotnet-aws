@@ -28,7 +28,18 @@ internal enum SimulatorFault
 
 internal sealed record SimulatorRequest(string Method, string Host, string Path, string Protocol, string Cursor, string Capacity);
 
-internal sealed class GitHubSimulator(string groupName)
+internal sealed record GitHubSimulatorAddress(string[] ApiHosts, string ServiceHost, string QueueHost)
+{
+    internal static readonly GitHubSimulatorAddress Default = new(
+        [GitHubProtocolHost.PublicApi, GitHubProtocolHost.EnterpriseApi], GitHubProtocolHost.ServiceHost, GitHubProtocolHost.QueueHost);
+
+    internal IEnumerable<string> Hosts => ApiHosts.Append(ServiceHost).Append(QueueHost);
+
+    internal static GitHubSimulatorAddress ForProfile(string profileId) => new(
+        ["api." + profileId + ".ghe.com"], profileId + ".actions.example.test", profileId + ".queue.example.test");
+}
+
+internal sealed class GitHubSimulator(string groupName, GitHubSimulatorAddress? address = null)
 {
     internal const long GroupId = 203;
     internal const long SetId = 401;
@@ -56,6 +67,8 @@ internal sealed class GitHubSimulator(string groupName)
     private long _messageId;
     private long _nextRunner = 600;
     private int _lastCapacity;
+
+    internal GitHubSimulatorAddress Address { get; } = address ?? GitHubSimulatorAddress.Default;
 
     internal SimulatorRequest[] Requests => _requests.ToArray();
     internal Guid? SessionId { get { lock (_sync) { return _session?.Id; } } }
@@ -148,35 +161,38 @@ internal sealed class GitHubSimulator(string groupName)
         app.Use(async (context, next) =>
         {
             var request = context.Request;
-            _requests.Enqueue(new SimulatorRequest(request.Method, request.Host.Host, request.Path.Value ?? "",
-                request.Protocol, request.Query["lastMessageId"].ToString(), request.Headers["X-ScaleSetMaxCapacity"].ToString()));
+            if (Address.Hosts.Contains(request.Host.Host, StringComparer.OrdinalIgnoreCase))
+            {
+                _requests.Enqueue(new SimulatorRequest(request.Method, request.Host.Host, request.Path.Value ?? "",
+                    request.Protocol, request.Query["lastMessageId"].ToString(), request.Headers["X-ScaleSetMaxCapacity"].ToString()));
+            }
             await next(context).ConfigureAwait(false);
         });
         app.MapPost("/app/installations/{id:long}/access_tokens", (HttpContext context) =>
             Bearer(context).Split('.').Length == 3
                 ? Results.Json(new { token = AppAccessToken, expires_at = "2099-01-01T00:00:00Z" }, statusCode: 201)
-                : Results.Unauthorized()).RequireHost(GitHubProtocolHost.PublicApi, GitHubProtocolHost.EnterpriseApi);
+                : Results.Unauthorized()).RequireHost(Address.ApiHosts);
         app.MapPost("/orgs/{owner}/actions/runners/registration-token", RegistrationTokenResult)
-            .RequireHost(GitHubProtocolHost.PublicApi, GitHubProtocolHost.EnterpriseApi);
+            .RequireHost(Address.ApiHosts);
         app.MapPost("/repos/{owner}/{repo}/actions/runners/registration-token", RegistrationTokenResult)
-            .RequireHost(GitHubProtocolHost.PublicApi, GitHubProtocolHost.EnterpriseApi);
+            .RequireHost(Address.ApiHosts);
         app.MapPost("/enterprises/{enterprise}/actions/runners/registration-token", RegistrationTokenResult)
-            .RequireHost(GitHubProtocolHost.PublicApi, GitHubProtocolHost.EnterpriseApi);
+            .RequireHost(Address.ApiHosts);
         app.MapPost("/actions/runner-registration", (HttpContext context) =>
             context.Request.Headers.Authorization == "RemoteAuth " + RegistrationToken
-                ? Results.Json(new { url = $"https://{GitHubProtocolHost.ServiceHost}{ServiceBase}", token = AdminToken })
-                : Results.Unauthorized()).RequireHost(GitHubProtocolHost.PublicApi, GitHubProtocolHost.EnterpriseApi);
+                ? Results.Json(new { url = $"https://{Address.ServiceHost}{ServiceBase}", token = AdminToken })
+                : Results.Unauthorized()).RequireHost(Address.ApiHosts);
 
         app.MapGet(ServiceBase + "/_apis/runtime/runnergroups/", (HttpContext context) =>
             Admin(context, () => ResultList(new { id = GroupId, name = groupName },
-                context.Request.Query["groupName"].ToString() == groupName))).RequireHost(GitHubProtocolHost.ServiceHost);
+                context.Request.Query["groupName"].ToString() == groupName))).RequireHost(Address.ServiceHost);
         app.MapGet(Sets, (HttpContext context) => Admin(context, () =>
             ResultList(_scaleSet, _scaleSet is not null &&
                 (context.Request.Query["name"].Count == 0 || context.Request.Query["name"] == _scaleSet.Name))))
-            .RequireHost(GitHubProtocolHost.ServiceHost);
+            .RequireHost(Address.ServiceHost);
         app.MapGet(Sets + "/{id:long}", (long id, HttpContext context) => Admin(context, () =>
             _scaleSet is { } existing && existing.Id == id ? Results.Json(existing) : Results.NotFound()))
-            .RequireHost(GitHubProtocolHost.ServiceHost);
+            .RequireHost(Address.ServiceHost);
         app.MapPost(Sets, (JsonElement input, HttpContext context) => Admin(context, () => Execute(SimulatorOperation.CreateScaleSet, () =>
         {
             if (_scaleSet is not null)
@@ -186,17 +202,17 @@ internal sealed class GitHubSimulator(string groupName)
             _scaleSet = new SimulatedScaleSet(SetId, input.GetProperty("name").GetString()!,
                 input.GetProperty("runnerGroupId").GetInt64(), input.GetProperty("labels").Clone());
             return Results.Json(_scaleSet);
-        }))).RequireHost(GitHubProtocolHost.ServiceHost);
+        }))).RequireHost(Address.ServiceHost);
 
         app.MapPost(Sessions, (HttpContext context) => Admin(context, () => Execute(SimulatorOperation.OpenSession, OpenSession)))
-            .RequireHost(GitHubProtocolHost.ServiceHost);
+            .RequireHost(Address.ServiceHost);
         app.MapDelete(Sessions + "/{id:guid}", (Guid id, HttpContext context) => Admin(context,
-            () => Execute(SimulatorOperation.CloseSession, () => CloseSession(id)))).RequireHost(GitHubProtocolHost.ServiceHost);
+            () => Execute(SimulatorOperation.CloseSession, () => CloseSession(id)))).RequireHost(Address.ServiceHost);
         app.MapGet("/messages/{id:guid}", (Guid id, HttpContext context) => Queue(context, id,
-            () => Execute(SimulatorOperation.Poll, () => Poll(context)))).RequireHost(GitHubProtocolHost.QueueHost);
+            () => Execute(SimulatorOperation.Poll, () => Poll(context)))).RequireHost(Address.QueueHost);
         app.MapDelete("/messages/{id:guid}/{messageId:long}", (Guid id, long messageId, HttpContext context) =>
             Queue(context, id, () => Execute(SimulatorOperation.Acknowledge, () =>
-                _queue.Remove(messageId) ? Results.NoContent() : Results.NotFound()))).RequireHost(GitHubProtocolHost.QueueHost);
+                _queue.Remove(messageId) ? Results.NoContent() : Results.NotFound()))).RequireHost(Address.QueueHost);
         app.MapPost(FormattableString.Invariant($"{Sets}/{SetId}/acquirejobs"), (long[] ids, HttpContext context) =>
         {
             lock (_sync)
@@ -208,7 +224,7 @@ internal sealed class GitHubSimulator(string groupName)
                 long[] granted = _lastCapacity == 0 ? [] : ids.Where(id => _available.Contains(id) && _acquired.Add(id)).ToArray();
                 return Results.Json(new { count = granted.Length, value = granted });
             }
-        }).RequireHost(GitHubProtocolHost.ServiceHost);
+        }).RequireHost(Address.ServiceHost);
 
         app.MapPost(FormattableString.Invariant($"{Sets}/{SetId}/generatejitconfig"), (JsonElement input, HttpContext context) =>
             Admin(context, () => Execute(SimulatorOperation.GenerateJit, () =>
@@ -216,18 +232,18 @@ internal sealed class GitHubSimulator(string groupName)
                 var runner = new SimulatedRunner(_nextRunner++, SetId, input.GetProperty("name").GetString()!, Assigned: false);
                 _runners.Add(runner.Id, runner);
                 return Results.Json(new { runner = RunnerPayload(runner), encodedJITConfig = Jit });
-            }))).RequireHost(GitHubProtocolHost.ServiceHost);
+            }))).RequireHost(Address.ServiceHost);
         app.MapGet(Runners, (HttpContext context) => Admin(context, () =>
         {
             string name = context.Request.Query["agentName"].ToString();
             var runner = _runners.Values.SingleOrDefault(value => value.Name == name);
             return runner is null ? Results.Json(new { count = 0, value = Array.Empty<object>() }) : ResultList(RunnerPayload(runner), true);
-        })).RequireHost(GitHubProtocolHost.ServiceHost);
+        })).RequireHost(Address.ServiceHost);
         app.MapGet(Runners + "/{id:long}", (long id, HttpContext context) => Admin(context, () =>
             _runners.TryGetValue(id, out var runner) ? Results.Json(RunnerPayload(runner)) : AgentError(404, "AgentNotFoundException")))
-            .RequireHost(GitHubProtocolHost.ServiceHost);
+            .RequireHost(Address.ServiceHost);
         app.MapDelete(Runners + "/{id:long}", (long id, HttpContext context) => Admin(context,
-            () => Execute(SimulatorOperation.RemoveRunner, () => RemoveRunner(id)))).RequireHost(GitHubProtocolHost.ServiceHost);
+            () => Execute(SimulatorOperation.RemoveRunner, () => RemoveRunner(id)))).RequireHost(Address.ServiceHost);
     }
 
     private IResult Admin(HttpContext context, Func<IResult> result)
@@ -267,7 +283,7 @@ internal sealed class GitHubSimulator(string groupName)
         {
             sessionId = id,
             ownerName = "fixture-owner",
-            messageQueueUrl = $"https://{GitHubProtocolHost.QueueHost}/messages/{id:D}?signature=fixture-queue-signature",
+            messageQueueUrl = $"https://{Address.QueueHost}/messages/{id:D}?signature=fixture-queue-signature",
             messageQueueAccessToken = token,
             statistics = new { totalAssignedJobs = TotalAssignedJobs },
         });

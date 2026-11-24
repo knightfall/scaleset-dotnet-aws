@@ -20,7 +20,6 @@ internal sealed class GitHubProtocolHost : IAsyncDisposable
     internal const string EnterpriseApi = "api.example.ghe.com";
     internal const string ServiceHost = "actions.example.test";
     internal const string QueueHost = "queue.example.test";
-    private static readonly string[] Hosts = [PublicApi, EnterpriseApi, ServiceHost, QueueHost];
 
     private readonly WebApplication _app;
     private readonly X509Certificate2 _certificate;
@@ -37,10 +36,13 @@ internal sealed class GitHubProtocolHost : IAsyncDisposable
 
     internal string Fingerprint => _certificate.GetCertHashString(HashAlgorithmName.SHA256);
 
-    internal static async Task<GitHubProtocolHost> StartAsync(GitHubSimulator simulator, CancellationToken cancellationToken,
+    internal static Task<GitHubProtocolHost> StartAsync(GitHubSimulator simulator, CancellationToken cancellationToken,
+        Func<HttpContext, Task>? beforeRequest = null) => StartAsync([simulator], cancellationToken, beforeRequest);
+
+    internal static async Task<GitHubProtocolHost> StartAsync(IReadOnlyList<GitHubSimulator> simulators, CancellationToken cancellationToken,
         Func<HttpContext, Task>? beforeRequest = null)
     {
-        var certificate = CreateCertificate();
+        var certificate = CreateCertificate(simulators.SelectMany(simulator => simulator.Address.Hosts));
         var builder = WebApplication.CreateSlimBuilder();
         builder.Logging.ClearProviders();
         builder.WebHost.ConfigureKestrel(server =>
@@ -67,7 +69,10 @@ internal sealed class GitHubProtocolHost : IAsyncDisposable
                     }
                 });
             }
-            simulator.Map(app);
+            foreach (var simulator in simulators)
+            {
+                simulator.Map(app);
+            }
             await app.StartAsync(cancellationToken).ConfigureAwait(false);
             return new GitHubProtocolHost(app, certificate);
         }
@@ -81,8 +86,9 @@ internal sealed class GitHubProtocolHost : IAsyncDisposable
 
     internal HttpClient CreateClient() => CreateClient(Port, Fingerprint);
 
-    internal static HttpClient CreateClient(int port, string fingerprint)
+    internal static HttpClient CreateClient(int port, string fingerprint, IEnumerable<string>? allowedHosts = null)
     {
+        var hosts = (allowedHosts ?? GitHubSimulatorAddress.Default.Hosts).ToHashSet(StringComparer.OrdinalIgnoreCase);
         return new HttpClient(new RequireHttp2(new SocketsHttpHandler
         {
             UseProxy = false,
@@ -93,7 +99,7 @@ internal sealed class GitHubProtocolHost : IAsyncDisposable
                     cert is not null && cert.GetCertHashString(HashAlgorithmName.SHA256) == fingerprint &&
                     errors is SslPolicyErrors.None or SslPolicyErrors.RemoteCertificateChainErrors,
             },
-            ConnectCallback = (context, token) => ConnectAsync(context, port, token),
+            ConnectCallback = (context, token) => ConnectAsync(context, port, hosts, token),
         }))
         {
             Timeout = TimeSpan.FromSeconds(10),
@@ -106,9 +112,10 @@ internal sealed class GitHubProtocolHost : IAsyncDisposable
         _certificate.Dispose();
     }
 
-    private static async ValueTask<Stream> ConnectAsync(SocketsHttpConnectionContext context, int port, CancellationToken cancellationToken)
+    private static async ValueTask<Stream> ConnectAsync(SocketsHttpConnectionContext context, int port,
+        HashSet<string> hosts, CancellationToken cancellationToken)
     {
-        if (context.DnsEndPoint.Port != 443 || !Hosts.Contains(context.DnsEndPoint.Host, StringComparer.OrdinalIgnoreCase) ||
+        if (context.DnsEndPoint.Port != 443 || !hosts.Contains(context.DnsEndPoint.Host) ||
             context.InitialRequestMessage.RequestUri?.Scheme != Uri.UriSchemeHttps)
         {
             throw new HttpRequestException("The simulator transport accepts only its pinned HTTPS hosts.");
@@ -126,12 +133,12 @@ internal sealed class GitHubProtocolHost : IAsyncDisposable
         }
     }
 
-    private static X509Certificate2 CreateCertificate()
+    private static X509Certificate2 CreateCertificate(IEnumerable<string> hosts)
     {
         using var key = RSA.Create(2048);
         var request = new CertificateRequest("CN=Scale Set Test Simulator", key, HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1);
         var names = new SubjectAlternativeNameBuilder();
-        foreach (string host in Hosts)
+        foreach (string host in hosts)
         {
             names.AddDnsName(host);
         }

@@ -49,7 +49,8 @@ internal static class MixedOtlpAssertions
     /// <summary>Checks captured AWS and released SDK telemetry. Select the current process for coverage assertions after replacement.</summary>
     internal static IReadOnlyCollection<string> AssertPayloads(
         IReadOnlyList<OtlpCapture> captures, IReadOnlyDictionary<string, string> expectedProfiles,
-        IEnumerable<string> forbiddenValues, string? currentInstanceId = null, bool requireLogs = false)
+        IEnumerable<string> forbiddenValues, IReadOnlyDictionary<string, string> expectedResource,
+        string? currentInstanceId = null, bool requireLogs = false)
     {
         Assert.NotEmpty(expectedProfiles);
         string[] forbidden = forbiddenValues.Where(value => !string.IsNullOrEmpty(value)).Distinct(StringComparer.Ordinal).ToArray();
@@ -77,6 +78,10 @@ internal static class MixedOtlpAssertions
                 Assert.Equal(identity, attributes.OrderBy(attribute => attribute.Key, StringComparer.Ordinal));
                 Assert.Equal("knightfall.scaleset.aws", attributes["service.namespace"]);
                 Assert.Equal("aws", attributes["cloud.provider"]);
+                foreach (var (key, value) in expectedResource)
+                {
+                    Assert.Equal(value, attributes[key]);
+                }
                 Assert.All(attributes.Values, value => Assert.False(string.IsNullOrWhiteSpace(value)));
                 Assert.All(attributes.Values, value => AssertSafeText(value, forbidden));
             }
