@@ -490,10 +490,12 @@
         "type": "Project",
         "dependencies": {
           "AWSSDK.Core": "[4.1.1.2, 4.1.1.2]",
+          "AWSSDK.DynamoDBv2": "[4.1.0.3, 4.1.0.3]",
           "AWSSDK.ECS": "[4.1.1.1, 4.1.1.1]",
           "AWSSDK.IdentityManagement": "[4.1.3, 4.1.3]",
           "AWSSDK.S3": "[4.1.2, 4.1.2]",
           "AWSSDK.SQS": "[4.1.0.2, 4.1.0.2]",
+          "AWSSDK.SecurityToken": "[4.1.1.1, 4.1.1.1]",
           "Knightfall.ScaleSet.Aws.Core": "[1.0.0, )",
           "Knightfall.ScaleSet.Aws.DynamoDb": "[1.0.0, )",
           "Knightfall.ScaleSet.Aws.GitHub": "[1.0.0, )",
@@ -593,6 +595,15 @@
         "contentHash": "UJUSKF7V70OAGBnmYQhWndBblpTgk8mCgKuMHKbOMxAsbf1WFbMcuoQFtky7BLQ0D4zhtLkv0AKFciyUQUVHbA==",
         "dependencies": {
           "AWSSDK.Core": "[4.1.1.1, 5.0.0)"
+        }
+      },
+      "AWSSDK.SecurityToken": {
+        "type": "CentralTransitive",
+        "requested": "[4.1.1.1, 4.1.1.1]",
+        "resolved": "4.1.1.1",
+        "contentHash": "kPtMCvLbVqG/vwsdXwNlwVTkxNcfIBh9MnXacfv8rrdZaZrbLCxRqdGCdGY2Ccc08ySqkwThMLHKu6jUyA88OA==",
+        "dependencies": {
+          "AWSSDK.Core": "[4.1.1.2, 5.0.0)"
         }
       },
       "AWSSDK.SQS": {

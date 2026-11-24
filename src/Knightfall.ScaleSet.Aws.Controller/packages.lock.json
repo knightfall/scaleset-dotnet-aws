@@ -12,6 +12,15 @@
           "System.IO.Hashing": "11.0.0"
         }
       },
+      "AWSSDK.DynamoDBv2": {
+        "type": "Direct",
+        "requested": "[4.1.0.3, 4.1.0.3]",
+        "resolved": "4.1.0.3",
+        "contentHash": "E/HlGsFqZnGVbQ4mNDqc9tBehKZXJXFM76uYLkPpvbA0NTn41BSTJ10zrfYE4VjB4ujTmFqrGIjEvYLmZLf44Q==",
+        "dependencies": {
+          "AWSSDK.Core": "[4.1.1.2, 5.0.0)"
+        }
+      },
       "AWSSDK.ECS": {
         "type": "Direct",
         "requested": "[4.1.1.1, 4.1.1.1]",
@@ -37,6 +46,15 @@
         "contentHash": "vGRpeXIxK7uRRHzVIrp2dYDri4wwlerUutG8TG7jHMolb3hX6Zu6VVDZpmwB8AlTIZ9BKLIV+V4Oi4xEsamZsQ==",
         "dependencies": {
           "AWSSDK.Core": "[4.1.1.1, 5.0.0)"
+        }
+      },
+      "AWSSDK.SecurityToken": {
+        "type": "Direct",
+        "requested": "[4.1.1.1, 4.1.1.1]",
+        "resolved": "4.1.1.1",
+        "contentHash": "kPtMCvLbVqG/vwsdXwNlwVTkxNcfIBh9MnXacfv8rrdZaZrbLCxRqdGCdGY2Ccc08ySqkwThMLHKu6jUyA88OA==",
+        "dependencies": {
+          "AWSSDK.Core": "[4.1.1.2, 5.0.0)"
         }
       },
       "AWSSDK.SQS": {
@@ -547,15 +565,6 @@
       },
       "knightfall.scaleset.aws.handoff": {
         "type": "Project"
-      },
-      "AWSSDK.DynamoDBv2": {
-        "type": "CentralTransitive",
-        "requested": "[4.1.0.3, 4.1.0.3]",
-        "resolved": "4.1.0.3",
-        "contentHash": "E/HlGsFqZnGVbQ4mNDqc9tBehKZXJXFM76uYLkPpvbA0NTn41BSTJ10zrfYE4VjB4ujTmFqrGIjEvYLmZLf44Q==",
-        "dependencies": {
-          "AWSSDK.Core": "[4.1.1.2, 5.0.0)"
-        }
       },
       "AWSSDK.SecretsManager": {
         "type": "CentralTransitive",

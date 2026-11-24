@@ -35,9 +35,44 @@ public sealed class ControllerLifecycleTests
         using var table = await MiniStackTable.CreateAsync(cancellation);
         var clock = new FixtureClock();
         var store = new DynamoDbLifecycleStore(table.Client, table.Name, clock);
-        var configuration = await ConfigurationAsync(draining: true, cancellation);
+        var document = await ConfigurationDocumentAsync(draining: true, cancellation);
+        document["spec"]!["tracking"]!["table"] = new JsonObject { ["type"] = "import", ["name"] = table.Name };
+        var profiles = Assert.IsType<JsonArray>(document["spec"]!["profiles"]);
+        var retained = profiles[0]!.DeepClone();
+        retained["id"] = "retained-linux";
+        retained["state"] = "active";
+        retained["github"]!["scaleSet"] = "retained-linux";
+        retained["github"]!["labels"] = new JsonArray("retained-linux");
+        profiles.Add(retained);
+        var configuration = RuntimeConfigurationLoader.Load(JsonSerializer.SerializeToUtf8Bytes(document));
+        var candidateDocument = document.DeepClone();
+        candidateDocument["spec"]!["profiles"]![0]!["state"] = "disabled";
+        var candidate = RuntimeConfigurationLoader.Load(JsonSerializer.SerializeToUtf8Bytes(candidateDocument));
+        Assert.Equal(RetirementPreflightStatus.CatalogUnavailable,
+            (await store.VerifyRetirementAsync(configuration, 1, candidate, 2, cancellation)).Status);
         var first = await AcquireAsync(store, configuration, clock, MiniStackTable.FirstTask, cancellation);
         await ApplyCatalogAsync(store, first, configuration, cancellation);
+        var premature = await store.VerifyRetirementAsync(configuration, 1, candidate, 2, cancellation);
+        Assert.Equal(RetirementPreflightStatus.RetirementRequired, premature.Status);
+        Assert.Equal([ProfileId], premature.Profiles);
+        Assert.Equal(RetirementPreflightStatus.Verified,
+            (await store.VerifyRetirementAsync(configuration, 1, configuration, 2, cancellation)).Status);
+
+        var clusterChange = document.DeepClone();
+        clusterChange["spec"]!["ecsClusters"]!["replacement"] = new JsonObject { ["type"] = "create", ["name"] = "replacement-cluster" };
+        clusterChange["spec"]!["profiles"]![1]!["provisioner"]!["cluster"] = "replacement";
+        var changedCluster = RuntimeConfigurationLoader.Load(JsonSerializer.SerializeToUtf8Bytes(clusterChange));
+        var blockedCluster = await store.VerifyRetirementAsync(configuration, 1, changedCluster, 2, cancellation);
+        Assert.Equal(RetirementPreflightStatus.RetirementRequired, blockedCluster.Status);
+        Assert.Equal(["retained-linux"], blockedCluster.Profiles);
+
+        var roleChange = document.DeepClone();
+        var changedProvisioner = roleChange["spec"]!["profiles"]![1]!["provisioner"]!;
+        changedProvisioner["bootstrapRoleArn"] = changedProvisioner["bootstrapRoleArn"]!.GetValue<string>() + "-replacement";
+        var changedRole = RuntimeConfigurationLoader.Load(JsonSerializer.SerializeToUtf8Bytes(roleChange));
+        var blockedRole = await store.VerifyRetirementAsync(configuration, 1, changedRole, 2, cancellation);
+        Assert.Equal(RetirementPreflightStatus.RetirementRequired, blockedRole.Status);
+        Assert.Equal(["retained-linux"], blockedRole.Profiles);
         var profile = new LifecycleProfile(first.Deployment, ProfileId);
         var catalog = Assert.IsType<CatalogProfile>(await store.ReadCatalogProfileAsync(profile, cancellation));
         Assert.Equal(CatalogProfileState.Draining, catalog.State);
@@ -121,7 +156,7 @@ public sealed class ControllerLifecycleTests
         });
         using var http = new HttpClient(wire, disposeHandler: false);
         var remote = await ConnectAsync(configuration, clock, http, cancellation);
-        var routing = Assert.Single(configuration.Profiles).GitHub;
+        var routing = Assert.Single(configuration.Profiles, item => item.Id == ProfileId).GitHub;
         var laneInput = new GitHubListenerProfile(configuration, ProfileId, new GitHubScaleSetBinding(Scope, routing.RunnerGroup,
             42, routing.ScaleSet, 84, routing.Labels), remote, closingOwner.Fence,
             _ => Task.FromResult<GitHubRegistrationLease?>(new GitHubRegistrationLease(closingOwner, 1, ClockProof(clock))),
@@ -164,6 +199,28 @@ public sealed class ControllerLifecycleTests
         Assert.NotNull(await checkpoint.ReadAsync(checkpoint.SessionKey, cancellation));
         Assert.Equal(ProfileRetirementStatus.Retired,
             (await coordinator.AdvanceAsync(profile, Authority(closer, clock), cancellation)).Status);
+
+        table.Wire.Clear();
+        var verified = await store.VerifyRetirementAsync(configuration, 1, candidate, 2, cancellation);
+        Assert.Equal(RetirementPreflightStatus.Verified, verified.Status);
+        Assert.Empty(verified.Profiles);
+        Assert.NotEmpty(table.Wire.Requests);
+        Assert.All(table.Wire.Requests, request =>
+        {
+            Assert.True(request.Operation is "GetItem" or "Query");
+            Assert.True(request.Request.GetProperty("ConsistentRead").GetBoolean());
+        });
+        Assert.Equal(RetirementPreflightStatus.CatalogUnavailable,
+            (await store.VerifyRetirementAsync(configuration, 2, candidate, 3, cancellation)).Status);
+        Assert.Equal(RetirementPreflightStatus.BindingMismatch,
+            (await store.VerifyRetirementAsync(configuration, 1, candidate, 1, cancellation)).Status);
+
+        var dryRunDocument = document.DeepClone();
+        dryRunDocument["spec"]!["mode"] = "dry-run";
+        var dryRun = RuntimeConfigurationLoader.Load(JsonSerializer.SerializeToUtf8Bytes(dryRunDocument));
+        var retainedGrants = await store.VerifyRetirementAsync(configuration, 1, dryRun, 2, cancellation);
+        Assert.Equal(RetirementPreflightStatus.RetirementRequired, retainedGrants.Status);
+        Assert.Equal(["retained-linux"], retainedGrants.Profiles);
     }
 
     [Fact]
@@ -292,7 +349,11 @@ public sealed class ControllerLifecycleTests
         return Assert.IsType<ControllerLease>(activated.Lease);
     }
 
-    internal static async Task<RuntimeConfiguration> ConfigurationAsync(bool draining, CancellationToken cancellationToken)
+    internal static async Task<RuntimeConfiguration> ConfigurationAsync(bool draining, CancellationToken cancellationToken) =>
+        RuntimeConfigurationLoader.Load(JsonSerializer.SerializeToUtf8Bytes(
+            await ConfigurationDocumentAsync(draining, cancellationToken)));
+
+    private static async Task<JsonNode> ConfigurationDocumentAsync(bool draining, CancellationToken cancellationToken)
     {
         var image = await File.ReadAllTextAsync(Path.Combine(AppContext.BaseDirectory, "fargate-only.json"), cancellationToken);
         var document = JsonNode.Parse(image)!;
@@ -303,7 +364,7 @@ public sealed class ControllerLifecycleTests
         {
             document["spec"]!["profiles"]![0]!["state"] = "draining";
         }
-        return RuntimeConfigurationLoader.Load(JsonSerializer.SerializeToUtf8Bytes(document));
+        return document;
     }
 
     internal static async Task<GitHubScaleSetConnection> ConnectAsync(RuntimeConfiguration configuration, TimeProvider clock, HttpClient http,
