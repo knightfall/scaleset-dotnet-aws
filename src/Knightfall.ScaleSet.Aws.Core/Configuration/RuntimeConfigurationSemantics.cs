@@ -137,7 +137,10 @@ internal static partial class RuntimeConfigurationSemantics
 
     internal static (string Scope, string Group, string ScaleSet) GitHubBinding(
         string scopeUrl, string runnerGroup, string scaleSet, string scopePath) =>
-        (ParseGitHubScope(scopeUrl, scopePath).Identity, Fold(runnerGroup), Fold(scaleSet));
+        (GitHubScopeIdentity(scopeUrl, scopePath), Fold(runnerGroup), Fold(scaleSet));
+
+    internal static string GitHubScopeIdentity(string scopeUrl, string scopePath) =>
+        ParseGitHubScope(scopeUrl, scopePath).Identity;
 
     private static long? ValidatePinnedScaleSet(JsonElement routing, string path)
     {
@@ -414,7 +417,7 @@ internal static partial class RuntimeConfigurationSemantics
         return mappings.ToFrozenDictionary();
     }
 
-    private static string Fold(string value)
+    internal static string Fold(string value)
     {
         var result = new StringBuilder(value.Length);
         foreach (Rune rune in value.EnumerateRunes())

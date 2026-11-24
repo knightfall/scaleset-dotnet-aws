@@ -16,7 +16,22 @@ public interface IControllerTaskFenceObserver
 public sealed record ControllerClockEvidence(
     DateTimeOffset ObservedAt,
     DateTimeOffset ValidUntil,
-    TimeSpan MaximumAbsoluteSkew);
+    TimeSpan MaximumAbsoluteSkew)
+{
+    public bool TryGetUpperBound(DateTimeOffset now, DateTimeOffset writeDeadline, TimeSpan reserve, out DateTimeOffset upperBound)
+    {
+        upperBound = default;
+        TimeSpan remaining = writeDeadline - now;
+        if (ObservedAt > now || ValidUntil <= now || MaximumAbsoluteSkew < TimeSpan.Zero || reserve < TimeSpan.Zero ||
+            remaining <= reserve || MaximumAbsoluteSkew >= remaining - reserve)
+        {
+            return false;
+        }
+
+        upperBound = now + MaximumAbsoluteSkew;
+        return ValidUntil > upperBound;
+    }
+}
 
 /// <summary>Independently verified isolation from both external mutation surfaces for one exact task.</summary>
 public sealed record VerifiedControllerIsolation(

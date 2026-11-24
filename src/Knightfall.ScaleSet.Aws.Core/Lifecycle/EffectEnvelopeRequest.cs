@@ -2,6 +2,7 @@ using System.Collections.Immutable;
 using System.Globalization;
 using System.Text.Json.Serialization;
 using System.Text.RegularExpressions;
+using Knightfall.ScaleSet.Aws.Core.Configuration;
 
 namespace Knightfall.ScaleSet.Aws.Core.Lifecycle;
 
@@ -11,6 +12,7 @@ namespace Knightfall.ScaleSet.Aws.Core.Lifecycle;
 [JsonDerivedType(typeof(Ec2TerminateEffectRequest), "ec2-terminate")]
 [JsonDerivedType(typeof(FargateStopEffectRequest), "fargate-stop")]
 [JsonDerivedType(typeof(GitHubSessionRetireEffectRequest), "github-session-retire")]
+[JsonDerivedType(typeof(GitHubScaleSetCreateEffectRequest), "github-scale-set-create")]
 public abstract record EffectEnvelopeRequest
 {
     private protected EffectEnvelopeRequest()
@@ -182,6 +184,46 @@ public sealed record GitHubSessionRetireEffectRequest(string ScopeUrl, long Scal
         {
             throw new ArgumentException("The GitHub scope must identify the exact target.", nameof(ScopeUrl));
         }
+        return this;
+    }
+}
+
+public sealed record GitHubScaleSetCreateEffectRequest(
+    string ScopeUrl,
+    string RunnerGroupName,
+    long RunnerGroupId,
+    string ScaleSetName,
+    ImmutableArray<string> Labels) : EffectEnvelopeRequest
+{
+    [JsonIgnore]
+    public override EffectTargetBinding Target => new(
+        GitHubRoutingIdentity.Scope(ScopeUrl, nameof(ScopeUrl)),
+        RunnerGroupId.ToString(CultureInfo.InvariantCulture) + "/" + GitHubRoutingIdentity.Name(ScaleSetName, nameof(ScaleSetName)));
+
+    internal override EffectEnvelopeRequest Normalize()
+    {
+        _ = GitHubRoutingIdentity.Scope(ScopeUrl, nameof(ScopeUrl));
+        ArgumentOutOfRangeException.ThrowIfNegative(RunnerGroupId);
+        _ = GitHubRoutingIdentity.Name(RunnerGroupName, nameof(RunnerGroupName));
+        string scaleSet = GitHubRoutingIdentity.Name(ScaleSetName, nameof(ScaleSetName));
+        if (Labels.IsDefaultOrEmpty)
+        {
+            throw new ArgumentException("The scale-set request requires managed labels.", nameof(Labels));
+        }
+
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        foreach (string label in Labels)
+        {
+            if (!seen.Add(GitHubRoutingIdentity.Name(label, nameof(Labels))))
+            {
+                throw new ArgumentException("Managed scale-set labels must be distinct.", nameof(Labels));
+            }
+        }
+        if (!seen.Contains(scaleSet))
+        {
+            throw new ArgumentException("The managed labels must include the scale-set name.", nameof(Labels));
+        }
+
         return this;
     }
 }

@@ -284,15 +284,7 @@ public sealed class ControllerLeaseRecoveryCoordinator
         ControllerLease lease, ControllerClockEvidence? evidence, DateTimeOffset now, out DateTimeOffset latestNow)
     {
         latestNow = default;
-        TimeSpan remaining = lease.ValidUntil - now;
-        if (evidence is null || evidence.ObservedAt > now || evidence.ValidUntil <= now ||
-            evidence.MaximumAbsoluteSkew < TimeSpan.Zero ||
-            remaining <= _writeMargin || evidence.MaximumAbsoluteSkew >= remaining - _writeMargin)
-        {
-            return false;
-        }
-        latestNow = now + evidence.MaximumAbsoluteSkew;
-        return evidence.ValidUntil > latestNow;
+        return evidence is not null && evidence.TryGetUpperBound(now, lease.ValidUntil, _writeMargin, out latestNow);
     }
 
     private static bool StillIsolated(

@@ -10,16 +10,38 @@ public sealed record EffectBeginOutcome(LifecycleWriteOutcome Outcome, EffectSen
 /// <remarks>A caller must retain current ownership and respect the attempt deadline when sending.</remarks>
 public sealed class EffectSendAuthorization
 {
-    internal EffectSendAuthorization(EffectEnvelope envelope, EffectAttempt attempt, long revision)
+    private readonly TimeProvider _clock;
+    private readonly long _beganAt;
+    private readonly DateTimeOffset _upperUtcNow;
+    private int _consumed;
+
+    internal EffectSendAuthorization(
+        EffectEnvelope envelope,
+        EffectAttempt attempt,
+        long revision,
+        TimeProvider clock,
+        long beganAt,
+        DateTimeOffset upperUtcNow)
     {
         Envelope = envelope;
         Attempt = attempt;
         Revision = revision;
+        _clock = clock;
+        _beganAt = beganAt;
+        _upperUtcNow = upperUtcNow;
     }
 
     public EffectEnvelope Envelope { get; }
     public EffectAttempt Attempt { get; }
     public long Revision { get; }
+
+    public bool TryConsume(out TimeSpan remaining)
+    {
+        var estimate = _upperUtcNow + _clock.GetElapsedTime(_beganAt);
+        var local = _clock.GetUtcNow();
+        remaining = Attempt.Deadline - (estimate > local ? estimate : local);
+        return Interlocked.CompareExchange(ref _consumed, 1, 0) == 0 && remaining > TimeSpan.Zero;
+    }
 }
 
 public sealed class DynamoDbEffectJournal
@@ -89,7 +111,8 @@ public sealed class DynamoDbEffectJournal
         // A write can commit at the end of the window. The durable attempt remains unresolved.
         var permission = outcome == LifecycleWriteOutcome.Committed && !cancellationToken.IsCancellationRequested &&
             UpperNow(upperUtcNow, beganAt) < attempt.Deadline
-            ? new EffectSendAuthorization(entry.Envelope, attempt, checked(current.Revision + 1))
+            ? new EffectSendAuthorization(entry.Envelope, attempt, checked(current.Revision + 1),
+                _timeProvider, beganAt, upperUtcNow)
             : null;
         return new EffectBeginOutcome(outcome, permission);
     }
