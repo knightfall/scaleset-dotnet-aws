@@ -255,6 +255,11 @@ public sealed class ExecutorLifecycleTests
         Assert.Equal(10, capacity.Maximum);
         Assert.Equal(2, capacity.OutsideAssigned);
         Assert.Empty(session.Acquisitions);
+        var demand = Assert.IsType<SessionDemandObservation>(await store.ReadCurrentSessionDemandAsync(profile, table.Lease, token));
+        Assert.Equal(owned.Identity.SessionId, demand.SessionId);
+        Assert.Equal(8, demand.TotalAssignedJobs);
+        var successor = table.Lease with { Epoch = table.Lease.Epoch + 1, OwnerId = "successor" };
+        Assert.Null(await store.ReadCurrentSessionDemandAsync(profile, successor, token));
 
         var newer = new RunnerScaleSetMessage { MessageId = 1, Statistics = delivery.Statistics };
         Assert.Equal(ScaleSetListenerDeliveryDisposition.Completed, await handler.HandleAsync(Delivery(owned, clock.Now, newer), token));

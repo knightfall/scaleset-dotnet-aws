@@ -227,7 +227,7 @@ public sealed partial class DynamoDbLifecycleStore
     public async Task<ListenerCapacity> ReadListenerCapacityAsync(
         LifecycleProfile profile, int maximum, TimeSpan freshness, TimeSpan logFlushGrace, CancellationToken cancellationToken)
     {
-        var (demandRecord, demand) = await ReadDemandEnvelopeAsync(profile, cancellationToken).ConfigureAwait(false);
+        var (demandRecord, demand, _) = await ReadDemandEnvelopeAsync(profile, cancellationToken).ConfigureAwait(false);
         var inventory = await ReadExecutorInventoryAsync(profile, cancellationToken).ConfigureAwait(false);
         var capacity = ExecutorClassifier.ProjectListenerCapacity(
             inventory, demand, maximum, _timeProvider.GetUtcNow(), freshness, logFlushGrace);
@@ -241,20 +241,22 @@ public sealed partial class DynamoDbLifecycleStore
         };
     }
 
-    /// <summary>Returns the demand observation only while its exact session is active.</summary>
-    public async Task<SessionDemandObservation?> ReadCurrentSessionDemandAsync(LifecycleProfile profile, CancellationToken cancellationToken)
+    /// <summary>Returns demand from an active session under the supplied owner fence.</summary>
+    public async Task<SessionDemandObservation?> ReadCurrentSessionDemandAsync(
+        LifecycleProfile profile, DeploymentLeaseFence lease, CancellationToken cancellationToken)
     {
-        var (_, demand) = await ReadDemandEnvelopeAsync(profile, cancellationToken).ConfigureAwait(false);
-        return demand;
+        RequireProfileLease(profile, lease);
+        var (_, demand, owner) = await ReadDemandEnvelopeAsync(profile, cancellationToken).ConfigureAwait(false);
+        return owner == lease ? demand : null;
     }
 
-    private async Task<(LifecycleRecord? Record, SessionDemandObservation? Demand)> ReadDemandEnvelopeAsync(
+    private async Task<(LifecycleRecord? Record, SessionDemandObservation? Demand, DeploymentLeaseFence? Owner)> ReadDemandEnvelopeAsync(
         LifecycleProfile profile, CancellationToken cancellationToken)
     {
         var record = await ReadRecordAsync(LifecycleKey.Demand(profile), cancellationToken).ConfigureAwait(false);
         var demand = record is null ? null : ParseExecutorRecord<SessionDemandObservation>(record);
         var session = await ReadSessionAsync(profile, cancellationToken).ConfigureAwait(false);
-        return (record, session?.Phase == SessionPhase.Active && session.SessionId == demand?.SessionId ? demand : null);
+        return (record, session is { Phase: SessionPhase.Active } && session.SessionId == demand?.SessionId ? demand : null, session?.Owner);
     }
 
     private async Task<LifecycleWriteOutcome> UpdateExecutorAsync(

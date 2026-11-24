@@ -77,11 +77,15 @@ internal sealed class ControllerProfileReconciler(
         {
             binding = await Session.EnsureRegisteredAsync(cancellationToken).ConfigureAwait(false);
         }
-        var demand = await store.ReadCurrentSessionDemandAsync(Key, cancellationToken).ConfigureAwait(false);
+        var demand = await store.ReadCurrentSessionDemandAsync(Key, current.Lease.Fence, cancellationToken).ConfigureAwait(false);
         var plan = CapacityPlanner.Plan(profile, demand is null ? null : new DemandSample(demand.ObservedAt, demand.TotalAssignedJobs), sample, clock);
         var effectIndex = await store.ReadEffectIndexAsync(Key, cancellationToken).ConfigureAwait(false);
-        bool exactIndex = effectIndex is { State: EffectIndexState.Ready } && effectIndex.OwnerEpoch == current.Lease.Epoch;
-        bool ready = IsReady(catalog.State, binding, plan, exactIndex, complete);
+        bool exactIndex = effectIndex is { State: EffectIndexState.Ready } && effectIndex.OwnerEpoch == current.Lease.Epoch &&
+            effectIndex.WriterProtocol == current.Lease.WriterProtocol;
+        bool listenerAvailable = Session.ListenerResult is not { Status: GitHubListenerLaneStatus.RecoveryRequired or
+            GitHubListenerLaneStatus.Failed or GitHubListenerLaneStatus.OwnershipUnavailable or GitHubListenerLaneStatus.StorageUnavailable or
+            GitHubListenerLaneStatus.Stopped };
+        bool ready = IsReady(catalog.State, binding, plan, exactIndex, complete, listenerAvailable);
         var now = clock.GetUtcNow();
         telemetry.SetOwnership(current.Lease, current.Clock, timing.WriteReserve);
         telemetry.SetListenerCooldown(current.Lease.Fence, Key.ProfileId, Session.ReadCredentialCooldown());
@@ -256,8 +260,9 @@ internal sealed class ControllerProfileReconciler(
         _handoffCursor = pending.Continuation;
     }
 
-    private static bool IsReady(CatalogProfileState state, GitHubScaleSetBinding? binding, CapacityPlan plan, bool exactIndex, bool complete) =>
-        complete && exactIndex && (state == CatalogProfileState.ClosureHeld || (binding is not null &&
+    private static bool IsReady(CatalogProfileState state, GitHubScaleSetBinding? binding, CapacityPlan plan,
+        bool exactIndex, bool complete, bool listenerAvailable) =>
+        complete && exactIndex && (state == CatalogProfileState.ClosureHeld || (binding is not null && listenerAvailable &&
             (state == CatalogProfileState.Draining || (plan.DemandStatus == ObservationStatus.Fresh &&
                 plan.InventoryStatus == ObservationStatus.Fresh && plan.BackendLaunchHeadroom.HasValue))));
 
