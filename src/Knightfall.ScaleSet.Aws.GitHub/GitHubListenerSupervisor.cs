@@ -50,6 +50,12 @@ public sealed class GitHubListenerSupervisor
 
     public GitHubListenerSupervisor(
         DynamoDbLifecycleStore store, TimeProvider clock, GitHubListenerTiming timing, GitHubCredentialRotator? rotation = null)
+        : this(store, clock, timing, rotation, cooldown: null)
+    {
+    }
+
+    public GitHubListenerSupervisor(DynamoDbLifecycleStore store, TimeProvider clock, GitHubListenerTiming timing,
+        GitHubCredentialRotator? rotation, GitHubCredentialCooldown? cooldown)
     {
         ArgumentNullException.ThrowIfNull(store);
         ArgumentNullException.ThrowIfNull(clock);
@@ -62,7 +68,7 @@ public sealed class GitHubListenerSupervisor
         _clock = clock;
         _timing = timing;
         _rotation = rotation;
-        _cooldown = new GitHubCredentialCooldown(clock, timing.UnauthorizedCooldown);
+        _cooldown = cooldown ?? new GitHubCredentialCooldown(clock, timing.UnauthorizedCooldown);
     }
 
     public GitHubListenerLane Register(GitHubListenerProfile definition)
