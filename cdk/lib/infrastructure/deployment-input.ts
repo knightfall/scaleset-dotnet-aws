@@ -1,5 +1,11 @@
 import { parseArgs } from "node:util";
 import type { RunnerControllerRuntime } from "../config/types.ts";
+import type { ControllerTelemetrySettings } from "./controller-telemetry.ts";
+
+export interface ControllerDeploymentEnvironment {
+  readonly fargatePreflight?: string;
+  readonly telemetry?: ControllerTelemetrySettings;
+}
 
 const maximumGeneration = 9223372036854775807n;
 
@@ -20,6 +26,7 @@ export function deploymentArguments(argv: string[]) {
     options: {
       config: { type: "string" },
       generation: { type: "string" },
+      telemetry: { type: "string" },
     },
   });
   if (!values.config || !values.generation) {
@@ -28,7 +35,11 @@ export function deploymentArguments(argv: string[]) {
     );
   }
   generationValue(values.generation);
-  return { config: values.config, generation: values.generation };
+  return {
+    config: values.config,
+    generation: values.generation,
+    telemetry: values.telemetry,
+  };
 }
 
 export function trackingTableName(runtime: RunnerControllerRuntime): string {

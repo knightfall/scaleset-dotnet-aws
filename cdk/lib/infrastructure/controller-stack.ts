@@ -20,14 +20,15 @@ import {
   controllerHealthAddress,
   createControllerService,
 } from "./controller-service.ts";
+import { resolveControllerTelemetry } from "./controller-telemetry.ts";
 import {
   controllerStackName,
   deploymentIdentity,
   generationValue,
   trackingTableName,
 } from "./deployment-input.ts";
+import type { ControllerDeploymentEnvironment } from "./deployment-input.ts";
 import { validateFargatePreflight } from "./fargate-preflight.ts";
-import type { ControllerDeploymentEnvironment } from "./fargate-preflight.ts";
 import {
   bootstrapPolicy,
   ec2Profiles,
@@ -69,6 +70,7 @@ export class ControllerInfrastructure extends Stack {
       runtime,
       props.fargatePreflight,
     );
+    const telemetry = resolveControllerTelemetry(props.telemetry, spec.aws);
 
     const active = spec.mode === "active";
     const inspect = !active && spec.dryRun.inspectAws;
@@ -180,6 +182,7 @@ export class ControllerInfrastructure extends Stack {
       taskRole: this.controllerRole,
       command: this.runtimeArguments,
       fargatePreflight,
+      telemetry,
     });
     new CfnOutput(this, "DeploymentIdentity", {
       value: deploymentIdentity(runtime),
@@ -362,6 +365,7 @@ export function synthesizeController(
       generation,
       artifactPath,
       fargatePreflight: environment.fargatePreflight,
+      telemetry: environment.telemetry,
     });
     return app.synth().getStackArtifact(stack.artifactId);
   } finally {

@@ -1,16 +1,21 @@
 import { spawnSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { compileConfig } from "../lib/config/compiler.ts";
+import { readControllerTelemetry } from "../lib/infrastructure/controller-telemetry.ts";
 import { deployController } from "../lib/infrastructure/deploy-controller.ts";
 import { deploymentArguments } from "../lib/infrastructure/deployment-input.ts";
 import { fargatePreflightEnvironmentName } from "../lib/infrastructure/fargate-preflight.ts";
 
 try {
-  const { config, generation } = deploymentArguments(process.argv.slice(2));
+  const { config, generation, telemetry } = deploymentArguments(
+    process.argv.slice(2),
+  );
+  const compiled = compileConfig(readFileSync(config, "utf8"));
   const env = Object.fromEntries(
     Object.entries(process.env).filter(
       ([name]) =>
         !name.startsWith("AWS_ENDPOINT_URL") &&
+        !name.startsWith("OTEL_") &&
         name !== fargatePreflightEnvironmentName,
     ),
   );
@@ -18,9 +23,10 @@ try {
   env.AWS_CLI_AUTO_PROMPT = "off";
   deployController(
     {
-      compiled: compileConfig(readFileSync(config, "utf8")),
+      compiled,
       generation,
       fargatePreflight: process.env[fargatePreflightEnvironmentName],
+      telemetry: readControllerTelemetry(telemetry, compiled.runtime.spec.aws),
     },
     (program, args) => {
       const result = spawnSync(program, args, {
