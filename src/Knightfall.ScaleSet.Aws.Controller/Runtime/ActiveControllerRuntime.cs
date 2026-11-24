@@ -105,7 +105,7 @@ internal static class ActiveControllerRuntime
         }).ToArray();
         var queuePump = context.EventQueues is { Ec2: not null } or { Ecs: not null }
             ? new ControllerQueuePump(configuration, clients.Queue(), store, ec2Effects, fargateInspector, clock) : null;
-        await RunOwnedAsync(context, metadata, observation.TaskArn, owner, store, shutdown, profiles, queuePump,
+        await RunOwnedAsync(context, metadata, observation.TaskArn, owner, store, dispatcher, shutdown, profiles, queuePump,
             metrics, clock).ConfigureAwait(false);
     }
 
@@ -155,8 +155,8 @@ internal static class ActiveControllerRuntime
     }
 
     private static async Task RunOwnedAsync(ControllerRunContext context, EcsControllerMetadata metadata, string taskArn,
-        ControllerLeaseOwnership owner, DynamoDbLifecycleStore store, ControllerShutdownCoordinator shutdown,
-        ControllerProfileReconciler[] profiles, ControllerQueuePump? queuePump, ProfileTelemetry metrics, TimeProvider clock)
+        ControllerLeaseOwnership owner, DynamoDbLifecycleStore store, DynamoDbEffectDispatcher dispatcher,
+        ControllerShutdownCoordinator shutdown, ControllerProfileReconciler[] profiles, ControllerQueuePump? queuePump, ProfileTelemetry metrics, TimeProvider clock)
     {
         if (owner.ReadAuthority() is not { } initial)
         {
@@ -171,7 +171,7 @@ internal static class ActiveControllerRuntime
             health.Pulse();
             return proof;
         }, heartbeatsStop.Token);
-        var workers = RunProfilesAsync(context, owner, store, profiles, queuePump, metrics, health, clock, workStop.Token);
+        var workers = RunProfilesAsync(context, owner, store, dispatcher, profiles, queuePump, metrics, health, clock, workStop.Token);
         using var stopSignal = CancellationTokenSource.CreateLinkedTokenSource(context.Stopping, owner.OwnershipLost);
         var quitting = Task.Delay(Timeout.InfiniteTimeSpan, stopSignal.Token);
         try
@@ -221,10 +221,11 @@ internal static class ActiveControllerRuntime
     }
 
     private static async Task RunProfilesAsync(ControllerRunContext context, ControllerLeaseOwnership owner, DynamoDbLifecycleStore store,
-        ControllerProfileReconciler[] profiles, ControllerQueuePump? queuePump, ProfileTelemetry metrics, ActiveHealth health, TimeProvider clock,
+        DynamoDbEffectDispatcher dispatcher, ControllerProfileReconciler[] profiles, ControllerQueuePump? queuePump, ProfileTelemetry metrics, ActiveHealth health, TimeProvider clock,
         CancellationToken cancellationToken)
     {
-        if (!await ApplyConfigurationAsync(context, owner, store, clock, cancellationToken).ConfigureAwait(false))
+        var keys = profiles.Select(profile => profile.Key).ToArray();
+        if (!await PrepareConfigurationAsync(context, owner, store, dispatcher, keys, clock, cancellationToken).ConfigureAwait(false))
         {
             return;
         }
@@ -264,8 +265,9 @@ internal static class ActiveControllerRuntime
         }
     }
 
-    private static async Task<bool> ApplyConfigurationAsync(ControllerRunContext context, ControllerLeaseOwnership owner,
-        DynamoDbLifecycleStore store, TimeProvider clock, CancellationToken cancellationToken)
+    private static async Task<bool> PrepareConfigurationAsync(ControllerRunContext context, ControllerLeaseOwnership owner,
+        DynamoDbLifecycleStore store, DynamoDbEffectDispatcher dispatcher, LifecycleProfile[] keys, TimeProvider clock,
+        CancellationToken cancellationToken)
     {
         while (owner.ReadAuthority() is { } current && !cancellationToken.IsCancellationRequested)
         {
@@ -276,7 +278,12 @@ internal static class ActiveControllerRuntime
                 switch (applied.Status)
                 {
                     case CatalogRolloutStatus.Applied:
-                        return true;
+                        // The replacement session requires a clear effect index. An inherited unstarted launch has no current demand.
+                        if (await dispatcher.CancelInheritedLaunchesAsync(owner, keys, cancellationToken).ConfigureAwait(false))
+                        {
+                            return true;
+                        }
+                        break;
                     case CatalogRolloutStatus.Staging:
                         continue;
                     case CatalogRolloutStatus.StaleGeneration:
