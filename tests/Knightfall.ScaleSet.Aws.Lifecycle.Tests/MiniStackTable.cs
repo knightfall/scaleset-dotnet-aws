@@ -1,0 +1,284 @@
+using System.Collections.Concurrent;
+using System.Net;
+using System.Net.Sockets;
+using System.Text;
+using System.Text.Json;
+using Amazon.DynamoDBv2;
+using Amazon.DynamoDBv2.Model;
+using Amazon.Runtime;
+using Knightfall.ScaleSet.Aws.Core.Lifecycle;
+using Knightfall.ScaleSet.Aws.DynamoDb;
+
+namespace Knightfall.ScaleSet.Aws.Lifecycle.Tests;
+
+internal sealed class MiniStackTable : IDisposable
+{
+    internal static readonly DateTimeOffset Now = new(2050, 1, 2, 3, 4, 5, TimeSpan.Zero);
+
+    internal readonly AmazonDynamoDBClient Client;
+    internal readonly MiniStackWire Wire = new();
+    internal readonly string Name = "lifecycle-" + Guid.NewGuid().ToString("N");
+    internal readonly DeploymentLeaseFence Lease = new("test", "controller-1", 1, 1);
+
+    private MiniStackTable()
+    {
+        var endpoint = Environment.GetEnvironmentVariable("SCALESET_MINISTACK_ENDPOINT");
+        if (!Uri.TryCreate(endpoint, UriKind.Absolute, out var uri) || uri.Scheme != Uri.UriSchemeHttp ||
+            uri.Host != "127.0.0.1" || uri.IsDefaultPort || uri.AbsolutePath != "/" || uri.Query.Length != 0)
+        {
+            throw new InvalidOperationException("Use make check-lifecycle to provide a loopback MiniStack endpoint.");
+        }
+
+        Client = new AmazonDynamoDBClient(new BasicAWSCredentials("000000000000", "test-only-secret"),
+            new AmazonDynamoDBConfig
+            {
+                ServiceURL = uri.AbsoluteUri,
+                AuthenticationRegion = "us-east-1",
+                Timeout = TimeSpan.FromSeconds(15),
+                MaxErrorRetry = 0,
+                MaxStaleConnectionRetries = 0,
+                DisableClockSkewCorrection = true,
+                HttpClientFactory = new MiniStackClientFactory(Wire),
+            });
+    }
+
+    internal DynamoDbLifecycleStore CreateStore(DateTimeOffset? now = null) => new(Client, Name, new FixtureClock(now ?? Now));
+
+    internal LifecycleProfile Profile(string name) => new(Lease.Deployment, name);
+
+    internal static async Task<MiniStackTable> CreateAsync(CancellationToken cancellationToken)
+    {
+        var table = new MiniStackTable();
+        try
+        {
+            await table.Client.CreateTableAsync(new CreateTableRequest
+            {
+                TableName = table.Name,
+                BillingMode = BillingMode.PAY_PER_REQUEST,
+                KeySchema = [new("PK", KeyType.HASH), new("SK", KeyType.RANGE)],
+                AttributeDefinitions =
+                [
+                    new("PK", ScalarAttributeType.S),
+                    new("SK", ScalarAttributeType.S),
+                    new("dueShard", ScalarAttributeType.S),
+                    new("dueAtMillis", ScalarAttributeType.N),
+                ],
+                GlobalSecondaryIndexes =
+                [
+                    new()
+                    {
+                        IndexName = "due",
+                        KeySchema = [new("dueShard", KeyType.HASH), new("dueAtMillis", KeyType.RANGE)],
+                        Projection = new Projection { ProjectionType = ProjectionType.KEYS_ONLY },
+                    },
+                ],
+            }, cancellationToken);
+
+            await table.SetLeaseAsync(table.Lease, Now.AddHours(1), cancellationToken);
+            table.Wire.Clear();
+            return table;
+        }
+        catch
+        {
+            table.Dispose();
+            throw;
+        }
+    }
+
+    internal async Task SetLeaseAsync(DeploymentLeaseFence fence, DateTimeOffset validUntil, CancellationToken cancellationToken)
+    {
+        var leaseItem = Key(LifecycleKey.Lease(fence.Deployment));
+        leaseItem["ownerId"] = new AttributeValue(fence.OwnerId);
+        leaseItem["epoch"] = new AttributeValue { N = FormattableString.Invariant($"{fence.Epoch}") };
+        leaseItem["writerProtocol"] = new AttributeValue { N = FormattableString.Invariant($"{fence.WriterProtocol}") };
+        leaseItem["validUntil"] = new AttributeValue { N = FormattableString.Invariant($"{validUntil.ToUnixTimeMilliseconds()}") };
+        await Client.PutItemAsync(Name, leaseItem, cancellationToken);
+    }
+
+    internal async Task<Dictionary<string, AttributeValue>> ReadAsync(LifecycleKey key, CancellationToken cancellationToken)
+    {
+        var response = await Client.GetItemAsync(new GetItemRequest
+        {
+            TableName = Name,
+            Key = Key(key),
+            ConsistentRead = true,
+        }, cancellationToken);
+        return response.Item ?? [];
+    }
+
+    internal async Task SeedEffectsAsync(
+        LifecycleProfile profile, int count, IReadOnlySet<int> unfinished, CancellationToken cancellationToken)
+    {
+        string transition = Guid.NewGuid().ToString("D");
+        var rows = Enumerable.Range(0, count).Select(index =>
+        {
+            var item = Key(LifecycleKey.Operation(profile, RetainedIntent(index)));
+            item["deployment"] = new AttributeValue(profile.Deployment);
+            item["revision"] = new AttributeValue { N = "1" };
+            item["transitionId"] = new AttributeValue(transition);
+            item["effectState"] = new AttributeValue(unfinished.Contains(index) ? "uncertain" : "settled");
+            item["payload"] = new AttributeValue("{}");
+            return new WriteRequest { PutRequest = new PutRequest { Item = item } };
+        });
+
+        foreach (var batch in rows.Chunk(25))
+        {
+            Dictionary<string, List<WriteRequest>> pending = new(StringComparer.Ordinal) { [Name] = [.. batch] };
+            for (int attempt = 0; pending.Count != 0; attempt++)
+            {
+                if (attempt == 3)
+                {
+                    throw new InvalidOperationException("MiniStack did not complete the local seed batch.");
+                }
+                var response = await Client.BatchWriteItemAsync(new BatchWriteItemRequest { RequestItems = pending }, cancellationToken);
+                pending = response.UnprocessedItems ?? [];
+            }
+        }
+    }
+
+    internal static string RetainedIntent(int index) => FormattableString.Invariant($"retained-{index:D5}");
+
+    internal static Dictionary<string, AttributeValue> Key(LifecycleKey key) => new(StringComparer.Ordinal)
+    {
+        ["PK"] = new AttributeValue(key.PartitionKey),
+        ["SK"] = new AttributeValue(key.SortKey),
+    };
+
+    public void Dispose()
+    {
+        Client.Dispose();
+        Wire.Dispose();
+    }
+
+    private sealed class FixtureClock(DateTimeOffset now) : TimeProvider
+    {
+        public override DateTimeOffset GetUtcNow() => now;
+    }
+
+    private sealed class MiniStackClientFactory(MiniStackWire wire) : HttpClientFactory
+    {
+        public override HttpClient CreateHttpClient(IClientConfig clientConfig) => new(wire, disposeHandler: false);
+
+        public override bool UseSDKHttpClientCaching(IClientConfig clientConfig) => false;
+
+        public override bool DisposeHttpClientsAfterUse(IClientConfig clientConfig) => true;
+    }
+}
+
+internal sealed record MiniStackCall(string Operation, JsonElement Request)
+{
+    internal bool IsDueQuery => Operation == "Query" &&
+        Request.TryGetProperty("IndexName", out var index) && index.GetString() == "due";
+
+    internal string? QueryPrefix => Operation == "Query" && Request.GetProperty("ExpressionAttributeValues")
+        .TryGetProperty(":prefix", out var prefix)
+            ? prefix.GetProperty("S").GetString()
+            : null;
+}
+
+internal sealed class MiniStackWire : DelegatingHandler
+{
+    private readonly ConcurrentQueue<MiniStackCall> _requests = new();
+    private int _dropSuccessfulTransaction;
+    private TransactionBarrier? _transactionBarrier;
+    private PausedRead? _pausedRead;
+
+    internal IReadOnlyList<MiniStackCall> Requests => _requests.ToArray();
+
+    internal string? DueQueryResponse { get; set; }
+
+    internal MiniStackWire()
+        : base(new SocketsHttpHandler { UseProxy = false, AllowAutoRedirect = false })
+    {
+    }
+
+    internal void Clear() => _requests.Clear();
+
+    internal void DropNextSuccessfulTransactionResponse() => Interlocked.Exchange(ref _dropSuccessfulTransaction, 1);
+
+    internal void HoldNextTwoTransactions() => _transactionBarrier = new TransactionBarrier();
+
+    internal PausedRead PauseNextRead(LifecycleKey key)
+    {
+        var pause = new PausedRead(key);
+        _pausedRead = pause;
+        return pause;
+    }
+
+    protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+    {
+        if (request.RequestUri is not { Scheme: "http", Host: "127.0.0.1" })
+        {
+            throw new InvalidOperationException("The fixture only permits loopback requests.");
+        }
+        var target = request.Headers.GetValues("X-Amz-Target").Single();
+        string operation = target[(target.LastIndexOf('.') + 1)..];
+        using var document = JsonDocument.Parse(await request.Content!.ReadAsStringAsync(cancellationToken));
+        var call = new MiniStackCall(operation, document.RootElement.Clone());
+        _requests.Enqueue(call);
+
+        if (operation == "TransactWriteItems" && _transactionBarrier is { } barrier)
+        {
+            await barrier.WaitAsync(cancellationToken);
+        }
+        var actual = await base.SendAsync(request, cancellationToken);
+        if (operation == "GetItem" && _pausedRead is { } pause &&
+            pause.Matches(call.Request.GetProperty("Key")) &&
+            Interlocked.CompareExchange(ref _pausedRead, null, pause) == pause)
+        {
+            await pause.AwaitResumeAsync(cancellationToken);
+        }
+        if (operation == "TransactWriteItems" && actual.IsSuccessStatusCode &&
+            Interlocked.Exchange(ref _dropSuccessfulTransaction, 0) == 1)
+        {
+            actual.Dispose();
+            throw new HttpRequestException("Lost response after MiniStack committed the transaction.",
+                new SocketException((int)SocketError.ConnectionReset));
+        }
+
+        if (call.IsDueQuery && actual.IsSuccessStatusCode && DueQueryResponse is { } body)
+        {
+            actual.Dispose();
+            return new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                Content = new StringContent(body, Encoding.UTF8, "application/x-amz-json-1.0"),
+            };
+        }
+        return actual;
+    }
+
+    internal sealed class PausedRead(LifecycleKey key)
+    {
+        private readonly TaskCompletionSource _captured = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private readonly TaskCompletionSource _resume = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        internal Task Captured => _captured.Task;
+
+        internal bool Matches(JsonElement item) =>
+            item.GetProperty("PK").GetProperty("S").GetString() == key.PartitionKey &&
+            item.GetProperty("SK").GetProperty("S").GetString() == key.SortKey;
+
+        internal async Task AwaitResumeAsync(CancellationToken cancellationToken)
+        {
+            _captured.TrySetResult();
+            await _resume.Task.WaitAsync(TimeSpan.FromSeconds(10), cancellationToken);
+        }
+
+        internal void Resume() => _resume.TrySetResult();
+    }
+
+    private sealed class TransactionBarrier
+    {
+        private readonly TaskCompletionSource _release = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private int _arrivals;
+
+        internal Task WaitAsync(CancellationToken cancellationToken)
+        {
+            if (Interlocked.Increment(ref _arrivals) == 2)
+            {
+                _release.SetResult();
+            }
+            return _release.Task.WaitAsync(TimeSpan.FromSeconds(10), cancellationToken);
+        }
+    }
+}
