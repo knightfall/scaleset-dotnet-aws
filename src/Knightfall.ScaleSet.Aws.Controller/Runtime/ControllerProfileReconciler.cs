@@ -85,14 +85,13 @@ internal sealed class ControllerProfileReconciler(
         var now = clock.GetUtcNow();
         telemetry.SetOwnership(current.Lease, current.Clock, timing.WriteReserve);
         telemetry.SetListenerCooldown(current.Lease.Fence, Key.ProfileId, Session.ReadCredentialCooldown());
+        var oldestCleanup = complete ? ReadOldestEligibleCleanup(snapshot, now) : null;
         telemetry.Observe(current.Lease.Fence, Key.ProfileId, new ProfileTelemetryObservation(plan, now,
             now + timing.ObservationFreshness, demand?.ObservedAt, sample.ObservedAt, cloud.DriftCount,
-            exactIndex ? effectIndex!.UnfinishedCount : null, null, ready));
+            exactIndex ? effectIndex!.UnfinishedCount : null, oldestCleanup, ready));
 
-        if (binding is not null && await Session.GetConnectionAsync(cancellationToken).ConfigureAwait(false) is { } connection)
-        {
-            await AdvanceExecutorsAsync(catalog, current, observed.Exact, connection, cancellationToken).ConfigureAwait(false);
-        }
+        var connection = binding is null ? null : await Session.GetConnectionAsync(cancellationToken).ConfigureAwait(false);
+        await AdvanceExecutorsAsync(catalog, current, observed.Exact, connection, cancellationToken).ConfigureAwait(false);
         if (ownership.ReadAuthority() is not { } latest)
         {
             diagnostics?.Complete("deferred", "ownership_unavailable");
@@ -117,6 +116,26 @@ internal sealed class ControllerProfileReconciler(
         }
         diagnostics?.Complete(ready ? "success" : "deferred", ready ? "profile_current" : "profile_evidence_unavailable");
         return ready;
+    }
+
+    private DateTimeOffset? ReadOldestEligibleCleanup(ExecutorInventorySnapshot snapshot, DateTimeOffset now)
+    {
+        DateTimeOffset? oldest = null;
+        foreach (var executor in snapshot.Executors)
+        {
+            var state = executor.State;
+            if (state.Process is { State: ExecutorProcessState.Exited } process && state.Job is { Phase: ExecutorJobPhase.Completed } job &&
+                ExecutorClassifier.Classify(state, now, timing.ObservationFreshness, timing.LogFlushGrace).CompletedCleanupCandidate)
+            {
+                var logDeadline = process.ObservedAt + timing.LogFlushGrace;
+                var eligibleAt = logDeadline > job.ObservedAt ? logDeadline : job.ObservedAt;
+                if (oldest is null || eligibleAt < oldest)
+                {
+                    oldest = eligibleAt;
+                }
+            }
+        }
+        return oldest;
     }
 
     private InventorySample ProjectInventory(ExecutorInventorySnapshot snapshot, RunnerBackendInventory cloud, int unowned, bool complete)
@@ -189,7 +208,7 @@ internal sealed class ControllerProfileReconciler(
     }
 
     private async Task AdvanceExecutorsAsync(CatalogProfile catalog, ActiveControllerAuthority authority,
-        Dictionary<string, RunnerBackendResource> exact, GitHubScaleSetConnection connection, CancellationToken cancellationToken)
+        Dictionary<string, RunnerBackendResource> exact, GitHubScaleSetConnection? connection, CancellationToken cancellationToken)
     {
         foreach (var (allocation, resource) in exact)
         {
@@ -200,8 +219,9 @@ internal sealed class ControllerProfileReconciler(
                 continue;
             }
             await backend.CleanupAsync(current, catalog, executor, ownership.OwnershipLost, cancellationToken).ConfigureAwait(false);
-            if (executor.State.Resource is { State: ExecutorResourceState.Starting or ExecutorResourceState.Running } observed &&
-                executor.State.AdmissionClosure is null && resource.BootstrapCredentialArn is { } principal)
+            if (connection is not null && executor.State.Resource is { State: ExecutorResourceState.Starting or ExecutorResourceState.Running } observed &&
+                executor.State.Job is not { Phase: ExecutorJobPhase.Completed } && executor.State.AdmissionClosure is null &&
+                resource.BootstrapCredentialArn is { } principal)
             {
                 var result = await jit.AdvanceAsync(configuration, ownership, new BootstrapProviderObservation(executor.Binding,
                     principal, observed.ObservedAt), connection, cancellationToken).ConfigureAwait(false);
@@ -213,6 +233,10 @@ internal sealed class ControllerProfileReconciler(
             }
         }
 
+        if (connection is null)
+        {
+            return;
+        }
         // Terminal executors leave the active index. Retained handoff rows can still require an exact GitHub removal after restart.
         var pending = await store.ReadOutstandingJitHandoffPageAsync(Key, _handoffCursor, cancellationToken).ConfigureAwait(false);
         foreach (var remaining in pending.Handoffs)

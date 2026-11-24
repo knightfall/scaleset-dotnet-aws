@@ -119,10 +119,12 @@ internal sealed class Ec2RunnerBackend(
         CancellationToken ownershipLost, CancellationToken cancellationToken)
     {
         var binding = executor.Binding;
+        bool terminal = executor.State is { HasConflict: false, Resource.State: ExecutorResourceState.IrreversiblyTerminated };
         if (catalog.Profile != key || catalog.State is not (CatalogProfileState.Active or CatalogProfileState.Draining) ||
             authority.Lease.Mode != ControllerLeaseMode.Active || ownershipLost.IsCancellationRequested ||
             binding.Profile != key || binding.Provider is not Ec2ExecutorIdentity identity || identity.LaunchTemplateId != _provisioner.LaunchTemplateId ||
-            !ExecutorClassifier.Classify(executor.State, clock.GetUtcNow(), timing.ObservationFreshness, timing.LogFlushGrace).CompletedCleanupCandidate)
+            (!terminal && !ExecutorClassifier.Classify(executor.State, clock.GetUtcNow(), timing.ObservationFreshness,
+                timing.LogFlushGrace).CompletedCleanupCandidate))
         {
             return;
         }
@@ -139,6 +141,16 @@ internal sealed class Ec2RunnerBackend(
             identity.InstanceLaunchTime, identity.LaunchTemplateId, identity.LaunchTemplateVersion);
         string intentId = EffectIntentIdentity.ForAllocation(request)!;
         var existing = await journal.ReadAsync(key, intentId, token).ConfigureAwait(false);
+        if (terminal)
+        {
+            if (existing is { Entry.State: EffectState.Planned } && existing.Entry.Envelope.Request == request)
+            {
+                var planned = existing.Entry.Envelope;
+                var evidence = new EffectEvidence(EffectResolutionKind.CanceledBeforeSend, planned.Sha256, planned.Target, clock.GetUtcNow());
+                _ = await journal.ResolveAsync(authority.Lease, existing, Guid.NewGuid(), evidence, token).ConfigureAwait(false);
+            }
+            return;
+        }
         if (existing is null)
         {
             var envelope = EffectEnvelope.Create(key, intentId, catalog.AppliedGeneration, request, clock.GetUtcNow(), null);
