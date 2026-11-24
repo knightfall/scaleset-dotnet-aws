@@ -9,9 +9,11 @@
     <ProjectReference Include="../Knightfall.ScaleSet.Aws.GitHub/Knightfall.ScaleSet.Aws.GitHub.csproj" />
     <ProjectReference Include="../Knightfall.ScaleSet.Aws.Handoff/Knightfall.ScaleSet.Aws.Handoff.csproj" />
     <PackageReference Include="AWSSDK.Core" />
+    <PackageReference Include="AWSSDK.DynamoDBv2" />
     <PackageReference Include="AWSSDK.ECS" />
     <PackageReference Include="AWSSDK.IdentityManagement" />
     <PackageReference Include="AWSSDK.S3" />
+    <PackageReference Include="AWSSDK.SecurityToken" />
     <PackageReference Include="AWSSDK.SQS" />
     <PackageReference Include="Microsoft.Extensions.Hosting" />
     <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" />

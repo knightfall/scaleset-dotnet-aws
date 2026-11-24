@@ -14,12 +14,28 @@ Build the standalone TypeScript AWS CDK v2 entry point (`cdk/bin/controller.ts`)
   - `create`: provision encrypted retained DynamoDB table `<metadata.name>-runner-lifecycle` (`PK`/`SK`, `due` `KEYS_ONLY` GSI on `dueShard`/`dueAtMillis`, `expiresAt` TTL, PITR enabled). `import`: reference existing table without mutation.
   - Upload deterministic runtime JSON from [T03](M1-foundation-config-planner.md#t03-define-v1alpha1-schemas-and-typescript-config-compiler) as a versioned S3 asset; pass exact S3 URI, object version ID, SHA-256 digest, and monotonic `--generation` to the controller launch command.
 - **Conditional runner resources & IAM separation**:
-  - Only when `active`/`draining` `ec2` profiles exist: EventBridge `EC2 Instance State-change Notification` rules -> SQS + DLQ, scoped `ec2:RunInstances`/`TerminateInstances`/`CreateTags` + `iam:PassRole` on selected Launch Templates/subnets/bootstrap roles, and `dynamodb:LeadingKeys` bootstrap policy (`HELLO#`, `OFFER#`, and proven `STATUS#`).
+  - Only when `active`/`draining` `ec2` profiles exist: EventBridge `EC2 Instance State-change Notification` rules scoped to the deployment account and Region -> SQS + DLQ, scoped `ec2:RunInstances`/`TerminateInstances`/`CreateTags` + `iam:PassRole` on selected Launch Templates/subnets/bootstrap roles, and `dynamodb:LeadingKeys` bootstrap policy (`HELLO#`, `OFFER#`, and proven `STATUS#`).
   - Only when `active`/`draining` `fargate` profiles exist: EventBridge `ECS Task State Change` rules -> SQS + DLQ, scoped `ecs:RunTask`/`StopTask`/`TagResource` + `iam:PassRole` (`iam:PassedToService: ecs-tasks.amazonaws.com`), and `dynamodb:LeadingKeys` bootstrap policy (`HELLO#`, `OFFER#` only).
   - Deduplicate `ecsClusters` `create` entries if controller host and Fargate runners share a cluster. Never grant runner `ecs:RunTask`/`StopTask` when only controller hosting uses ECS.
   - In `dry-run` mode: omit GitHub `secretsmanager:GetSecretValue`, DynamoDB mutations, SQS receive/delete, and all EC2/ECS runner launch/stop/`PassRole` permissions.
 - **Runtime retirement preflight gate**:
   - Require `preflight retire` verification against the DynamoDB table's catalog/generation/tombstones (verified against MiniStack / AWS Emulator DynamoDB in `T25` and targeting the deployment table at deploy time) before a CDK deployment removes IAM grants or EventBridge rules for a removed/disabled profile; reject fixture/context-flag bypasses.
+
+### Deployment command
+
+Use the AWS CLI v2 and the repository's Release build of the controller. The deployment caller needs permission to read the current stack outputs, the exact previous S3 object version, and the deployment table. It also needs permission to prepare and execute CloudFormation change sets for the selected stack.
+
+```sh
+npm --prefix cdk run deploy:controller -- --config /path/to/controller.yaml --generation 42
+```
+
+The command compiles the candidate once. For an existing stack, it reads the current S3 version and verifies its digest and table against the current stack outputs. It runs `preflight retire` before preparing a change set and again before executing that exact change set. New stacks require confirmed stack absence and either a new table name or an existing imported table with an empty deployment partition. An active-to-dry-run update removes active grants and requires the same retirement checks.
+
+Use the deployment command for stack updates. Direct CDK or CloudFormation deployment requires independent enforcement of the same gate. Offline synthesis uses `node bin/controller.ts --config <controller.yaml> --generation <generation>` as the CDK app under `cdk synth --strict --no-lookups`.
+
+The stack supplies the controller task role, host cluster identity, and `run` arguments to the T20 host construct. The runtime object copy must return a destination version ID. The bounded artifact waiter gives initial S3 versioning up to 16 minutes to settle. [S3 copy response](https://docs.aws.amazon.com/AmazonS3/latest/API/API_CopyObject.html) · [S3 versioning configuration](https://docs.aws.amazon.com/AWSCloudFormation/latest/TemplateReference/aws-properties-s3-bucket-versioningconfiguration.html)
+
+The EC2 rule uses the fields available in the native event. The controller verifies ownership in AWS readback and checks subnet and AZ against the launch intent. Bootstrap roles receive their own `HELLO#` and `OFFER#` permissions. An EC2 `STATUS#` grant requires the T14 and T26 isolation qualification. [EC2 event payload](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/monitoring-instance-state-changes.html)
 
 ### Acceptance
 
