@@ -62,6 +62,19 @@ internal sealed class GitHubSimulator(string groupName)
     internal long? RegisteredRunnerId { get { lock (_sync) { return _runners.Values.SingleOrDefault()?.Id; } } }
     internal int TotalAssignedJobs { get; set; }
 
+    internal void SeedScaleSet(string name, IEnumerable<string> labels)
+    {
+        lock (_sync)
+        {
+            if (_scaleSet is not null)
+            {
+                throw new InvalidOperationException("The fixture scale set already exists.");
+            }
+            var payload = JsonSerializer.SerializeToElement(labels.Select(label => new { name = label, type = "System" }));
+            _scaleSet = new SimulatedScaleSet(SetId, name, GroupId, payload);
+        }
+    }
+
     internal void FailNext(SimulatorOperation operation, SimulatorFault failure)
     {
         lock (_sync)

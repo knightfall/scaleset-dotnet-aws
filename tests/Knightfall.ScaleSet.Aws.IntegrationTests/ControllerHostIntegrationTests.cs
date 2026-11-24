@@ -4,6 +4,7 @@ using System.Net;
 using System.Net.Sockets;
 using System.Text.Json;
 using System.Text.Json.Nodes;
+using Knightfall.ScaleSet.Aws.Core.Catalog;
 using Knightfall.ScaleSet.Aws.Core.Configuration;
 using Knightfall.ScaleSet.Aws.Core.Lifecycle;
 using Knightfall.ScaleSet.Aws.DynamoDb;
@@ -36,11 +37,16 @@ public sealed class ControllerHostIntegrationTests(ITestOutputHelper output)
         {
             var (configuration, path) = await WriteConfigurationAsync(table.Name, workspace.FullName, setup);
             string deployment = ControllerLeaseRecoveryCoordinator.DeploymentKey(configuration);
-            var predecessor = await WriteExpiredPredecessorAsync(table, configuration, setup);
+            var (predecessor, inherited) = await WriteExpiredPredecessorAsync(table, configuration, planLaunch: !holdEffect, setup);
             var store = new DynamoDbLifecycleStore(table.Client, table.Name, TimeProvider.System);
+            var journal = new DynamoDbEffectJournal(store, TimeProvider.System);
             var profile = Assert.Single(configuration.Profiles);
             var profileKey = new LifecycleProfile(deployment, profile.Id);
             var simulator = new GitHubSimulator(profile.GitHub.RunnerGroup);
+            if (inherited is not null)
+            {
+                simulator.SeedScaleSet(profile.GitHub.ScaleSet, profile.GitHub.Labels);
+            }
             var operationStarted = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
             var operationAborted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
             int heldRequests = 0;
@@ -68,6 +74,13 @@ public sealed class ControllerHostIntegrationTests(ITestOutputHelper output)
                 Assert.Equal(ControllerHostAwsFixture.Task, held.OwnerTaskArn);
                 Assert.Empty(simulator.Requests);
                 Assert.DoesNotContain(aws.Operations, request => request.Service == "secretsmanager");
+                if (inherited is not null)
+                {
+                    var planned = Assert.IsType<EffectJournalSnapshot>(await journal.ReadAsync(profileKey, inherited.IntentId, setup));
+                    Assert.Equal(inherited.Sha256, planned.Entry.Envelope.Sha256);
+                    Assert.Equal(EffectState.Planned, planned.Entry.State);
+                    Assert.Null(planned.Entry.Attempt);
+                }
 
                 using var probe = new HttpClient(new SocketsHttpHandler { UseProxy = false, AllowAutoRedirect = false })
                 {
@@ -84,7 +97,6 @@ public sealed class ControllerHostIntegrationTests(ITestOutputHelper output)
                 Assert.Equal(ControllerLeaseMode.Active, (await store.ReadLeaseAsync(deployment, setup))?.Mode);
                 Assert.Equal(HttpStatusCode.OK, await ProbeAsync(probe, "healthz", setup));
 
-                var journal = new DynamoDbEffectJournal(store, TimeProvider.System);
                 Guid? sessionId = simulator.SessionId;
                 EffectAttempt? attempt = null;
                 if (holdEffect)
@@ -98,6 +110,14 @@ public sealed class ControllerHostIntegrationTests(ITestOutputHelper output)
                 }
                 else
                 {
+                    var priorPlan = Assert.IsType<EffectEnvelope>(inherited);
+                    var settled = Assert.IsType<EffectJournalSnapshot>(await journal.ReadAsync(profileKey, priorPlan.IntentId, setup));
+                    Assert.Equal(priorPlan.Sha256, settled.Entry.Envelope.Sha256);
+                    Assert.Equal(EffectState.Settled, settled.Entry.State);
+                    Assert.Equal(EffectResolutionKind.CanceledBeforeSend, settled.Entry.Resolution?.Kind);
+                    Assert.Null(settled.Entry.Attempt);
+                    var pending = Assert.IsType<PendingEc2LaunchPage>(await store.ReadPendingEc2LaunchesAsync(profileKey, held.Fence, null, setup));
+                    Assert.Empty(pending.Launches);
                     Assert.NotNull(sessionId);
                     var opened = Assert.IsType<SessionRecord>(await store.ReadSessionAsync(profileKey, setup));
                     Assert.Equal(SessionPhase.Active, opened.Phase);
@@ -138,6 +158,7 @@ public sealed class ControllerHostIntegrationTests(ITestOutputHelper output)
                 var requests = aws.Operations;
                 Assert.Contains(requests, request => request.Service == "ec2");
                 Assert.Contains(requests, request => request is ("ecs-controller", "DescribeTasks"));
+                Assert.DoesNotContain(requests, request => request.Operation.Contains("RunInstances", StringComparison.Ordinal));
                 Assert.All(requests, request => Assert.Contains(request.Service, AllowedAwsServices));
             }
             catch
@@ -248,8 +269,8 @@ public sealed class ControllerHostIntegrationTests(ITestOutputHelper output)
         return (RuntimeConfigurationLoader.Load(document), path);
     }
 
-    private static async Task<ControllerLease> WriteExpiredPredecessorAsync(MiniStackTable table, RuntimeConfiguration configuration,
-        CancellationToken cancellationToken)
+    private static async Task<(ControllerLease Lease, EffectEnvelope? InheritedPlan)> WriteExpiredPredecessorAsync(MiniStackTable table,
+        RuntimeConfiguration configuration, bool planLaunch, CancellationToken cancellationToken)
     {
         var clock = new FormerClock(TimeProvider.System.GetUtcNow().AddMinutes(-2));
         var store = new DynamoDbLifecycleStore(table.Client, table.Name, clock);
@@ -262,7 +283,43 @@ public sealed class ControllerHostIntegrationTests(ITestOutputHelper output)
         var active = await recovery.TryActivateAsync(Assert.IsType<ControllerLease>(acquired.Lease), configuration, proof, [], cancellationToken)
             .ConfigureAwait(false);
         Assert.Equal(LeaseActivationStatus.Activated, active.Status);
-        return Assert.IsType<ControllerLease>(active.Lease);
+        var predecessor = Assert.IsType<ControllerLease>(active.Lease);
+        var inherited = planLaunch
+            ? await WriteInheritedLaunchAsync(configuration, store, predecessor, clock, cancellationToken).ConfigureAwait(false)
+            : null;
+        return (predecessor, inherited);
+    }
+
+    private static async Task<EffectEnvelope> WriteInheritedLaunchAsync(RuntimeConfiguration configuration, DynamoDbLifecycleStore store,
+        ControllerLease predecessor, TimeProvider clock, CancellationToken cancellationToken)
+    {
+        var rollout = await store.AdvanceCatalogRolloutAsync(predecessor.Fence, configuration, 1, cancellationToken).ConfigureAwait(false);
+        for (int pass = 0; pass < 3 && rollout.Status == CatalogRolloutStatus.Staging; pass++)
+        {
+            rollout = await store.AdvanceCatalogRolloutAsync(predecessor.Fence, configuration, 1, cancellationToken).ConfigureAwait(false);
+        }
+        Assert.Equal(CatalogRolloutStatus.Applied, rollout.Status);
+        var profile = Assert.Single(configuration.Profiles);
+        var key = new LifecycleProfile(predecessor.Deployment, profile.Id);
+        var catalog = Assert.IsType<CatalogProfile>(await store.ReadCatalogProfileAsync(key, cancellationToken).ConfigureAwait(false));
+        Assert.Equal(LifecycleWriteOutcome.Committed, await store.BindCatalogScaleSetAsync(predecessor.Fence, catalog,
+            GitHubSimulator.GroupId, GitHubSimulator.SetId, cancellationToken).ConfigureAwait(false));
+
+        var ec2 = Assert.IsType<Ec2ProvisionerConfiguration>(profile.Provisioner);
+        var numericVersion = Assert.IsType<PinnedLaunchTemplateVersion>(ec2.LaunchTemplateVersion);
+        var network = configuration.Networks[ec2.Network];
+        var subnet = network.Subnets[0];
+        var allocation = Guid.NewGuid();
+        var tags = new Ec2LaunchOwnershipTags(RunnerOwnershipTags.ControllerValue, key.Deployment, key.ProfileId,
+            allocation.ToString("D"), ec2.BootstrapProtocol);
+        var launch = new Ec2LaunchEffectRequest(allocation, configuration.Aws.Region, subnet.Id, subnet.AvailabilityZone,
+            ec2.LaunchTemplateId, long.Parse(numericVersion.Version, CultureInfo.InvariantCulture), "c7g.xlarge", network.SecurityGroupIds,
+            ec2.InstanceProfileArn, Guid.NewGuid(), Tenancy: Ec2Tenancy.Default, OwnershipTags: tags);
+        var envelope = EffectEnvelope.Create(key, EffectIntentIdentity.ForAllocation(launch)!, 1, launch, clock.GetUtcNow(), null);
+        var outcome = await new DynamoDbEffectJournal(store, clock).PlanAsync(predecessor, envelope, Guid.NewGuid(), cancellationToken)
+            .ConfigureAwait(false);
+        Assert.Equal(LifecycleWriteOutcome.Committed, outcome);
+        return envelope;
     }
 
     private static async Task SendTerminateAsync(int processId, CancellationToken cancellationToken)
