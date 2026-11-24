@@ -15,6 +15,7 @@ internal sealed class AwsWireTransport(Func<AwsWireRequest, HttpResponseMessage>
     public static BasicAWSCredentials Credentials => new("AKIDEXAMPLE", "offline-fixture-secret");
 
     public IReadOnlyList<AwsWireRequest> Requests => _requests.ToArray();
+    internal Func<AwsWireRequest, CancellationToken, Task>? BeforeRespondAsync { get; set; }
 
     public T Configure<T>(T config) where T : ClientConfig
     {
@@ -49,6 +50,10 @@ internal sealed class AwsWireTransport(Func<AwsWireRequest, HttpResponseMessage>
 
         var captured = new AwsWireRequest(request.Method, uri, body, target, request.Content?.Headers.ContentType?.MediaType);
         _requests.Enqueue(captured);
+        if (BeforeRespondAsync is { } beforeRespond)
+        {
+            await beforeRespond(captured, cancellationToken);
+        }
         return respond(captured);
     }
 
