@@ -12,6 +12,10 @@ internal static class ControllerIntegrationEntryPoint
 
     public static async Task<int> Main(string[] args)
     {
+        if (args is [SimulatedFargateJob.ChildMode])
+        {
+            return await SimulatedFargateJob.RunChildAsync().ConfigureAwait(false);
+        }
         if (args is [ChildMode, var portValue, var fingerprint, "run", ..])
         {
             if (!ushort.TryParse(portValue, NumberStyles.None, CultureInfo.InvariantCulture, out ushort port) || port == 0 ||
