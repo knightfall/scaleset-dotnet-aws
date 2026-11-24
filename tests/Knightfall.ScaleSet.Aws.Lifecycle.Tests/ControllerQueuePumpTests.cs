@@ -95,7 +95,7 @@ public sealed class ControllerQueuePumpTests
         var old = Assert.IsType<ActiveControllerAuthority>(ownership.ReadAuthority()).Lease.Fence;
         using var wire = new AwsWireTransport(static request =>
         {
-            Assert.EndsWith(".ReceiveMessage", request.Target!);
+            Assert.EndsWith(".ReceiveMessage", request.Target);
             return AwsWireTransport.Json("""{"Messages":[{"ReceiptHandle":"invalid","Body":"not-an-event"}]}""");
         });
         wire.BeforeRespondAsync = async (_, ct) => await table.SetLeaseAsync(
@@ -114,7 +114,7 @@ public sealed class ControllerQueuePumpTests
             await clock.RetryScheduled.WaitAsync(token);
             Assert.Equal(old, Assert.IsType<ActiveControllerAuthority>(ownership.ReadAuthority()).Lease.Fence);
             Assert.Equal(old.Epoch + 1, (await store.ReadLeaseAsync(old.Deployment, token))?.Epoch);
-            Assert.EndsWith(".ReceiveMessage", Assert.Single(wire.Requests).Target!);
+            Assert.EndsWith(".ReceiveMessage", Assert.Single(wire.Requests).Target);
         }
         finally
         {
@@ -144,7 +144,7 @@ public sealed class ControllerQueuePumpTests
 
     private static string Event(string instance) => $$"""
         {"source":"aws.ec2","detail-type":"EC2 Instance State-change Notification","account":"{{Account}}","region":"{{Region}}",
-         "resources":["arn:aws:ec2:{{Region}}:{{Account}}:instance/{{instance}}"],"detail":{"instance-id":"{{instance}}","state":"terminated"}}
+         "resources":["arn:aws:ec2:{{Region}}:{{Account}}:instance/{{instance}}"],"detail":{"instance-id":"{{instance}}","state":"terminated"} }
         """;
 
     private sealed class QueueClock : TimeProvider
