@@ -13,6 +13,8 @@
     <ProjectReference Include="../../src/Knightfall.ScaleSet.Aws.GitHub/Knightfall.ScaleSet.Aws.GitHub.csproj" />
     <PackageReference Include="xunit.v3" />
     <Compile Include="../Knightfall.ScaleSet.Aws.Lifecycle.Tests/MiniStackTable.cs" Link="MiniStackTable.cs" />
+    <Compile Include="../Knightfall.ScaleSet.Aws.Telemetry.Tests/OtlpLoopback.cs" Link="Telemetry/OtlpLoopback.cs" />
+    <Compile Include="../Knightfall.ScaleSet.Aws.Telemetry.Tests/OtlpMessage.cs" Link="Telemetry/OtlpMessage.cs" />
     <None Include="../../testdata/config/runtime/fargate-only.json" Link="fargate-only.json" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 </Project>
