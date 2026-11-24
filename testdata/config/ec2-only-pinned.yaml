@@ -1,0 +1,66 @@
+apiVersion: scaleset-aws/v1alpha1
+kind: RunnerController
+metadata:
+  name: engineering-dev
+spec:
+  aws:
+    account: '111122223333'
+    region: ap-southeast-2
+  controller:
+    image: '111122223333.dkr.ecr.ap-southeast-2.amazonaws.com/scaleset-dotnet-controller@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef'
+    hosting:
+      type: ecs-fargate
+      network: controller-private
+      cluster: control-plane
+      cpuArchitecture: arm64
+      cpu: 512
+      memoryMiB: 1024
+  tracking:
+    table:
+      type: create
+  networks:
+    controller-private:
+      vpcId: vpc-0123456789abcdef0
+      subnets:
+        - { id: subnet-0123456789abcdef0, az: ap-southeast-2a }
+        - { id: subnet-0123456789abcdef1, az: ap-southeast-2b }
+      securityGroupIds: [sg-0123456789abcdef0]
+    runner-private:
+      vpcId: vpc-0123456789abcdef0
+      subnets:
+        - { id: subnet-0123456789abcdef2, az: ap-southeast-2a }
+        - { id: subnet-0123456789abcdef3, az: ap-southeast-2b }
+      securityGroupIds: [sg-0123456789abcdef1]
+  ecsClusters:
+    control-plane:
+      type: create
+      name: engineering-dev-controller
+  github:
+    engineering:
+      scopeURL: https://github.com/example-engineering
+      auth:
+        type: github-app
+        secretArn: arn:aws:secretsmanager:ap-southeast-2:111122223333:secret:github-app-engineering-a1b2c3
+  profiles:
+    - id: linux-ec2-build
+      state: active
+      purpose: ec2-general
+      platform: { os: linux, arch: arm64 }
+      capacity: { idleReserve: 2, maxRunners: 16, startupTimeoutSeconds: 480 }
+      github:
+        connection: engineering
+        runnerGroup: Linux-EC2-Arm
+        scaleSet: linux-ec2-build
+        scaleSetId: '9223372036854775807'
+        labels: [linux-ec2-build, arm64-compiled]
+        registration: existing
+      provisioner:
+        type: ec2
+        launchTemplateId: lt-0123456789abcdef1
+        launchTemplateVersion:
+          type: pinned
+          version: '3'
+        network: runner-private
+        instanceProfileArn: arn:aws:iam::111122223333:instance-profile/runner-arm64-bootstrap
+        bootstrapRoleArn: arn:aws:iam::111122223333:role/runner-arm64-bootstrap
+        bootstrapProtocol: v1

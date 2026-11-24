@@ -1,0 +1,134 @@
+apiVersion: scaleset-aws/v1alpha1
+kind: RunnerController
+metadata:
+  name: engineering-dev
+spec:
+  aws:
+    account: '111122223333'
+    region: ap-southeast-2
+  mode: active
+  controller:
+    image: '111122223333.dkr.ecr.ap-southeast-2.amazonaws.com/scaleset-dotnet-controller@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef'
+    hosting:
+      type: ecs-fargate
+      network: controller-private
+      cluster: control-plane
+      cpuArchitecture: arm64
+      cpu: 512
+      memoryMiB: 1024
+  tracking:
+    table:
+      type: create
+  networks:
+    controller-private:
+      vpcId: vpc-0123456789abcdef0
+      subnets:
+        - { id: subnet-0123456789abcdef0, az: ap-southeast-2a }
+        - { id: subnet-0123456789abcdef1, az: ap-southeast-2b }
+      securityGroupIds: [sg-0123456789abcdef0]
+    runner-private:
+      vpcId: vpc-0123456789abcdef0
+      subnets:
+        - { id: subnet-0123456789abcdef2, az: ap-southeast-2a }
+        - { id: subnet-0123456789abcdef3, az: ap-southeast-2b }
+      securityGroupIds: [sg-0123456789abcdef1]
+  ecsClusters:
+    control-plane:
+      type: create
+      name: engineering-dev-controller
+    runner-shell:
+      type: import
+      arn: arn:aws:ecs:ap-southeast-2:111122223333:cluster/engineering-shell
+    runner-arm:
+      type: import
+      arn: arn:aws:ecs:ap-southeast-2:111122223333:cluster/engineering-arm
+  github:
+    engineering:
+      scopeURL: https://github.com/example-engineering
+      auth:
+        type: github-app
+        secretArn: arn:aws:secretsmanager:ap-southeast-2:111122223333:secret:github-app-engineering-a1b2c3
+  profiles:
+    - id: linux-ec2-docker
+      state: active
+      purpose: ec2-general
+      platform: { os: linux, arch: x64 }
+      capacity: { idleReserve: 0, maxRunners: 12, startupTimeoutSeconds: 600 }
+      github:
+        connection: engineering
+        runnerGroup: Linux-EC2
+        scaleSet: linux-ec2-docker
+        labels: [linux-ec2-docker]
+        registration: existing
+      provisioner:
+        type: ec2
+        launchTemplateId: lt-0123456789abcdef0
+        launchTemplateVersion:
+          type: alias
+          name: $Latest
+        network: runner-private
+        instanceProfileArn: arn:aws:iam::111122223333:instance-profile/runner-linux-bootstrap
+        bootstrapRoleArn: arn:aws:iam::111122223333:role/runner-linux-bootstrap
+        bootstrapProtocol: v1
+    - id: linux-ec2-build
+      state: active
+      purpose: ec2-general
+      platform: { os: linux, arch: arm64 }
+      capacity: { idleReserve: 2, maxRunners: 16, startupTimeoutSeconds: 480 }
+      github:
+        connection: engineering
+        runnerGroup: Linux-EC2-Arm
+        scaleSet: linux-ec2-build
+        scaleSetId: '9223372036854775807'
+        labels: [linux-ec2-build, arm64-compiled]
+        registration: existing
+      provisioner:
+        type: ec2
+        launchTemplateId: lt-0123456789abcdef1
+        launchTemplateVersion:
+          type: pinned
+          version: '3'
+        network: runner-private
+        instanceProfileArn: arn:aws:iam::111122223333:instance-profile/runner-arm64-bootstrap
+        bootstrapRoleArn: arn:aws:iam::111122223333:role/runner-arm64-bootstrap
+        bootstrapProtocol: v1
+    - id: linux-shell
+      state: active
+      purpose: fargate-compatible
+      platform: { os: linux, arch: x64 }
+      capacity: { idleReserve: 1, maxRunners: 24, startupTimeoutSeconds: 420 }
+      github:
+        connection: engineering
+        runnerGroup: No-Docker
+        scaleSet: linux-shell
+        labels: [linux-shell, shell-x64]
+        registration: create-if-missing
+      provisioner:
+        type: fargate
+        cluster: runner-shell
+        network: runner-private
+        taskDefinitionArn: 'arn:aws:ecs:ap-southeast-2:111122223333:task-definition/linux-shell-runner:7'
+        runnerContainer: runner
+        bootstrapRoleArn: arn:aws:iam::111122223333:role/fargate-shell-bootstrap
+        executionRoleArn: arn:aws:iam::111122223333:role/fargate-shell-execution
+        bootstrapProtocol: v1
+    - id: linux-ci-arm
+      state: active
+      purpose: fargate-compatible
+      platform: { os: linux, arch: arm64 }
+      capacity: { idleReserve: 3, maxRunners: 31, startupTimeoutSeconds: 540 }
+      github:
+        connection: engineering
+        runnerGroup: Fargate-Arm-Batches
+        scaleSet: linux-ci-arm
+        labels: [linux-ci-arm, slim-arm]
+        registration: create-if-missing
+      provisioner:
+        type: fargate
+        cluster: runner-arm
+        network: runner-private
+        taskDefinitionArn: 'arn:aws:ecs:ap-southeast-2:111122223333:task-definition/runner-slim-arm:19'
+        runnerContainer: runner
+        bootstrapRoleArn: arn:aws:iam::111122223333:role/fargate-arm-bootstrap
+        executionRoleArn: arn:aws:iam::111122223333:role/fargate-arm-execution
+        bootstrapProtocol: v1
