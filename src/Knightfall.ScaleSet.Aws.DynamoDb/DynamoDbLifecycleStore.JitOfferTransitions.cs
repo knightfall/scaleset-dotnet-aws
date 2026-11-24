@@ -248,7 +248,8 @@ public sealed partial class DynamoDbLifecycleStore
         if (handoff.RunnerId is not long runnerId)
         {
             return removal is null && (generation is null ||
-                generation.Entry.Resolution is { Kind: EffectResolutionKind.Absent or EffectResolutionKind.CanceledBeforeSend or EffectResolutionKind.Rejected });
+                generation.Entry.Resolution is { Kind: EffectResolutionKind.Absent or EffectResolutionKind.CanceledBeforeSend or
+                    EffectResolutionKind.Rejected or EffectResolutionKind.AbandonedBeforeSend });
         }
         var identity = handoff.Identity;
         return generation is { Entry.State: EffectState.Settled, Entry.Resolution.Kind: EffectResolutionKind.Applied } &&

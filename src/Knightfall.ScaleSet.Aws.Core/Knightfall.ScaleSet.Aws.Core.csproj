@@ -4,6 +4,7 @@
   </PropertyGroup>
   <ItemGroup>
     <PackageReference Include="JsonSchema.Net" />
+    <InternalsVisibleTo Include="Knightfall.ScaleSet.Aws.DynamoDb" />
     <EmbeddedResource Include="../../cdk/config/schema/controller-common-v1alpha1.json"
                       LogicalName="Knightfall.ScaleSet.Aws.Core.Configuration.controller-common-v1alpha1.json" />
     <EmbeddedResource Include="../../cdk/config/schema/controller-runtime-v1alpha1.json"

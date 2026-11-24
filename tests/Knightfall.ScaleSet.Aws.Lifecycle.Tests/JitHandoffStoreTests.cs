@@ -21,6 +21,62 @@ public sealed class JitHandoffStoreTests
     private const long RunnerId = 6501;
     private static ReadOnlySpan<byte> SyntheticJit => "synthetic-jit-that-must-never-appear-in-durable-storage"u8;
 
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task OnlyTheExactUnconsumedTicketCanProveABegunAttemptNeverSent(bool consumed)
+    {
+        var cancellation = TestContext.Current.CancellationToken;
+        using var table = await MiniStackTable.CreateAsync(cancellation);
+        using var recipient = JitRecipientKey.Create();
+        var fixture = await CreateFixtureAsync(table, cancellation);
+        Assert.Equal(LifecycleWriteOutcome.Committed, await fixture.Bootstrap.RegisterHelloAsync(recipient.Hello, cancellation));
+        var staged = await StageAsync(fixture, cancellation);
+        var planned = await PlanAsync(fixture, staged, cancellation);
+        var begun = await fixture.Journal.BeginJitAsync(fixture.Lease, fixture.Catalog, fixture.Executor, staged, planned,
+            fixture.Clock.Now, fixture.Clock.Now.AddSeconds(40), TimeSpan.FromSeconds(1), cancellation);
+        var authorization = Assert.IsType<EffectSendAuthorization>(begun.Permission);
+        var executing = Assert.IsType<EffectJournalSnapshot>(
+            await fixture.Journal.ReadAsync(fixture.Catalog.Profile, staged.IntentId, cancellation));
+        var forged = new EffectEvidence(EffectResolutionKind.AbandonedBeforeSend, executing.Entry.Envelope.Sha256,
+            executing.Entry.Envelope.Target, authorization.Attempt.BeganAt, authorization.Attempt.Id);
+
+        table.Wire.Clear();
+        Assert.False(executing.Entry.CanResolve(forged));
+        await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            fixture.Journal.ResolveAsync(fixture.Lease, executing, Guid.NewGuid(), forged, cancellation));
+        Assert.Equal(LifecycleWriteOutcome.LeaseRejected, await fixture.Journal.AbandonUnsentRunnerEffectAsync(
+            fixture.Lease with { OwnerId = "different-owner" }, authorization, cancellation));
+        Assert.DoesNotContain(table.Wire.Requests, call => call.Operation == "TransactWriteItems");
+
+        if (consumed)
+        {
+            Assert.True(authorization.TryConsume(out _));
+            Assert.Equal(LifecycleWriteOutcome.Conflict,
+                await fixture.Journal.AbandonUnsentRunnerEffectAsync(fixture.Lease, authorization, cancellation));
+            Assert.DoesNotContain(table.Wire.Requests, call => call.Operation == "TransactWriteItems");
+            var retained = Assert.IsType<EffectJournalSnapshot>(
+                await fixture.Journal.ReadAsync(fixture.Catalog.Profile, staged.IntentId, cancellation));
+            Assert.Equal(executing.TransitionId, retained.TransitionId);
+            Assert.Equal(EffectState.Executing, retained.Entry.State);
+            return;
+        }
+
+        table.Wire.DropNextSuccessfulTransactionResponse();
+        Assert.Equal(LifecycleWriteOutcome.Committed,
+            await fixture.Journal.AbandonUnsentRunnerEffectAsync(fixture.Lease, authorization, cancellation));
+        Assert.False(authorization.TryConsume(out _));
+        Assert.Equal(LifecycleWriteOutcome.Committed,
+            await fixture.Journal.AbandonUnsentRunnerEffectAsync(fixture.Lease, authorization, cancellation));
+        Assert.Single(table.Wire.Requests, call => call.Operation == "TransactWriteItems");
+        var settled = Assert.IsType<EffectJournalSnapshot>(
+            await fixture.Journal.ReadAsync(fixture.Catalog.Profile, staged.IntentId, cancellation));
+        Assert.Equal(executing.Revision + 1, settled.Revision);
+        Assert.Equal(authorization.Attempt, settled.Entry.Attempt);
+        Assert.Equal(EffectResolutionKind.AbandonedBeforeSend, settled.Entry.Resolution?.Kind);
+        Assert.Equal(authorization.Attempt.Id, settled.Entry.Resolution?.AttemptId);
+    }
+
     [Fact]
     public async Task DuplicateAndForeignHellosCannotReplaceTheKeyBoundToAnOffer()
     {
@@ -284,7 +340,7 @@ public sealed class JitHandoffStoreTests
         return new TestContextFixture(store, new DynamoDbEffectJournal(store, clock), lease, catalog, executor, identity, bootstrap, clock);
     }
 
-    private static async Task<JitHandoffSnapshot> StageAsync(TestContextFixture fixture, CancellationToken cancellationToken)
+    internal static async Task<JitHandoffSnapshot> StageAsync(TestContextFixture fixture, CancellationToken cancellationToken)
     {
         var staged = await fixture.Store.StageJitHandoffAsync(fixture.Lease, fixture.Catalog, fixture.Executor, fixture.Identity,
             RunnerName(fixture.Identity), cancellationToken);
@@ -294,7 +350,7 @@ public sealed class JitHandoffStoreTests
 
     private static string RunnerName(JitHandoffIdentity identity) => "ss-" + JitOfferBinding.GetOfferId(identity)[..48];
 
-    private static async Task<EffectJournalSnapshot> PlanAsync(TestContextFixture fixture, JitHandoffSnapshot handoff,
+    internal static async Task<EffectJournalSnapshot> PlanAsync(TestContextFixture fixture, JitHandoffSnapshot handoff,
         CancellationToken cancellationToken)
     {
         var identity = fixture.Identity;

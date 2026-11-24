@@ -82,6 +82,13 @@ public sealed partial class DynamoDbLifecycleStore
         CancellationToken cancellationToken) =>
         WriteEffectAsync(profile, lease, transitionId, write, LeaseAccess.Active, cancellationToken, guard, attemptDeadline);
 
+    internal Task<LifecycleWriteOutcome> WriteAbandonedRunnerEffectAsync(
+        DeploymentLeaseFence lease, Guid transitionId, EffectJournalSnapshot exactAttempt, EffectJournalEntry settled,
+        DateTimeOffset leaseValidThrough, CancellationToken cancellationToken) =>
+        WriteEffectAsync(settled.Envelope.Profile, lease, transitionId,
+            new EffectWrite(settled.Envelope.IntentId, exactAttempt.Revision, settled.State, settled.WritePayload()),
+            LeaseAccess.Active, cancellationToken, leaseValidThrough: leaseValidThrough, exactAttempt: exactAttempt);
+
     private async Task<LifecycleWriteOutcome> WriteEffectAsync(
         LifecycleProfile profile,
         DeploymentLeaseFence lease,
@@ -90,7 +97,8 @@ public sealed partial class DynamoDbLifecycleStore
         LeaseAccess leaseAccess,
         CancellationToken cancellationToken,
         EffectDispatchGuard? guard = null,
-        DateTimeOffset? attemptDeadline = null)
+        DateTimeOffset? leaseValidThrough = null,
+        EffectJournalSnapshot? exactAttempt = null)
     {
         RequireProfileLease(profile, lease);
         ArgumentNullException.ThrowIfNull(write);
@@ -146,11 +154,20 @@ public sealed partial class DynamoDbLifecycleStore
             operation.Add("dueAtMillis", NumberValue(due.ToUnixTimeMilliseconds()));
         }
 
-        var leaseCondition = LeaseCondition(lease, leaseAccess, attemptDeadline);
+        var leaseCondition = LeaseCondition(lease, leaseAccess, leaseValidThrough);
+        var writeOperation = CompareAndPut(operationKey, operation, write.ExpectedRevision, profile.Deployment);
+        if (exactAttempt is not null)
+        {
+            var put = writeOperation.Write.Put;
+            put.ConditionExpression += " AND transitionId = :previousTransition AND effectState = :executing AND payload = :previousPayload";
+            put.ExpressionAttributeValues[":previousTransition"] = StringValue(exactAttempt.TransitionId.ToString("D"));
+            put.ExpressionAttributeValues[":executing"] = StringValue(EffectStateValue(EffectState.Executing));
+            put.ExpressionAttributeValues[":previousPayload"] = StringValue(exactAttempt.Entry.WritePayload());
+        }
         var actions = new List<TransactionAction>
         {
             leaseCondition,
-            CompareAndPut(operationKey, operation, write.ExpectedRevision, profile.Deployment),
+            writeOperation,
             WriteIndex(profile, nextIndex, head.Revision, transitionId),
         };
         if (guard is not null)
@@ -176,7 +193,8 @@ public sealed partial class DynamoDbLifecycleStore
         {
             actions.Add(DeleteMarker(profile, head.Generation, write.IntentId));
         }
-        return await WriteAsync(actions, transitionId, cancellationToken).ConfigureAwait(false);
+        // An abandonment retry uses the same durable proof but may read a newer index revision.
+        return await WriteAsync(actions, exactAttempt is null ? transitionId : Guid.NewGuid(), cancellationToken).ConfigureAwait(false);
     }
 
     public async Task<ActiveEffectPage?> ReadActiveOperationsAsync(

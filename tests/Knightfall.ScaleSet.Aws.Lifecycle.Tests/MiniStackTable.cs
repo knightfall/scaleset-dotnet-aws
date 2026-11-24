@@ -191,6 +191,7 @@ internal sealed class MiniStackWire : DelegatingHandler
     private TransactionBarrier? _transactionBarrier;
     private PausedRequest? _pausedRead;
     private PausedRequest? _pausedWrite;
+    private PausedRequest? _pausedSuccessfulWrite;
     private StorageFailure? _failedGetItem;
     private StorageFailure? _failedTransactWrite;
 
@@ -233,6 +234,13 @@ internal sealed class MiniStackWire : DelegatingHandler
         return pause;
     }
 
+    internal PausedRequest PauseAfterNextSuccessfulTransactionWrite(LifecycleKey key)
+    {
+        var pause = new PausedRequest(key);
+        _pausedSuccessfulWrite = pause;
+        return pause;
+    }
+
     protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
     {
         if (request.RequestUri is not { Scheme: "http", Host: "127.0.0.1" })
@@ -268,13 +276,18 @@ internal sealed class MiniStackWire : DelegatingHandler
             await barrier.WaitAsync(cancellationToken);
         }
         if (operation == "TransactWriteItems" && _pausedWrite is { } writePause &&
-            call.Request.GetProperty("TransactItems").EnumerateArray().Any(action =>
-                action.TryGetProperty("Put", out var put) && writePause.Matches(put.GetProperty("Item"))) &&
+            MatchesTransactionPut(call, writePause) &&
             Interlocked.CompareExchange(ref _pausedWrite, null, writePause) == writePause)
         {
             await writePause.AwaitResumeAsync(cancellationToken);
         }
         var actual = await base.SendAsync(request, cancellationToken);
+        if (operation == "TransactWriteItems" && actual.IsSuccessStatusCode && _pausedSuccessfulWrite is { } afterWrite &&
+            MatchesTransactionPut(call, afterWrite) &&
+            Interlocked.CompareExchange(ref _pausedSuccessfulWrite, null, afterWrite) == afterWrite)
+        {
+            await afterWrite.AwaitResumeAsync(cancellationToken);
+        }
         if (operation == "GetItem" && _pausedRead is { } pause &&
             pause.Matches(call.Request.GetProperty("Key")) &&
             Interlocked.CompareExchange(ref _pausedRead, null, pause) == pause)
@@ -306,6 +319,10 @@ internal sealed class MiniStackWire : DelegatingHandler
         }
         return actual;
     }
+
+    private static bool MatchesTransactionPut(MiniStackCall call, PausedRequest pause) =>
+        call.Request.GetProperty("TransactItems").EnumerateArray().Any(action =>
+            action.TryGetProperty("Put", out var put) && pause.Matches(put.GetProperty("Item")));
 
     private static bool MatchesKey(JsonElement item, LifecycleKey key) =>
         item.GetProperty("PK").GetProperty("S").GetString() == key.PartitionKey &&

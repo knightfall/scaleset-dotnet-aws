@@ -10,6 +10,7 @@ public enum EffectResolutionKind
     Applied = 1,
     Rejected = 2,
     Absent = 3,
+    AbandonedBeforeSend = 4,
 }
 
 public sealed record EffectEvidence(
@@ -108,7 +109,23 @@ public sealed class EffectJournalEntry
             throw new InvalidOperationException("The evidence cannot settle this exact effect.");
         }
 
-        return new EffectJournalEntry(Envelope, EffectState.Settled,
+        return Settle(evidence);
+    }
+
+    internal EffectJournalEntry AbandonRunnerEffectBeforeSend(EffectAttempt attempt, DateTimeOffset observedAt)
+    {
+        var evidence = new EffectEvidence(EffectResolutionKind.AbandonedBeforeSend, Envelope.Sha256, Envelope.Target,
+            observedAt, attempt.Id);
+        if (State != EffectState.Executing || Attempt != attempt || !ValidAbandonment(evidence))
+        {
+            throw new InvalidOperationException("Only the exact initial runner effect attempt may be abandoned before send.");
+        }
+
+        return Settle(evidence);
+    }
+
+    private EffectJournalEntry Settle(EffectEvidence evidence) =>
+        new(Envelope, EffectState.Settled,
             _body with
             {
                 Resolution = evidence with
@@ -117,7 +134,6 @@ public sealed class EffectJournalEntry
                     EarliestObservedAt = evidence.EarliestObservedAt?.ToUniversalTime(),
                 },
             });
-    }
 
     public string WritePayload() => JsonSerializer.Serialize(_body, EffectEnvelope.Serializer);
 
@@ -174,8 +190,7 @@ public sealed class EffectJournalEntry
     public bool CanResolve(EffectEvidence evidence)
     {
         ArgumentNullException.ThrowIfNull(evidence);
-        if (State == EffectState.Settled || evidence.EnvelopeSha256 != Envelope.Sha256 || evidence.Target != Envelope.Target ||
-            evidence.ObservedAt == default || evidence.EarliestObservedAt > evidence.ObservedAt)
+        if (State == EffectState.Settled || !MatchesEvidence(evidence))
         {
             return false;
         }
@@ -200,6 +215,16 @@ public sealed class EffectJournalEntry
         };
     }
 
+    private bool MatchesEvidence(EffectEvidence evidence) =>
+        evidence.EnvelopeSha256 == Envelope.Sha256 && evidence.Target == Envelope.Target &&
+        evidence.ObservedAt != default && !(evidence.EarliestObservedAt > evidence.ObservedAt);
+
+    private bool ValidAbandonment(EffectEvidence evidence) =>
+        MatchesEvidence(evidence) && evidence.EarliestObservedAt is null && !EarlierSendUncertain &&
+        Envelope.ProviderReplayDeadline is null && Envelope.Request is GitHubJitGenerateEffectRequest or GitHubRunnerRemoveEffectRequest &&
+        Attempt is { } attempt && evidence.AttemptId == attempt.Id && evidence.ObservedAt >= attempt.BeganAt &&
+        LatestAuthorizedDeadline == attempt.Deadline;
+
     private bool ValidState()
     {
         if (Attempt is { } attempt)
@@ -221,6 +246,8 @@ public sealed class EffectJournalEntry
         {
             EffectState.Planned => Attempt is null && Resolution is null,
             EffectState.Executing or EffectState.Uncertain => Attempt is not null && Resolution is null,
+            EffectState.Settled when Resolution is { Kind: EffectResolutionKind.AbandonedBeforeSend } abandonment =>
+                ValidAbandonment(abandonment),
             EffectState.Settled when Resolution is { } evidence =>
                 new EffectJournalEntry(Envelope, Attempt is null ? EffectState.Planned : EffectState.Uncertain, _body).CanResolve(evidence),
             _ => false,

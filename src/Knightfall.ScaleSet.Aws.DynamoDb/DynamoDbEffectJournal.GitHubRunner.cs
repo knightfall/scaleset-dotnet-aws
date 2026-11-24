@@ -5,6 +5,61 @@ namespace Knightfall.ScaleSet.Aws.DynamoDb;
 
 public sealed partial class DynamoDbEffectJournal
 {
+    /// <summary>Settles an exact initial GitHub runner effect whose send authorization can still be discarded.</summary>
+    public async Task<LifecycleWriteOutcome> AbandonUnsentRunnerEffectAsync(
+        ControllerLease lease, EffectSendAuthorization authorization, CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(lease);
+        ArgumentNullException.ThrowIfNull(authorization);
+        if (lease.Mode != ControllerLeaseMode.Active || lease.Fence != authorization.Lease)
+        {
+            return LifecycleWriteOutcome.LeaseRejected;
+        }
+        var envelope = authorization.Envelope;
+        if (envelope.Request is not (GitHubJitGenerateEffectRequest or GitHubRunnerRemoveEffectRequest) ||
+            envelope.ProviderReplayDeadline is not null || authorization.TryDiscard() is not { } discard)
+        {
+            return LifecycleWriteOutcome.Conflict;
+        }
+
+        var owner = await _store.ReadLeaseAsync(lease.Deployment, cancellationToken).ConfigureAwait(false);
+        if (owner is not { Mode: ControllerLeaseMode.Active } || owner.Fence != authorization.Lease ||
+            owner.ValidUntil <= authorization.EstimateUtcNow())
+        {
+            return LifecycleWriteOutcome.LeaseRejected;
+        }
+
+        var current = await ReadAsync(envelope.Profile, envelope.IntentId, cancellationToken).ConfigureAwait(false);
+        if (MatchesAbandonment(current, authorization, discard))
+        {
+            return LifecycleWriteOutcome.Committed;
+        }
+        if (current is not { Entry.State: EffectState.Executing, Entry.EarlierSendUncertain: false } ||
+            current.Revision != authorization.Revision || current.TransitionId != authorization.BeginTransitionId ||
+            current.Entry.Attempt != authorization.Attempt || !current.Entry.Envelope.Matches(envelope))
+        {
+            return LifecycleWriteOutcome.Conflict;
+        }
+
+        var settled = current.Entry.AbandonRunnerEffectBeforeSend(authorization.Attempt, discard.ObservedAt);
+        var outcome = await _store.WriteAbandonedRunnerEffectAsync(owner.Fence, discard.TransitionId, current, settled,
+            authorization.EstimateUtcNow(), cancellationToken).ConfigureAwait(false);
+        if (outcome is LifecycleWriteOutcome.Conflict or LifecycleWriteOutcome.Indeterminate &&
+            MatchesAbandonment(await ReadAsync(envelope.Profile, envelope.IntentId, cancellationToken).ConfigureAwait(false), authorization, discard))
+        {
+            return LifecycleWriteOutcome.Committed;
+        }
+
+        return outcome;
+    }
+
+    private static bool MatchesAbandonment(EffectJournalSnapshot? current, EffectSendAuthorization authorization,
+        EffectSendAuthorization.DiscardWitness discard) =>
+        current is { Entry.State: EffectState.Settled, Entry.Resolution.Kind: EffectResolutionKind.AbandonedBeforeSend } &&
+        current.Revision == checked(authorization.Revision + 1) && current.TransitionId == discard.TransitionId &&
+        current.Entry.Attempt == authorization.Attempt && current.Entry.Envelope.Matches(authorization.Envelope) &&
+        current.Entry.Resolution.ObservedAt == discard.ObservedAt;
+
     public async Task<EffectBeginOutcome> BeginJitAsync(
         ControllerLease lease, CatalogProfile catalog, ExecutorSnapshot executor, JitHandoffSnapshot handoff,
         EffectJournalSnapshot intent, DateTimeOffset upperUtcNow, DateTimeOffset deadline, TimeSpan writeReserve,

@@ -235,6 +235,65 @@ public sealed class GitHubJitControllerTests
     }
 
     [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task InvalidPredispatchEvidenceSettlesAnUnsentAttemptAndUnblocksTerminalCleanup(bool beginExpired)
+    {
+        var token = TestContext.Current.CancellationToken;
+        using var table = await MiniStackTable.CreateAsync(token);
+        var configuration = await ControllerLifecycleTests.ConfigurationAsync(draining: false, token);
+        var fixture = await JitHandoffStoreTests.CreateFixtureAsync(table, token, configuration);
+        using var recipient = JitRecipientKey.Create();
+        Assert.Equal(LifecycleWriteOutcome.Committed, await fixture.Bootstrap.RegisterHelloAsync(recipient.Hello, token));
+        var staged = await JitHandoffStoreTests.StageAsync(fixture, token);
+        _ = await JitHandoffStoreTests.PlanAsync(fixture, staged, token);
+        var write = table.Wire.PauseAfterNextSuccessfulTransactionWrite(LifecycleKey.Operation(fixture.Catalog.Profile, staged.IntentId));
+        using var wire = new GitHubWire((_, _) => throw new InvalidOperationException("No GitHub send is authorized."));
+        using var http = new HttpClient(wire, disposeHandler: false);
+        using var connection = await ControllerLifecycleTests.ConnectAsync(configuration, fixture.Clock, http, token);
+        var authority = new ActiveControllerAuthority(fixture.Lease, Proof(fixture.Clock));
+        var service = new GitHubJitHandoff(fixture.Store, fixture.Clock, Timing);
+        var issuing = service.IssueAsync(authority, fixture.Identity, fixture.Clock.Now, connection, CancellationToken.None, token);
+        try
+        {
+            await write.Captured.WaitAsync(TimeSpan.FromSeconds(5), token);
+            var attempt = await fixture.Journal.ReadAsync(fixture.Catalog.Profile, staged.IntentId, token);
+            Assert.Equal(EffectState.Executing, attempt?.Entry.State);
+            if (beginExpired)
+            {
+                fixture.Clock.Now += Timing.SendWindow + TimeSpan.FromSeconds(3);
+            }
+            else
+            {
+                fixture.Clock.Now = fixture.Clock.Now.AddSeconds(1);
+                Assert.Equal(LifecycleWriteOutcome.Committed, await fixture.Store.ObserveResourceAsync(fixture.Lease.Fence, fixture.Executor.Binding,
+                    new ExecutorResourceObservation(ExecutorResourceState.Running, fixture.Clock.Now, fixture.Executor.State.StartedAt, Guid.NewGuid()),
+                    token));
+            }
+        }
+        finally
+        {
+            write.Resume();
+        }
+        Assert.Equal(GitHubJitStatus.RecoveryRequired, (await issuing).Status);
+        var effect = Assert.IsType<EffectJournalSnapshot>(await fixture.Journal.ReadAsync(fixture.Catalog.Profile, staged.IntentId, token));
+        Assert.Equal(EffectState.Settled, effect.Entry.State);
+        Assert.Equal(EffectResolutionKind.AbandonedBeforeSend, effect.Entry.Resolution?.Kind);
+        Assert.Equal(0, (await fixture.Store.ReadEffectIndexAsync(fixture.Catalog.Profile, token))?.UnfinishedCount);
+        Assert.Empty(wire.Requests);
+        Assert.Equal(BootstrapOfferStatus.NotAvailable, (await fixture.Bootstrap.TryConsumeOfferAsync(recipient.Hello, token)).Status);
+
+        fixture.Clock.Now = fixture.Clock.Now.AddSeconds(1);
+        Assert.Equal(LifecycleWriteOutcome.Committed, await fixture.Store.ObserveResourceAsync(fixture.Lease.Fence, fixture.Executor.Binding,
+            new ExecutorResourceObservation(ExecutorResourceState.IrreversiblyTerminated, fixture.Clock.Now, fixture.Executor.State.StartedAt, Guid.NewGuid()),
+            token));
+        Assert.Equal(LifecycleWriteOutcome.Committed, await service.RemoveTerminatedRunnerAsync(authority, fixture.Catalog.Profile,
+            fixture.Identity.AllocationId, connection, CancellationToken.None, token));
+        Assert.Equal(0, (await fixture.Store.ReadProfileHandoffObservationAsync(fixture.Catalog.Profile, token)).OutstandingOffers);
+        Assert.Empty(wire.Requests);
+    }
+
+    [Theory]
     [InlineData(true)]
     [InlineData(false)]
     public async Task Ec2IdentityRequiresTheSameRoleIdFromInstanceProfileAndRole(bool matching)
