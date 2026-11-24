@@ -132,15 +132,20 @@ public sealed partial class GitHubJitHandoff
         {
             return new GitHubJitResult(GitHubJitStatus.RecoveryRequired);
         }
+        bool published = false;
         try
         {
-            return await GenerateAsync(authority.Clock, lease, catalog!, executor, handoff, permission, connection, token)
+            var result = await GenerateAsync(authority.Clock, lease, catalog!, executor, handoff, permission, connection, token)
                 .ConfigureAwait(false);
+            published = result.Status == GitHubJitStatus.Offered;
+            return result;
         }
-        catch (OperationCanceledException) when (token.IsCancellationRequested)
+        finally
         {
-            await _journal.FinalizeInterruptedRunnerEffectAsync(lease, permission, _timing.WriteReserve).ConfigureAwait(false);
-            throw;
+            if (!published)
+            {
+                await _journal.FinalizeInterruptedRunnerEffectAsync(lease, permission, _timing.WriteReserve).ConfigureAwait(false);
+            }
         }
     }
 
@@ -162,7 +167,6 @@ public sealed partial class GitHubJitHandoff
             await _store.ReadJitHandoffAsync(profile, handoff.Identity.AllocationId, cancellationToken).ConfigureAwait(false) is not
                 { State: JitHandoffState.Staged } staged || staged.TransitionId != handoff.TransitionId)
         {
-            _ = await _journal.AbandonUnsentRunnerEffectAsync(live, permission, cancellationToken).ConfigureAwait(false);
             return new GitHubJitResult(GitHubJitStatus.RecoveryRequired);
         }
 
@@ -185,16 +189,6 @@ public sealed partial class GitHubJitHandoff
         catch (Exception error) when (error is CryptographicException or ArgumentException)
         {
             // Retain the exact attempt if a response cannot be sealed.
-        }
-        if (permission.HasStartedSending)
-        {
-            // Only the caller that finished the send and all publication attempts may end the active send phase.
-            _ = await _journal.MarkUncertainAsync(live, attempt!, Guid.NewGuid(), permission.Attempt.Id, cancellationToken)
-                .ConfigureAwait(false);
-        }
-        else
-        {
-            _ = await _journal.AbandonUnsentRunnerEffectAsync(live, permission, cancellationToken).ConfigureAwait(false);
         }
         return new GitHubJitResult(GitHubJitStatus.RecoveryRequired, Failure: failure);
     }

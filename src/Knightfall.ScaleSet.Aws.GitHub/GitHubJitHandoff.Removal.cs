@@ -124,18 +124,22 @@ public sealed partial class GitHubJitHandoff
         {
             return null;
         }
+        EffectJournalSnapshot? settled = null;
         try
         {
             var executing = await _journal.ReadAsync(profile, intentId, cancellationToken).ConfigureAwait(false);
-            return MatchesAttempt(executing, authorized)
+            settled = MatchesAttempt(executing, authorized)
                 ? await SendRemovalAsync(live, clock, catalog, executor, executing!, authorized, connection, cancellationToken)
                     .ConfigureAwait(false)
                 : null;
+            return settled;
         }
-        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        finally
         {
-            await _journal.FinalizeInterruptedRunnerEffectAsync(live, authorized, _timing.WriteReserve).ConfigureAwait(false);
-            throw;
+            if (settled is null)
+            {
+                await _journal.FinalizeInterruptedRunnerEffectAsync(live, authorized, _timing.WriteReserve).ConfigureAwait(false);
+            }
         }
     }
 
@@ -153,7 +157,6 @@ public sealed partial class GitHubJitHandoff
             await _store.ReadCatalogProfileAsync(catalog.Profile, cancellationToken).ConfigureAwait(false) is not { } applied ||
             applied.TransitionId != catalog.TransitionId || applied.AppliedGeneration != catalog.AppliedGeneration)
         {
-            _ = await _journal.AbandonUnsentRunnerEffectAsync(live, authorized, cancellationToken).ConfigureAwait(false);
             return null;
         }
         try
@@ -163,18 +166,9 @@ public sealed partial class GitHubJitHandoff
                 return await ResolveRemovalAsync(live, executing, Applied(executing.Entry.Envelope), cancellationToken).ConfigureAwait(false);
             }
         }
-        catch (GitHubOperationException failure) when (failure.DomainError == ScaleSetDomainError.JobStillRunning)
-        {
-            // A scheduling conflict leaves a registration to reconcile. Retry only the exact readback.
-            _ = await _journal.MarkUncertainAsync(lease, executing, Guid.NewGuid(), authorized.Attempt.Id, cancellationToken)
-                .ConfigureAwait(false);
-        }
         catch (GitHubOperationException)
         {
-            if (!authorized.HasStartedSending)
-            {
-                _ = await _journal.AbandonUnsentRunnerEffectAsync(live, authorized, cancellationToken).ConfigureAwait(false);
-            }
+            // The journal finalizer preserves a possibly sent removal for exact readback.
         }
         return null;
     }

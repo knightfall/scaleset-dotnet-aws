@@ -256,8 +256,10 @@ public sealed class GitHubJitControllerTests
         Assert.DoesNotContain(table.Wire.Requests, request => request.Request.GetRawText().Contains(EncodedJit, StringComparison.Ordinal));
     }
 
-    [Fact]
-    public async Task CanceledGenerateCanRecoverInTheSameEpochWithoutResending()
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task InterruptedGenerateCanRecoverInTheSameEpochWithoutResending(bool publicationReadFails)
     {
         var token = TestContext.Current.CancellationToken;
         using var table = await MiniStackTable.CreateAsync(token);
@@ -275,6 +277,12 @@ public sealed class GitHubJitControllerTests
             {
                 Assert.Equal(JitPath(fixture.Identity.ScaleSetId), request.Uri.AbsolutePath);
                 AssertJitCommand(request, runnerName);
+                if (publicationReadFails)
+                {
+                    table.Wire.FailNextGetItem(LifecycleKey.Runner(fixture.Catalog.Profile, fixture.Executor.Binding.AllocationId),
+                        HttpStatusCode.ServiceUnavailable, "ServiceUnavailable");
+                    return GitHubWire.Json(HttpStatusCode.OK, $$"""{"runner":{{runnerJson}},"encodedJITConfig":"{{EncodedJit}}"}""");
+                }
                 postArrived.TrySetResult();
                 await Task.Delay(Timeout.InfiniteTimeSpan, cancellation);
             }
@@ -289,15 +297,22 @@ public sealed class GitHubJitControllerTests
         var service = new GitHubJitHandoff(fixture.Store, fixture.Clock, Timing);
         using var canceled = CancellationTokenSource.CreateLinkedTokenSource(token);
         var issuing = service.IssueAsync(authority, fixture.Identity, fixture.Clock.Now, connection, CancellationToken.None, canceled.Token);
-        try
+        if (publicationReadFails)
         {
-            await postArrived.Task.WaitAsync(TimeSpan.FromSeconds(5), token);
+            await Assert.ThrowsAsync<IOException>(() => issuing);
         }
-        finally
+        else
         {
-            await canceled.CancelAsync();
+            try
+            {
+                await postArrived.Task.WaitAsync(TimeSpan.FromSeconds(5), token);
+            }
+            finally
+            {
+                await canceled.CancelAsync();
+            }
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(() => issuing);
         }
-        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => issuing);
         string intentId = "jit-" + offerId;
         var uncertain = Assert.IsType<EffectJournalSnapshot>(await fixture.Journal.ReadAsync(fixture.Catalog.Profile, intentId, token));
         Assert.Equal(EffectState.Uncertain, uncertain.Entry.State);

@@ -1,3 +1,4 @@
+using Amazon.Runtime;
 using Knightfall.ScaleSet.Aws.Core.Catalog;
 using Knightfall.ScaleSet.Aws.Core.Lifecycle;
 
@@ -5,6 +6,7 @@ namespace Knightfall.ScaleSet.Aws.DynamoDb;
 
 public sealed partial class DynamoDbEffectJournal
 {
+    /// <summary>Closes the original sender's phase under a bounded, independent token when the effect is unresolved.</summary>
     public async Task FinalizeInterruptedRunnerEffectAsync(
         ControllerLease lease, EffectSendAuthorization authorization, TimeSpan writeReserve)
     {
@@ -43,7 +45,7 @@ public sealed partial class DynamoDbEffectJournal
         {
             // Persisted attempts remain available to fenced recovery.
         }
-        catch (IOException)
+        catch (Exception error) when (error is IOException or HttpRequestException or TimeoutException or AmazonServiceException)
         {
             // An unavailable store cannot confirm the exact transition.
         }
