@@ -69,9 +69,12 @@ public sealed class GitHubListenerDeliveryHandler : IScaleSetListenerDeliveryHan
 
         var message = delivery.Message!;
         var facts = GetFacts(message);
-        string digest = Convert.ToHexString(SHA256.HashData(JsonSerializer.SerializeToUtf8Bytes(facts)));
+        string digest = DeliveryDigest(facts);
+        string? priorDigest = facts.Jobs.Any(job => job.RelatedRunnerId is not null)
+            ? DeliveryDigest(facts with { Jobs = facts.Jobs.Select(job => job with { RelatedRunnerId = null }).ToArray() })
+            : null;
         long messageId = message.MessageId;
-        var receipt = await _ledger.ReadReceiptAsync(messageId, digest, cancellationToken).ConfigureAwait(false);
+        var receipt = await _ledger.ReadReceiptAsync(messageId, digest, cancellationToken, priorDigest).ConfigureAwait(false);
         if (receipt is null)
         {
             var result = await _ledger.PersistReceiptAsync(messageId, digest, delivery.ObservedAt, facts.Assigned, cancellationToken)
@@ -96,7 +99,7 @@ public sealed class GitHubListenerDeliveryHandler : IScaleSetListenerDeliveryHan
             {
                 return ScaleSetListenerDeliveryDisposition.Deferred;
             }
-            receipt = await RequireReceiptAsync(messageId, digest, cancellationToken).ConfigureAwait(false);
+            receipt = await RequireReceiptAsync(messageId, receipt.Value.Digest, cancellationToken).ConfigureAwait(false);
         }
 
         return await HandleOffersAsync(receipt, messageId, facts.OfferedIds, cancellationToken).ConfigureAwait(false);
@@ -204,7 +207,7 @@ public sealed class GitHubListenerDeliveryHandler : IScaleSetListenerDeliveryHan
         return new AdmissionBasis(demand, capacity, guards);
     }
 
-    private bool IsCurrent(SessionDemand? demand)
+    private bool IsCurrent(SessionDemandObservation? demand)
     {
         var now = _timeProvider.GetUtcNow();
         return demand is not null && demand.SessionId == _owned.Identity.SessionId &&
@@ -231,11 +234,12 @@ public sealed class GitHubListenerDeliveryHandler : IScaleSetListenerDeliveryHan
     {
         var offeredIds = message.JobAvailableMessages.Select(job => job.RunnerRequestId)
             .Where(requestId => requestId > 0).Distinct().ToImmutableArray();
-        var jobs = message.JobCompletedMessages.Select(job => new JobObservation(job.RunnerRequestId, JobPhase.Completed, PositiveId(job.RunnerId)))
-            .Concat(message.JobStartedMessages.Select(job => new JobObservation(job.RunnerRequestId, JobPhase.Started, PositiveId(job.RunnerId))))
-            .Concat(message.JobAssignedMessages.Select(job => new JobObservation(job.RunnerRequestId, JobPhase.Assigned, null)))
+        var jobs = message.JobCompletedMessages.Select(job => new JobObservation(job.RunnerRequestId, ExecutorJobPhase.Completed, PositiveId(job.RunnerId)))
+            .Concat(message.JobStartedMessages.Select(job => new JobObservation(job.RunnerRequestId, ExecutorJobPhase.Started, PositiveId(job.RunnerId))))
+            .Concat(message.JobAssignedMessages.Select(job => new JobObservation(job.RunnerRequestId, ExecutorJobPhase.Assigned, null)))
             .Where(job => job.RequestId > 0)
-            .DistinctBy(job => job.RequestId)
+            .GroupBy(job => job.RequestId)
+            .Select(MergeJobFacts)
             .OrderBy(job => job.RequestId)
             .ToArray();
         return new DeliveryFacts(message.Statistics?.TotalAssignedJobs, offeredIds, jobs);
@@ -256,11 +260,26 @@ public sealed class GitHubListenerDeliveryHandler : IScaleSetListenerDeliveryHan
 
     private static long? PositiveId(long value) => value > 0 ? value : null;
 
+    private static string DeliveryDigest(DeliveryFacts facts) =>
+        Convert.ToHexString(SHA256.HashData(JsonSerializer.SerializeToUtf8Bytes(facts)));
+
+    private static JobObservation MergeJobFacts(IGrouping<long, JobObservation> observations)
+    {
+        var selected = observations.First();
+        var others = observations.Where(job => job.RunnerId is not null && job.RunnerId != selected.RunnerId)
+            .Select(job => job.RunnerId).Distinct().Take(2).ToArray();
+        if (others.Length == 2)
+        {
+            throw new InvalidDataException("GitHub delivery contains incompatible runner identities for a job.");
+        }
+        return selected with { RelatedRunnerId = others.SingleOrDefault() };
+    }
+
     private static ScaleSetListenerDeliveryDisposition Disposition(bool committed) => committed
         ? ScaleSetListenerDeliveryDisposition.Completed : ScaleSetListenerDeliveryDisposition.Deferred;
 
     private sealed record DeliveryFacts(int? Assigned, ImmutableArray<long> OfferedIds, JobObservation[] Jobs);
 
     private sealed record AdmissionBasis(
-        Entry<SessionDemand>? Demand, ListenerCapacity Capacity, IReadOnlyDictionary<LifecycleKey, long?> Guards);
+        Entry<SessionDemandObservation>? Demand, ListenerCapacity Capacity, IReadOnlyDictionary<LifecycleKey, long?> Guards);
 }

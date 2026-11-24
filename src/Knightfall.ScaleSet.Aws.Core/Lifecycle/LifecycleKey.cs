@@ -21,6 +21,9 @@ public enum LifecycleItemKind
     Hello = 16,
     Offer = 17,
     Status = 18,
+    RunnerInventory = 19,
+    ActiveRunner = 20,
+    Drain = 21,
 }
 
 public sealed record LifecycleProfile
@@ -98,6 +101,15 @@ public sealed record LifecycleKey
 
     public static LifecycleKey Runner(LifecycleProfile profile, string allocationId) =>
         ProfileItem(profile, "RUNNER#" + Identity(allocationId, nameof(allocationId)), LifecycleItemKind.Runner);
+
+    public static LifecycleKey RunnerInventory(LifecycleProfile profile) =>
+        ProfileItem(profile, "RUNNER-INVENTORY", LifecycleItemKind.RunnerInventory);
+
+    public static LifecycleKey ActiveRunner(LifecycleProfile profile, string allocationId) =>
+        ProfileItem(profile, "ACTIVE-RUNNER#" + Identity(allocationId, nameof(allocationId)), LifecycleItemKind.ActiveRunner);
+
+    public static LifecycleKey Drain(LifecycleProfile profile) =>
+        ProfileItem(profile, "DRAIN", LifecycleItemKind.Drain);
 
     public static LifecycleKey RunnerIdentity(LifecycleProfile profile, long runnerId)
     {

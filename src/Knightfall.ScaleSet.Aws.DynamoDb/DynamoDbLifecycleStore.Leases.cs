@@ -207,6 +207,38 @@ public sealed partial class DynamoDbLifecycleStore
                 put.ConditionExpression += " AND #until <= :clock";
                 put.ExpressionAttributeValues[":clock"] = NumberValue(before.ToUnixTimeMilliseconds());
             }
+            List<string> assignments = [];
+            int index = 0;
+            foreach (var value in item)
+            {
+                if (value.Key is "PK" or "SK")
+                {
+                    continue;
+                }
+                string name = FormattableString.Invariant($"#leaseField{index}");
+                string parameter = FormattableString.Invariant($":leaseValue{index++}");
+                put.ExpressionAttributeNames.Add(name, value.Key);
+                put.ExpressionAttributeValues.Add(parameter, value.Value);
+                assignments.Add(name + " = " + parameter);
+            }
+            string updateExpression = "SET " + string.Join(", ", assignments);
+            if (replacement.RequiredFencingTaskArn is null)
+            {
+                put.ExpressionAttributeNames.Add("#requiredTask", "requiredFencingTaskArn");
+                updateExpression += " REMOVE #requiredTask";
+            }
+            action = new TransactionAction(key, new TransactWriteItem
+            {
+                Update = new Update
+                {
+                    TableName = _tableName,
+                    Key = Key(key),
+                    ConditionExpression = put.ConditionExpression,
+                    ExpressionAttributeNames = put.ExpressionAttributeNames,
+                    ExpressionAttributeValues = put.ExpressionAttributeValues,
+                    UpdateExpression = updateExpression,
+                },
+            });
         }
 
         var outcome = await WriteAsync([action], replacement.TransitionId, cancellationToken).ConfigureAwait(false);

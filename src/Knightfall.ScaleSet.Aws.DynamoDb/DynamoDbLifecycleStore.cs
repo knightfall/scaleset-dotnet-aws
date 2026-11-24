@@ -71,6 +71,11 @@ public sealed partial class DynamoDbLifecycleStore
         var actions = new List<TransactionAction>(writes.Count + 1) { LeaseCondition(lease) };
         foreach (var write in writes)
         {
+            if (write.Key.Kind is LifecycleItemKind.Runner or LifecycleItemKind.RunnerIdentity or LifecycleItemKind.RunnerInventory or
+                LifecycleItemKind.ActiveRunner)
+            {
+                throw new ArgumentException("Executor records require their dedicated inventory transaction.", nameof(writes));
+            }
             actions.Add(BuildRecordWrite(lease.Deployment, transitionId, write));
         }
 
@@ -110,7 +115,9 @@ public sealed partial class DynamoDbLifecycleStore
         }
 
         long? expirationCheck = AllowsHistoryRetention(write.Key.Kind) ? _timeProvider.GetUtcNow().ToUnixTimeSeconds() : null;
-        return CompareAndPut(write.Key, item, write.ExpectedRevision, leaseDeployment, expirationCheck);
+        var action = CompareAndPut(write.Key, item, write.ExpectedRevision, leaseDeployment, expirationCheck);
+        ProtectCatalogRecordWrite(action);
+        return action;
     }
 
     private async Task<Dictionary<string, AttributeValue>?> ReadItemAsync(LifecycleKey key, CancellationToken cancellationToken)
@@ -360,7 +367,7 @@ public sealed partial class DynamoDbLifecycleStore
         ArgumentNullException.ThrowIfNull(key);
         if (key.Kind is LifecycleItemKind.Lease or LifecycleItemKind.Operation or LifecycleItemKind.ActiveOperation or
             LifecycleItemKind.Effects or LifecycleItemKind.EffectRebuild or LifecycleItemKind.Hello or LifecycleItemKind.Offer or
-            LifecycleItemKind.Status or LifecycleItemKind.Session)
+            LifecycleItemKind.Status or LifecycleItemKind.Session or LifecycleItemKind.Drain or LifecycleItemKind.ActiveRunner)
         {
             throw new ArgumentException("This lifecycle key requires its dedicated protocol.", nameof(key));
         }

@@ -6,7 +6,7 @@ using ScaleSet.Listener;
 
 namespace Knightfall.ScaleSet.Aws.GitHub;
 
-public sealed class GitHubListenerLane : IDisposable
+public sealed partial class GitHubListenerLane : IDisposable
 {
     private readonly DynamoDbLifecycleStore _store;
     private readonly GitHubListenerProfile _definition;

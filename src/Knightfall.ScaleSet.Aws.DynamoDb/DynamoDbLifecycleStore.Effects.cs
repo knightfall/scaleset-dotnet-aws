@@ -72,13 +72,25 @@ public sealed partial class DynamoDbLifecycleStore
         CancellationToken cancellationToken) =>
         WriteEffectAsync(profile, lease, transitionId, write, LeaseAccess.Recovery, cancellationToken);
 
+    internal Task<LifecycleWriteOutcome> WriteDispatchedEffectAsync(
+        LifecycleProfile profile,
+        DeploymentLeaseFence lease,
+        Guid transitionId,
+        EffectWrite write,
+        EffectDispatchGuard guard,
+        DateTimeOffset attemptDeadline,
+        CancellationToken cancellationToken) =>
+        WriteEffectAsync(profile, lease, transitionId, write, LeaseAccess.Active, cancellationToken, guard, attemptDeadline);
+
     private async Task<LifecycleWriteOutcome> WriteEffectAsync(
         LifecycleProfile profile,
         DeploymentLeaseFence lease,
         Guid transitionId,
         EffectWrite write,
         LeaseAccess leaseAccess,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        EffectDispatchGuard? guard = null,
+        DateTimeOffset? attemptDeadline = null)
     {
         RequireProfileLease(profile, lease);
         ArgumentNullException.ThrowIfNull(write);
@@ -97,6 +109,10 @@ public sealed partial class DynamoDbLifecycleStore
         var operationKey = LifecycleKey.Operation(profile, write.IntentId);
         var existing = await ReadEffectAsync(profile, write.IntentId, cancellationToken).ConfigureAwait(false);
         if (existing?.Revision != write.ExpectedRevision)
+        {
+            return LifecycleWriteOutcome.Conflict;
+        }
+        if (guard is not null && (head != guard.Index || existing?.State != EffectState.Planned))
         {
             return LifecycleWriteOutcome.Conflict;
         }
@@ -130,12 +146,19 @@ public sealed partial class DynamoDbLifecycleStore
             operation.Add("dueAtMillis", NumberValue(due.ToUnixTimeMilliseconds()));
         }
 
+        var leaseCondition = LeaseCondition(lease, leaseAccess, attemptDeadline);
         var actions = new List<TransactionAction>
         {
-            LeaseCondition(lease, leaseAccess),
+            leaseCondition,
             CompareAndPut(operationKey, operation, write.ExpectedRevision, profile.Deployment),
             WriteIndex(profile, nextIndex, head.Revision, transitionId),
         };
+        if (guard is not null)
+        {
+            RequireAppliedCatalog(leaseCondition, guard.Catalog);
+            actions.Add(CatalogProfileCondition(guard.Catalog));
+            actions.Add(RecordRevisionCondition(new LifecycleRecordCondition(LifecycleKey.Runner(profile, guard.AllocationId), guard.AllocationRevision)));
+        }
         if (delta > 0)
         {
             actions.Add(CreateMarker(profile, head.Generation, write.IntentId, transitionId));
@@ -183,21 +206,56 @@ public sealed partial class DynamoDbLifecycleStore
             return null;
         }
 
+        var next = page.Continuation is { } after ? new ActiveEffectCursor(head.Generation, head.Revision, after, seen) : null;
+        return new ActiveEffectPage(ReadMarkerIntents(profile, head.Generation, page), next);
+    }
+
+    internal async Task<EffectCandidatePage?> ReadEffectCandidatesAsync(
+        LifecycleProfile profile,
+        DeploymentLeaseFence lease,
+        EffectCandidateCursor? continuation,
+        CancellationToken cancellationToken)
+    {
+        RequireProfileLease(profile, lease);
+        var head = await ReadEffectIndexAsync(profile, cancellationToken).ConfigureAwait(false);
+        if (head is not { State: EffectIndexState.Ready } || !MatchesLease(head, lease))
+        {
+            return null;
+        }
+        string prefix = LifecycleKey.ActiveOperationPrefix(head.Generation);
+        if (continuation is { } cursor && (cursor.Generation != head.Generation ||
+            !cursor.AfterSortKey.StartsWith(prefix, StringComparison.Ordinal)))
+        {
+            return null;
+        }
+        var page = await ReadBasePageAsync(profile.PartitionKey, prefix, continuation?.AfterSortKey, cancellationToken).ConfigureAwait(false);
+        var current = await ReadEffectIndexAsync(profile, cancellationToken).ConfigureAwait(false);
+        if (current is not { State: EffectIndexState.Ready } || current.Generation != head.Generation || !MatchesLease(current, lease))
+        {
+            return null;
+        }
+
+        // The marker page supplies work candidates only. A changing count cannot prove absence.
+        var next = page.Continuation is { } after ? new EffectCandidateCursor(head.Generation, after) : null;
+        return new EffectCandidatePage(ReadMarkerIntents(profile, head.Generation, page), next);
+    }
+
+    private static ImmutableArray<string> ReadMarkerIntents(LifecycleProfile profile, Guid generation, BasePage page)
+    {
         var candidates = ImmutableArray.CreateBuilder<string>(page.Items.Count);
         foreach (var marker in page.Items)
         {
             string intent = Text(marker, "intentId");
-            var markerKey = LifecycleKey.ActiveOperation(profile, head.Generation, intent);
+            var markerKey = LifecycleKey.ActiveOperation(profile, generation, intent);
             RequireKey(marker, markerKey.PartitionKey, markerKey.SortKey);
             CheckNoExpiration(marker);
-            if (GuidValue(marker, "indexGeneration") != head.Generation || Text(marker, "deployment") != profile.Deployment)
+            if (GuidValue(marker, "indexGeneration") != generation || Text(marker, "deployment") != profile.Deployment)
             {
                 throw InvalidRecord();
             }
             candidates.Add(intent);
         }
-        var next = page.Continuation is { } after ? new ActiveEffectCursor(head.Generation, head.Revision, after, seen) : null;
-        return new ActiveEffectPage(candidates.MoveToImmutable(), next);
+        return candidates.MoveToImmutable();
     }
 
     public async Task<DueEffectHintPage> ReadDueHintsAsync(

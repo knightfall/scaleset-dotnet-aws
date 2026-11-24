@@ -1,6 +1,7 @@
 using System.Security.Cryptography;
 using System.Text.Json;
 using Amazon.DynamoDBv2.Model;
+using Knightfall.ScaleSet.Aws.Core.Catalog;
 using Knightfall.ScaleSet.Aws.Core.Configuration;
 using Knightfall.ScaleSet.Aws.Core.Lifecycle;
 
@@ -81,6 +82,12 @@ public sealed partial class DynamoDbLifecycleStore
         {
             return new SessionChange(LifecycleWriteOutcome.Conflict);
         }
+        var catalog = await ReadCatalogProfileAsync(binding.Profile, cancellationToken).ConfigureAwait(false);
+        if (catalog is not null && (catalog.State is not (CatalogProfileState.Active or CatalogProfileState.Draining) ||
+            catalog.Binding.ScopeIdentity != binding.ScopeIdentity || catalog.Binding.ScaleSetId != binding.ScaleSetId))
+        {
+            return new SessionChange(LifecycleWriteOutcome.Conflict);
+        }
         var registered = await EnsureEffectProfileAsync(lease, binding.Profile, cancellationToken).ConfigureAwait(false);
         if (registered != LifecycleWriteOutcome.Committed)
         {
@@ -89,16 +96,43 @@ public sealed partial class DynamoDbLifecycleStore
 
         var next = new SessionRecord(binding, lease, Guid.NewGuid(), SessionPhase.OpenIntent, null, ownerName,
             Guid.NewGuid(), start, end, NextRevision(expected?.Revision), Guid.NewGuid(), null, expected?.SessionId, "");
-        return await BeginSessionSendAsync(expected, next, started, upperUtcNow, cancellationToken).ConfigureAwait(false);
+        return await BeginSessionSendAsync(expected, next, started, upperUtcNow, cancellationToken, catalog).ConfigureAwait(false);
     }
 
-    public async Task<SessionChange> BeginSessionCloseAsync(
+    public Task<SessionChange> BeginSessionCloseAsync(
         SessionRecord expected,
         DeploymentLeaseFence lease,
         SessionCloseKind kind,
         DateTimeOffset upperUtcNow,
         DateTimeOffset deadline,
+        CancellationToken cancellationToken) =>
+        BeginSessionCloseCoreAsync(expected, lease, kind, upperUtcNow, deadline, cancellationToken);
+
+    internal Task<SessionChange> BeginProfileRetirementSessionCloseAsync(
+        SessionRecord expected,
+        DeploymentLeaseFence lease,
+        CatalogProfile held,
+        IReadOnlyList<LifecycleRecordCondition> readGuards,
+        DateTimeOffset upperUtcNow,
+        DateTimeOffset deadline,
         CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(expected);
+        ArgumentNullException.ThrowIfNull(held);
+        ArgumentNullException.ThrowIfNull(readGuards);
+        var kind = expected.Owner == lease ? SessionCloseKind.OwnedClient : SessionCloseKind.FencedRetirement;
+        return BeginSessionCloseCoreAsync(expected, lease, kind, upperUtcNow, deadline, cancellationToken, held, readGuards);
+    }
+
+    private async Task<SessionChange> BeginSessionCloseCoreAsync(
+        SessionRecord expected,
+        DeploymentLeaseFence lease,
+        SessionCloseKind kind,
+        DateTimeOffset upperUtcNow,
+        DateTimeOffset deadline,
+        CancellationToken cancellationToken,
+        CatalogProfile? held = null,
+        IReadOnlyList<LifecycleRecordCondition>? readGuards = null)
     {
         ArgumentNullException.ThrowIfNull(expected);
         RequireProfileLease(expected.Binding.Profile, lease);
@@ -121,6 +155,19 @@ public sealed partial class DynamoDbLifecycleStore
             return new SessionChange(LifecycleWriteOutcome.Conflict);
         }
 
+        var catalog = await ReadCatalogProfileAsync(expected.Binding.Profile, cancellationToken).ConfigureAwait(false);
+        if (held is null
+            ? catalog is { State: not (CatalogProfileState.Active or CatalogProfileState.Draining) }
+            : held.State != CatalogProfileState.ClosureHeld || !SameProfile(catalog, held))
+        {
+            return new SessionChange(LifecycleWriteOutcome.Conflict);
+        }
+        if (catalog is not null && (catalog.Binding.ScopeIdentity != expected.Binding.ScopeIdentity ||
+            catalog.Binding.ScaleSetId != expected.Binding.ScaleSetId))
+        {
+            return new SessionChange(LifecycleWriteOutcome.Conflict);
+        }
+
         var next = expected with
         {
             Owner = lease,
@@ -132,7 +179,7 @@ public sealed partial class DynamoDbLifecycleStore
             TransitionId = Guid.NewGuid(),
             CloseKind = kind,
         };
-        return await BeginSessionSendAsync(expected, next, started, upperUtcNow, cancellationToken).ConfigureAwait(false);
+        return await BeginSessionSendAsync(expected, next, started, upperUtcNow, cancellationToken, catalog, readGuards).ConfigureAwait(false);
     }
 
     public Task<SessionChange> ConfirmSessionOpenedAsync(
@@ -189,11 +236,12 @@ public sealed partial class DynamoDbLifecycleStore
     }
 
     private async Task<SessionChange> BeginSessionSendAsync(
-        SessionRecord? expected, SessionRecord next, long started, DateTimeOffset upperUtcNow, CancellationToken cancellationToken)
+        SessionRecord? expected, SessionRecord next, long started, DateTimeOffset upperUtcNow, CancellationToken cancellationToken,
+        CatalogProfile? catalog = null, IReadOnlyList<LifecycleRecordCondition>? retirementGuards = null)
     {
         next = next with { RequestSha256 = SessionRequestDigest(next) };
         var change = await WriteSessionTransitionAsync(
-            expected, next, next.Owner, next.AttemptDeadline, cancellationToken).ConfigureAwait(false);
+            expected, next, next.Owner, next.AttemptDeadline, cancellationToken, catalog, retirementGuards).ConfigureAwait(false);
         if (change.Outcome != LifecycleWriteOutcome.Committed || cancellationToken.IsCancellationRequested)
         {
             return change;
@@ -233,7 +281,9 @@ public sealed partial class DynamoDbLifecycleStore
         SessionRecord next,
         DeploymentLeaseFence lease,
         DateTimeOffset? sendDeadline,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        CatalogProfile? catalog = null,
+        IReadOnlyList<LifecycleRecordCondition>? retirementGuards = null)
     {
         var profile = next.Binding.Profile;
         var key = LifecycleKey.Session(profile);
@@ -265,21 +315,34 @@ public sealed partial class DynamoDbLifecycleStore
             item.Add("closeKind", StringValue(kind == SessionCloseKind.OwnedClient ? "owned-client" : "fenced-retirement"));
         }
 
+        var leaseCondition = LeaseCondition(lease, validThrough: sendDeadline);
         var actions = new List<TransactionAction>
         {
-            LeaseCondition(lease, validThrough: sendDeadline),
+            leaseCondition,
             CompareAndPut(key, item, expected?.Revision, profile.Deployment),
         };
         if (sendDeadline is not null)
         {
-            // An open must await prior reconciliation. Closing the exact queue can proceed independently.
-            actions.Add(EffectReadyCondition(profile, lease, requireNoUnfinished: next.Phase == SessionPhase.OpenIntent));
+            RequireCatalogSessionOpen(leaseCondition, catalog);
+            actions.Add(catalog is null ? CatalogAllowsSessionOpenCondition(profile, null) : CatalogProfileCondition(catalog));
+            LifecycleRecordCondition? effectGuard = null;
+            if (retirementGuards is not null &&
+                (expected is null || !AddRetirementCloseGuards(expected, retirementGuards, actions, out effectGuard)))
+            {
+                return new SessionChange(LifecycleWriteOutcome.Conflict);
+            }
+            actions.Add(EffectReadyCondition(profile, lease, effectGuard,
+                requireNoUnfinished: next.Phase == SessionPhase.OpenIntent || retirementGuards is not null));
         }
         if (next.Phase == SessionPhase.Active && next.SessionId is Guid newSession)
         {
             actions.Add(RecordRevisionCondition(new LifecycleRecordCondition(LifecycleKey.Checkpoint(profile, newSession), null)));
         }
 
+        if (actions.Count > MaximumTransactionItems)
+        {
+            return new SessionChange(LifecycleWriteOutcome.Conflict);
+        }
         var outcome = await WriteAsync(actions, Guid.NewGuid(), cancellationToken).ConfigureAwait(false);
         if (outcome is LifecycleWriteOutcome.Conflict or LifecycleWriteOutcome.Indeterminate &&
             await ReadSessionAsync(profile, cancellationToken).ConfigureAwait(false) == next)
@@ -287,6 +350,40 @@ public sealed partial class DynamoDbLifecycleStore
             outcome = LifecycleWriteOutcome.Committed;
         }
         return new SessionChange(outcome, outcome == LifecycleWriteOutcome.Committed ? next : null);
+    }
+
+    private bool AddRetirementCloseGuards(SessionRecord session, IReadOnlyList<LifecycleRecordCondition> readGuards,
+        List<TransactionAction> actions, out LifecycleRecordCondition? effectGuard)
+    {
+        var profile = session.Binding.Profile;
+        var guards = new Dictionary<LifecycleKey, LifecycleRecordCondition>();
+        effectGuard = null;
+        if (session.SessionId is not Guid sessionId)
+        {
+            return false;
+        }
+        foreach (var guard in readGuards)
+        {
+            if (guard.Key.PartitionKey != profile.PartitionKey || guard.ExpectedRevision is <= 0 ||
+                (guards.TryGetValue(guard.Key, out var prior) && prior != guard))
+            {
+                return false;
+            }
+            guards[guard.Key] = guard;
+        }
+
+        if (!guards.Remove(LifecycleKey.Session(profile), out var sessionGuard) || sessionGuard.ExpectedRevision != session.Revision ||
+            !guards.Remove(LifecycleKey.Effects(profile), out effectGuard) || effectGuard.ExpectedRevision is null ||
+            !guards.ContainsKey(LifecycleKey.Admission(profile)) ||
+            guards.GetValueOrDefault(LifecycleKey.Demand(profile))?.ExpectedRevision is null ||
+            guards.GetValueOrDefault(LifecycleKey.RunnerInventory(profile))?.ExpectedRevision is null ||
+            guards.GetValueOrDefault(LifecycleKey.Checkpoint(profile, sessionId))?.ExpectedRevision is null)
+        {
+            return false;
+        }
+
+        actions.AddRange(guards.Values.Select(RecordRevisionCondition));
+        return true;
     }
 
     private static bool MatchesCompletion(SessionRecord? current, SessionRecord intent, SessionPhase phase, Guid? sessionId) =>

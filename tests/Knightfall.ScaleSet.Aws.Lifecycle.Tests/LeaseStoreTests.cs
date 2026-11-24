@@ -177,7 +177,7 @@ public sealed class LeaseStoreTests
         Assert.Equal(nextDeadline, current.ValidUntil);
 
         var actions = table.Wire.Requests.Where(call => call.Operation == "TransactWriteItems")
-            .Select(call => Assert.Single(call.Request.GetProperty("TransactItems").EnumerateArray()).GetProperty("Put"))
+            .Select(call => Assert.Single(call.Request.GetProperty("TransactItems").EnumerateArray()).GetProperty("Update"))
             .ToArray();
         Assert.Equal(2, actions.Length);
         Assert.All(actions, put =>
