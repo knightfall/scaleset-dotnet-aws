@@ -1,4 +1,6 @@
 using System.Globalization;
+using System.Security.Cryptography;
+using System.Text;
 using System.Text.Json;
 using Amazon.EC2;
 using Amazon.ECS;
@@ -21,6 +23,7 @@ public sealed class ControllerQueuePumpTests
 {
     private const string Queue = "https://aws.fixture.invalid/111122223333/events";
     private const string OtherAllocation = "12345678-0000-0000-0000-000000000002";
+    private const string SuccessorTask = "arn:aws:ecs:us-east-1:000000000000:task/controller/00000000000000000000000000000002";
 
     [Fact(Timeout = 10_000)]
     public async Task Ec2HintsRefreshOnlyTheExactDurableBindingAndDoNotProveTermination()
@@ -60,9 +63,9 @@ public sealed class ControllerQueuePumpTests
                 {
                     Messages = new[]
                     {
-                        new { ReceiptHandle = "unowned", Body = Event(Instance3) },
-                        new { ReceiptHandle = "confirmed", Body = Event(Instance1) },
-                        new { ReceiptHandle = "mismatch", Body = Event(Instance2) },
+                        Message("unowned", Event(Instance3)),
+                        Message("confirmed", Event(Instance1)),
+                        Message("mismatch", Event(Instance2)),
                     },
                 }));
             }
@@ -92,14 +95,21 @@ public sealed class ControllerQueuePumpTests
         var clock = new QueueClock();
         var store = new DynamoDbLifecycleStore(table.Client, table.Name, clock);
         using var ownership = await StartOwnershipAsync(table, store, configuration, clock, token);
-        var old = Assert.IsType<ActiveControllerAuthority>(ownership.ReadAuthority()).Lease.Fence;
+        var predecessor = Assert.IsType<ActiveControllerAuthority>(ownership.ReadAuthority()).Lease;
+        var old = predecessor.Fence;
         using var wire = new AwsWireTransport(static request =>
         {
             Assert.EndsWith(".ReceiveMessage", request.Target);
-            return AwsWireTransport.Json("""{"Messages":[{"ReceiptHandle":"invalid","Body":"not-an-event"}]}""");
+            return AwsWireTransport.Json(JsonSerializer.Serialize(new { Messages = new[] { Message("invalid", "not-an-event") } }));
         });
-        wire.BeforeRespondAsync = async (_, ct) => await table.SetLeaseAsync(
-            old with { Epoch = old.Epoch + 1, OwnerId = "successor-owner" }, clock.GetUtcNow().AddMinutes(5), ct);
+        wire.BeforeRespondAsync = async (_, ct) =>
+        {
+            var now = clock.GetUtcNow();
+            Assert.Equal(LifecycleWriteOutcome.Committed, (await store.ReleaseLeaseAsync(predecessor, now, ct)).Outcome);
+            var successor = await store.TryAcquireLeaseAsync(old.Deployment, "successor-owner", SuccessorTask,
+                old.WriterProtocol, now, now.AddMinutes(5), ct);
+            Assert.Equal(LifecycleWriteOutcome.Committed, successor.Outcome);
+        };
         using var sqs = new AmazonSQSClient(AwsWireTransport.Credentials, wire.Configure(new AmazonSQSConfig()));
         using var ecs = new AmazonECSClient(AwsWireTransport.Credentials, wire.Configure(new AmazonECSConfig()));
         using var iam = new AmazonIdentityManagementServiceClient(AwsWireTransport.Credentials,
@@ -146,6 +156,16 @@ public sealed class ControllerQueuePumpTests
         {"source":"aws.ec2","detail-type":"EC2 Instance State-change Notification","account":"{{Account}}","region":"{{Region}}",
          "resources":["arn:aws:ec2:{{Region}}:{{Account}}:instance/{{instance}}"],"detail":{"instance-id":"{{instance}}","state":"terminated"} }
         """;
+
+    private static object Message(string receipt, string body) => new
+    {
+        MessageId = receipt,
+        ReceiptHandle = receipt,
+        Body = body,
+#pragma warning disable CA5351 // The SQS protocol's content checksum uses MD5.
+        MD5OfBody = Convert.ToHexStringLower(MD5.HashData(Encoding.UTF8.GetBytes(body))),
+#pragma warning restore CA5351
+    };
 
     private sealed class QueueClock : TimeProvider
     {
