@@ -74,7 +74,7 @@ app="node bin/controller.ts --config '$source_yaml' --generation $generation --t
 
 (
   cd cdk
-  ./node_modules/.bin/cdk synth Controller --app "$app" --outdir "$assembly" --strict --no-lookups
+  ./node_modules/.bin/cdk synth Controller --app "$app" --output "$assembly" --strict --no-lookups
   ./node_modules/.bin/cdk diff Controller --app "$assembly" --method template --no-lookups
 )
 ```
