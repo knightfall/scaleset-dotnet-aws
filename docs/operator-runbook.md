@@ -81,7 +81,7 @@ Compare the published manifest with the qualified archive. If registry transport
 
 ## Review synth and diff
 
-Select a positive generation greater than the deployed generation. Use the same candidate YAML, Fargate preflight JSON, and optional host telemetry settings for both review and apply. The examples assume paths without single quotes. Omit `--telemetry` and its argument to use the defaults. Keep the Fargate approval and fresh quota evidence in the invoking environment when the enabled Fargate profiles require them. [Fargate preflight input](controller-local.md#controller-preflights) · [Telemetry deployment settings](operator-telemetry.md)
+Select a positive generation greater than the deployed generation. Use the same candidate YAML, Fargate preflight JSON, and optional host telemetry settings for both review and apply. The examples assume paths without single quotes. Omit `--telemetry` and its argument to use the defaults. Include the Fargate approvals and the designated quota source when enabled Fargate profiles require them. Verify that the source has a current sample before activation. [Fargate preflight input](controller-local.md#controller-preflights) · [Telemetry deployment settings](operator-telemetry.md)
 
 ```sh
 generation=1

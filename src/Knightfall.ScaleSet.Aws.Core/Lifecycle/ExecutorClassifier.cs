@@ -10,6 +10,7 @@ public static class ExecutorClassifier
     private static readonly ExecutorClassification Idle = new(true, false, false, RunnerSlotState.Idle);
     private static readonly ExecutorClassification Busy = new(true, false, false, RunnerSlotState.Busy);
     private static readonly ExecutorClassification Completed = new(true, false, true, RunnerSlotState.Unknown);
+    private static readonly ExecutorClassification Warm = Unknown with { CoversIdleReserve = true };
 
     public static ExecutorClassification Classify(
         ExecutorState executor, DateTimeOffset now, TimeSpan freshness, TimeSpan logFlushGrace)
@@ -36,7 +37,16 @@ public static class ExecutorClassifier
         {
             return Starting;
         }
-        if (resource.State != ExecutorResourceState.Running || executor.RunnerId is not long runnerId)
+        if (resource.State != ExecutorResourceState.Running)
+        {
+            return Unknown;
+        }
+        // A fresh, exact Fargate allocation covers only the warm reserve, including before GitHub registration.
+        if (executor.Binding.Provider is FargateExecutorIdentity && executor.Job is null && executor.Process is null)
+        {
+            return Warm;
+        }
+        if (executor.RunnerId is not long runnerId)
         {
             return Unknown;
         }

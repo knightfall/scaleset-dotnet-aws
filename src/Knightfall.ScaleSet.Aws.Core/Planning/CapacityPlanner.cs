@@ -69,8 +69,10 @@ public static class CapacityPlanner
         int? target = demandStatus == ObservationStatus.Fresh && demand is not null
             ? (int)Math.Min(effectiveMax, (long)demand.TotalAssignedJobs + reserve)
             : null;
-        int? deficit = target is int knownTarget && inventoryComplete && slots is not null
-            ? Math.Max(0, knownTarget - slots.Serving - slots.Pending)
+        // Only the reserve portion of a capped target can be filled by an allocation without process readiness.
+        int? deficit = target is int knownTarget && demand is not null && inventoryComplete && slots is not null
+            ? Math.Max(0, knownTarget - slots.Serving - slots.Pending -
+                Math.Min(slots.Warm, Math.Max(0, knownTarget - demand.TotalAssignedJobs)))
             : null;
 
         var plan = new CapacityPlan(
@@ -155,6 +157,7 @@ public static class CapacityPlanner
         var busy = 0;
         var pending = 0;
         var uncertain = 0;
+        var warm = 0;
         foreach (var slot in inventory.Slots)
         {
             if (slot is null || string.IsNullOrWhiteSpace(slot.Id) || !ids.Add(slot.Id))
@@ -188,13 +191,17 @@ public static class CapacityPlanner
                     pending++;
                     break;
                 default:
+                    if (slot.State == RunnerSlotState.Unknown && slot.CoversIdleReserve)
+                    {
+                        warm++;
+                    }
                     uncertain++;
                     break;
             }
         }
 
         orphans.Sort(StringComparer.Ordinal);
-        return new SlotSummary(inventory.Slots.Length, serving, busy, pending, uncertain, orphans.ToImmutable());
+        return new SlotSummary(inventory.Slots.Length, serving, busy, pending, uncertain, warm, orphans.ToImmutable());
     }
 
     private sealed record SlotSummary(
@@ -203,5 +210,6 @@ public static class CapacityPlanner
         int Busy,
         int Pending,
         int Uncertain,
+        int Warm,
         ImmutableArray<string> Orphans);
 }

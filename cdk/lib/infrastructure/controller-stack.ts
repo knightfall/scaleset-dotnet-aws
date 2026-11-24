@@ -2,7 +2,14 @@ import { createHash } from "node:crypto";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { App, CfnOutput, Duration, RemovalPolicy, Stack } from "aws-cdk-lib";
+import {
+  App,
+  ArnFormat,
+  CfnOutput,
+  Duration,
+  RemovalPolicy,
+  Stack,
+} from "aws-cdk-lib";
 import * as dynamodb from "aws-cdk-lib/aws-dynamodb";
 import * as ecs from "aws-cdk-lib/aws-ecs";
 import * as events from "aws-cdk-lib/aws-events";
@@ -111,6 +118,25 @@ export class ControllerInfrastructure extends Stack {
         conditions: { StringEquals: { "s3:VersionId": artifact.versionId } },
       }),
     );
+    if (fargatePreflight?.quotaSource) {
+      const { bucket, key } = fargatePreflight.quotaSource;
+      this.controllerRole.addToPolicy(
+        new iam.PolicyStatement({
+          actions: ["s3:GetObject"],
+          resources: [
+            this.formatArn({
+              service: "s3",
+              account: "",
+              region: "",
+              resource: bucket,
+              resourceName: key,
+              arnFormat: ArnFormat.SLASH_RESOURCE_NAME,
+            }),
+          ],
+          conditions: { StringEquals: { "s3:ResourceAccount": this.account } },
+        }),
+      );
+    }
     if (!active) {
       this.grantSnapshot(runtime);
     }
@@ -181,7 +207,7 @@ export class ControllerInfrastructure extends Stack {
       clusterArn: this.hostingCluster.arn,
       taskRole: this.controllerRole,
       command: this.runtimeArguments,
-      fargatePreflight,
+      fargatePreflight: fargatePreflight?.environment,
       telemetry,
     });
     new CfnOutput(this, "DeploymentIdentity", {

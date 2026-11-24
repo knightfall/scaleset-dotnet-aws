@@ -126,6 +126,70 @@ test("explicit Fargate preflight changes only the controller task definition env
   assert.deepEqual(wholeTemplate, defaultTemplate.toJSON());
 });
 
+test("refreshable Fargate quota grants the controller only one same-account S3 object", () => {
+  const config = fixture("mixed-ec2-fargate");
+  const quotaSource = {
+    bucket: "approved-quota-samples",
+    key: "usage/on-demand.json",
+  };
+  const raw = JSON.stringify({
+    profiles: { "linux-shell": shellApproval },
+    quotaSource,
+  });
+  const template = synthesize(config, raw);
+  template.hasResourceProperties("AWS::ECS::TaskDefinition", {
+    ContainerDefinitions: Match.arrayWith([
+      Match.objectLike({
+        Name: "Controller",
+        Environment: [{ Name: "SCALESET_FARGATE_PREFLIGHT", Value: raw }],
+      }),
+    ]),
+  });
+  assert.deepEqual(
+    rolePolicy(template).filter(({ Action }) =>
+      [Action].flat().includes("s3:GetObject"),
+    ),
+    [
+      {
+        Action: "s3:GetObject",
+        Condition: { StringEquals: { "s3:ResourceAccount": quota.account } },
+        Effect: "Allow",
+        Resource: {
+          "Fn::Join": [
+            "",
+            [
+              "arn:",
+              { Ref: "AWS::Partition" },
+              ":s3:::approved-quota-samples/usage/on-demand.json",
+            ],
+          ],
+        },
+      },
+    ],
+  );
+  assert.ok(!actions(template).has("s3:PutObject"));
+  assert.ok(!actions(template).has("s3:ListBucket"));
+  for (const source of [
+    { ...quotaSource, key: "usage/*" },
+    { ...quotaSource, key: "usage/../on-demand.json" },
+    { ...quotaSource, key: "usage/on-demand.json\n" },
+    { ...quotaSource, bucket: "Approved-Quota" },
+    { ...quotaSource, account: quota.account },
+  ]) {
+    assert.throws(
+      () =>
+        synthesize(
+          config,
+          JSON.stringify({ profiles: {}, quotaSource: source }),
+        ),
+      {
+        message:
+          "SCALESET_FARGATE_PREFLIGHT is invalid for the configured deployment.",
+      },
+    );
+  }
+});
+
 test("Fargate preflight is available in inspection mode and refuses unrelated profiles or modes", () => {
   const mixed = fixture("mixed-ec2-fargate");
   const inspection = rewrite(mixed, {

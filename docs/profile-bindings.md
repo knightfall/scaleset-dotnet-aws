@@ -113,7 +113,24 @@ Record evidence for the exact AMI, Launch Template version, runner version, boot
 3. Run the approved runner on the actual Fargate platform, with its real `/dev/shm` mount flags and task-local scratch volume. Verify the bounded RAM root and either `noswap` or a zero effective cgroup v2 swap limit. Exercise the image's one-job launcher with `noexec` RAM storage, using the executable muxer and child launcher in the read-only image. Verify RAM cleanup and native terminal task evidence after the essential process exits. Keep the Fargate task role limited to its own HELLO and OFFER operations, with zero `STATUS#` access. [Fargate RAM-backed runner configuration](fargate-runner-bootstrap.md#ram-backed-runner-configuration)
 4. Determine the applied On-Demand Fargate vCPU quota in the selected account and Region with `aws_read service-quotas list-service-quotas --service-code fargate`. Pair it with fresh, conservative account usage for `AWS/Usage` `ResourceCount` with dimensions `Service=Fargate`, `Type=Resource`, `Resource=vCPU`, and `Class=Standard/OnDemand`. Convert vCPU headroom to CPU units at 1,024 per vCPU. Record remaining headroom after observed usage and reserve headroom for other workloads. Verify subnet IPv4 availability alongside CPU. Known zero holds launches. Unavailable, ambiguous, or stale evidence also holds new launches. [Applied quotas](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/service-quotas.html) · [Fargate usage metrics](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/monitoring-fargate-usage.html)
 
-Supply the exact per-profile image, entry point, command, and scratch paths and account-level quota observation through `SCALESET_FARGATE_PREFLIGHT`. Its quota includes `account`, `region`, `observedAt`, `expiresAt`, `remainingCpuUnits`, and `reservedCpuUnits`. The controller also accounts for tracked launch reservations. The observation must be at most ten minutes old and before its explicit expiry when used. The controller reads this deployment input at startup. Refresh it through a reviewed deployment before relying on new Fargate launch headroom. [Controller preflight input](controller-local.md#controller-preflights)
+Supply the exact per-profile image, entry point, command, and scratch paths through `SCALESET_FARGATE_PREFLIGHT`. To refresh launch headroom without redeploying, configure `quotaSource` with the bucket and exact object key of an observation published by a trusted operator or scheduled job. Use a private, general-purpose S3 bucket in the deployment account and Region, with S3-managed encryption and a bucket name without dots. CDK grants the controller only `s3:GetObject` on that exact object. The controller also supplies the deployment account as the expected bucket owner. Restrict writes to that object to the observation publisher. [Controller preflight input](controller-local.md#controller-preflights) · [S3 expected bucket owner](https://docs.aws.amazon.com/AmazonS3/latest/userguide/bucket-owner-condition.html)
+
+Publish a complete UTF-8 JSON object of at most 4 KiB in one `PutObject`. The following example shows the payload shape.
+
+```json
+{
+  "account": "111122223333",
+  "region": "ap-southeast-2",
+  "observedAt": "2026-11-24T09:00:00Z",
+  "expiresAt": "2026-11-24T09:10:00Z",
+  "remainingCpuUnits": 8192,
+  "reservedCpuUnits": 1024
+}
+```
+
+Use the start of the measured usage window for `observedAt` so delayed metrics cannot make tracked launches disappear from the reservation calculation. Cover all regional On-Demand Fargate usage, including ECS services and EKS Fargate pods. Reserve CPU margin for workloads and pending allocations whose usage may lag the metric. Include launch pressure from controllers outside the deployment lease in that margin. Publish a new observation before the old sample expires and validate the source against known workload usage in the target. During qualification, stop the publisher or deny the controller's object read and check that new starts hold, then restore a current sample and check that they resume. [Fargate regional usage](https://docs.aws.amazon.com/eks/latest/userguide/monitoring-fargate-usage.html)
+
+The controller checks the source at most once per 30 seconds in a reconciliation pass, with a three-second read budget. A sample must match the configured account and Region, be at most ten minutes old, and be before its expiry. Read errors and invalid or expired samples hold new starts. The controller combines the sample with tracked launch reservations across the deployment and current subnet IP evidence. S3 qualification should include the actual task role and its network path to S3. An older inline `quota` observation remains supported when no source is set and expires on the same schedule.
 
 ### Secrets and role separation
 

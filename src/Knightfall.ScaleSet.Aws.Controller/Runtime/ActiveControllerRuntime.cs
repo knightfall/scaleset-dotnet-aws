@@ -56,6 +56,8 @@ internal static class ActiveControllerRuntime
             ? new FargateProfileInspector(ecs, iam, new FargateNetworkReader(clients.Ec2Network()), clock) : null;
         var fargateEvidence = fargateInspector is null ? null : FargateRuntimeEvidence.Load(configuration,
             Environment.GetEnvironmentVariable(FargateRuntimeEvidence.EnvironmentVariable));
+        var fargateQuota = fargateEvidence is null ? null : new FargateQuotaReader(configuration.Aws, fargateEvidence,
+            fargateEvidence.QuotaSource is null ? null : clients.S3(), clock);
         var fargateInventory = new ConcurrentDictionary<string, FargateInventorySnapshot>(StringComparer.Ordinal);
         var backends = new Dictionary<LifecycleProfile, IRunnerBackend>();
         foreach (var profile in configured)
@@ -71,7 +73,7 @@ internal static class ActiveControllerRuntime
             else
             {
                 backends.Add(key, new FargateRunnerBackend(configuration, profile, key, fargateInspector!, fargateEvidence!,
-                    fargateKeys, fargateInventory, store, journal, dispatcher, clock, EffectTiming.ObservationFreshness));
+                    fargateQuota!, fargateKeys, fargateInventory, store, journal, dispatcher, clock, EffectTiming.ObservationFreshness));
             }
         }
 

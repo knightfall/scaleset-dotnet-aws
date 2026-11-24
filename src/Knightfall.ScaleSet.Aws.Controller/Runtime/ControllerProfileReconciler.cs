@@ -153,7 +153,10 @@ internal sealed class ControllerProfileReconciler(
             {
                 // The sample's cut-off can precede a concurrent event update. Such a start adds no credible pending capacity.
                 var start = executor.State.StartedAt <= cloud.ObservedAt ? executor.State.StartedAt : null;
-                slots.Add(new RunnerSlot(executor.Binding.ResourceArn, classified.SlotState, OwnershipVerified: true, start));
+                slots.Add(new RunnerSlot(executor.Binding.ResourceArn, classified.SlotState, OwnershipVerified: true, start)
+                {
+                    CoversIdleReserve = classified.CoversIdleReserve,
+                });
             }
         }
         for (int index = 0; index < unowned; index++)

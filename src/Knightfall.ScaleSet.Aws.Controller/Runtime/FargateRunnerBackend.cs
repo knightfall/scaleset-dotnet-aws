@@ -11,7 +11,7 @@ namespace Knightfall.ScaleSet.Aws.Controller.Runtime;
 
 internal sealed class FargateRunnerBackend(
     RuntimeConfiguration configuration, RunnerProfile profile, LifecycleProfile key, FargateProfileInspector inspector,
-    FargateRuntimeEvidence evidence, IReadOnlyCollection<LifecycleProfile> deploymentProfiles,
+    FargateRuntimeEvidence evidence, FargateQuotaReader quota, IReadOnlyCollection<LifecycleProfile> deploymentProfiles,
     ConcurrentDictionary<string, FargateInventorySnapshot> deploymentInventory,
     DynamoDbLifecycleStore store, DynamoDbEffectJournal journal, DynamoDbEffectDispatcher dispatcher,
     TimeProvider clock, TimeSpan observationFreshness) : IRunnerBackend
@@ -38,7 +38,8 @@ internal sealed class FargateRunnerBackend(
             {
                 verified = approved;
                 var reservations = await ReadReservationsAsync(lease.Fence, cancellationToken).ConfigureAwait(false);
-                var headroom = inspector.EstimateHeadroom(approved, inventory, evidence.Quota, reservations,
+                var sample = await quota.ReadAsync(cancellationToken).ConfigureAwait(false);
+                var headroom = inspector.EstimateHeadroom(approved, inventory, sample, reservations,
                     deploymentInventory.Values.ToArray());
                 launchHeadroom = headroom.LaunchSlots;
                 if (launchHeadroom > 0)
@@ -169,6 +170,10 @@ internal sealed class FargateRunnerBackend(
     private RunnerBackendResource? ProjectResource(FargateInventorySnapshot inventory, FargateTaskObservation task,
         FargateResolvedTask? preflight)
     {
+        if (task.IsForeign)
+        {
+            return null;
+        }
         if (!inventory.IsProfileComplete || task.AllocationId is not Guid allocation ||
             task.Incarnation is not Guid incarnation || task.TaskDefinitionArn != inventory.Scope.TaskDefinitionArn)
         {

@@ -3,12 +3,14 @@ using System.Collections.Specialized;
 using System.Globalization;
 using System.Net;
 using System.Net.Http.Headers;
+using System.Text.Json;
 using System.Web;
 using System.Xml.Linq;
 using Amazon.ECS;
 using Amazon.ECS.Model;
 using Amazon.Runtime;
 using Knightfall.ScaleSet.Aws.Core.Lifecycle;
+using Knightfall.ScaleSet.Aws.Providers.Fargate;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Http;
@@ -26,11 +28,13 @@ internal sealed record HeldEc2Launch(Guid AllocationId, string ClientToken, stri
 /// <summary>Keeps worker AWS calls on loopback and applies the provider-specific MiniStack corrections.</summary>
 internal sealed class MixedControllerCloud : IAsyncDisposable
 {
+    internal const string QuotaBucket = "mixed-fargate-quota-fixture";
+    internal const string QuotaKey = "capacity/on-demand.json";
     internal const string Account = FargateNativeFixture.Account;
     internal const string Region = FargateNativeFixture.Region;
     private const string EcsTarget = "AmazonEC2ContainerServiceV20141113.";
     private static readonly string[] RelayHeaders = ["Authorization", "X-Amz-Date", "X-Amz-Target", "X-Amz-Security-Token"];
-    private static readonly System.Text.Json.JsonSerializerOptions WireNames = new();
+    private static readonly JsonSerializerOptions WireNames = new();
     internal static readonly BasicAWSCredentials Credentials = new(Account, "test-only-secret");
 
     private readonly WebApplication _app;
@@ -46,6 +50,7 @@ internal sealed class MixedControllerCloud : IAsyncDisposable
 
     private string? _holdTemplate;
     private string? _recoveryToken;
+    private byte[]? _quotaSample;
     private int _degradeEc2;
 
     private MixedControllerCloud(WebApplication app, Uri nativeEndpoint)
@@ -90,6 +95,7 @@ internal sealed class MixedControllerCloud : IAsyncDisposable
         try
         {
             app.MapGet("/v4/{id}/task", relay.ReadMetadata);
+            app.MapGet($"/{QuotaBucket}/{QuotaKey}", relay.ReadQuota);
             app.MapPost("/", relay.RelayAsync);
             await app.StartAsync(token);
             return relay;
@@ -101,7 +107,8 @@ internal sealed class MixedControllerCloud : IAsyncDisposable
         }
     }
 
-    internal async Task<string> StartControllerTaskAsync(string clusterArn, string definitionArn, string subnet, CancellationToken cancellationToken)
+    internal async Task<string> StartControllerTaskAsync(
+        string clusterArn, string definitionArn, string subnet, CancellationToken cancellationToken, string? group = null)
     {
         using var ecs = new AmazonECSClient(Credentials, _ecsWire.Configure<AmazonECSConfig>());
         string id = Guid.NewGuid().ToString("N");
@@ -113,6 +120,7 @@ internal sealed class MixedControllerCloud : IAsyncDisposable
             LaunchType = LaunchType.FARGATE,
             ClientToken = id,
             StartedBy = id,
+            Group = group,
             NetworkConfiguration = new NetworkConfiguration
             {
                 AwsvpcConfiguration = new AwsVpcConfiguration { AssignPublicIp = AssignPublicIp.DISABLED, Subnets = [subnet] },
@@ -126,6 +134,17 @@ internal sealed class MixedControllerCloud : IAsyncDisposable
     }
 
     internal Uri MetadataUri(string taskArn) => new(Endpoint, "v4/" + ShortId(taskArn));
+
+    internal void PublishQuota(FargateQuotaEvidence evidence) =>
+        Volatile.Write(ref _quotaSample, JsonSerializer.SerializeToUtf8Bytes(evidence, JsonSerializerOptions.Web));
+
+    private IResult ReadQuota(HttpContext context)
+    {
+        _calls.Enqueue(new MixedCloudCall("s3", "GetQuota", string.Empty));
+        return context.Request.Headers["x-amz-expected-bucket-owner"] == Account &&
+            Volatile.Read(ref _quotaSample) is { } bytes
+            ? Results.Bytes(bytes, "application/json") : Results.NotFound();
+    }
 
     internal void SetClock(string taskArn, bool healthy) => _metadata[ShortId(taskArn)].SetClock(healthy);
 

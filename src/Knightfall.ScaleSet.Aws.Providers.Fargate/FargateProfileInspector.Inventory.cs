@@ -180,6 +180,26 @@ public sealed partial class FargateProfileInspector
         tags.GetValueOrDefault(RunnerOwnershipTags.Deployment) == target.Scope.Deployment &&
         tags.GetValueOrDefault(RunnerOwnershipTags.Profile) == target.Scope.ProfileId;
 
+    private static bool IsForeignProfileTask(InventoryTarget target, EcsTask task, Dictionary<string, string> tags)
+    {
+        var deployment = tags.GetValueOrDefault(RunnerOwnershipTags.Deployment);
+        var profile = tags.GetValueOrDefault(RunnerOwnershipTags.Profile);
+        if (profile == target.Scope.ProfileId && (deployment is null || deployment == target.Scope.Deployment))
+        {
+            return false;
+        }
+        if (task.TaskDefinitionArn != target.Scope.TaskDefinitionArn ||
+            task.Group?.StartsWith("service:", StringComparison.Ordinal) == true)
+        {
+            return true;
+        }
+        // A standalone task using the same definition and with incomplete ownership evidence is ambiguous.
+        return tags.GetValueOrDefault(RunnerOwnershipTags.Controller) == RunnerOwnershipTags.ControllerValue &&
+            !string.IsNullOrWhiteSpace(deployment) && !string.IsNullOrWhiteSpace(profile) &&
+            Guid.TryParseExact(tags.GetValueOrDefault(RunnerOwnershipTags.Allocation), "D", out var allocation) &&
+            allocation != Guid.Empty && task.StartedBy == StartedBy(allocation);
+    }
+
     private static FargateTaskObservation ParseTask(InventoryTarget target, EcsTask task, Dictionary<string, string>? tags,
         DateTimeOffset observedAt, DateTimeOffset attachmentObservedAt, out bool exact)
     {
@@ -217,7 +237,10 @@ public sealed partial class FargateProfileInspector
         }
         return new FargateTaskObservation(task.TaskArn, task.TaskDefinitionArn, state, ReadCreatedAt(task.CreatedAt, observedAt),
             allocation, incarnation, attached, attached.IsEmpty ? null : attachmentObservedAt, inScope, task.EnableExecuteCommand,
-            task.Version is >= 0 ? task.Version : null);
+            task.Version is >= 0 ? task.Version : null)
+        {
+            IsForeign = exact && tags is not null && IsForeignProfileTask(target, task, tags),
+        };
     }
 
     /// <summary>ECS may echo an empty override or only the container name for an unchanged launch.</summary>

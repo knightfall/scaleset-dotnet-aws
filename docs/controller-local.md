@@ -40,7 +40,7 @@ dotnet /app/Knightfall.ScaleSet.Aws.Controller.dll preflight table --config /run
 dotnet /app/Knightfall.ScaleSet.Aws.Controller.dll preflight clock --config /runtime.json --sha256 "$runtime_sha256"
 ```
 
-Set `SCALESET_FARGATE_PREFLIGHT` when invoking the CDK synthesis or deployment entry point to supply nonsecret runner approvals and operator-verified Fargate quota evidence. CDK copies the JSON to the controller task only. The following example uses the `linux-shell` profile and its approved task definition. Replace the example image, exact argument and mount arrays, capacity values, and timestamps with verified values for your deployment. Times include an explicit UTC offset.
+Set `SCALESET_FARGATE_PREFLIGHT` when invoking the CDK synthesis or deployment entry point to supply runner approvals and a quota evidence source. CDK copies the nonsecret JSON to the controller task. This example uses the `linux-shell` profile and its approved task definition. Replace the example image, exact argument and mount arrays, and S3 source with the approved values for your deployment.
 
 ```sh
 export SCALESET_FARGATE_PREFLIGHT='{
@@ -52,19 +52,15 @@ export SCALESET_FARGATE_PREFLIGHT='{
       "scratchMountPaths": ["/work"]
     }
   },
-  "quota": {
-    "account": "111122223333",
-    "region": "ap-southeast-2",
-    "observedAt": "2026-11-24T09:00:00Z",
-    "expiresAt": "2026-11-24T09:15:00Z",
-    "remainingCpuUnits": 8192,
-    "reservedCpuUnits": 1024
+  "quotaSource": {
+    "bucket": "example-fargate-quota-observations",
+    "key": "capacity/on-demand.json"
   }
 }'
 npm --prefix cdk run synth
 ```
 
-The input supports up to 16 KiB of UTF-8. Use it with enabled Fargate profiles in active or AWS-inspection mode. The values appear in the synthesized task definition, so keep credentials and secrets out of the argument arrays. The controller checks the actual task definition and freshness of quota evidence at runtime.
+The input supports up to 16 KiB of UTF-8. Use it with enabled Fargate profiles in active or AWS-inspection mode. The values appear in the synthesized task definition, so keep credentials and secrets out of the argument arrays. The controller checks the actual task definition and refreshes quota evidence from the configured object. Existing configurations with inline `quota` still work until the observation expires. See [Fargate quota qualification](profile-bindings.md#fargate-task-network-and-quota) for the observation format and publisher contract.
 
 ## Build the OCI archives
 

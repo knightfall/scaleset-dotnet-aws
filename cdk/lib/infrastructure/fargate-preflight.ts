@@ -6,6 +6,16 @@ export const fargatePreflightEnvironmentName = "SCALESET_FARGATE_PREFLIGHT";
 const maximumBytes = 16 * 1024;
 const maximumCpuUnits = 9_223_372_036_854_775_807n;
 
+interface FargateQuotaObject {
+  readonly bucket: string;
+  readonly key: string;
+}
+
+interface FargatePreflight {
+  readonly environment: string;
+  readonly quotaSource: FargateQuotaObject | undefined;
+}
+
 function invalid(): never {
   throw new Error(
     "SCALESET_FARGATE_PREFLIGHT is invalid for the configured deployment.",
@@ -132,6 +142,21 @@ function validQuota(
   );
 }
 
+function validQuotaSource(value: unknown): value is FargateQuotaObject {
+  return (
+    isRecord(value) &&
+    containsOnly(value, ["bucket", "key"]) &&
+    typeof value.bucket === "string" &&
+    typeof value.key === "string" &&
+    /^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$/u.exec(value.bucket)?.[0] ===
+      value.bucket &&
+    /^[A-Za-z0-9][A-Za-z0-9._/-]{0,511}$/u.exec(value.key)?.[0] === value.key &&
+    value.key
+      .split("/")
+      .every((segment) => segment !== "" && segment !== "." && segment !== "..")
+  );
+}
+
 function readJson(input: string): unknown {
   // JSON supplies the syntax and exact source for integer tokens. The YAML
   // AST adds duplicate-member rejection, which JSON.parse omits.
@@ -166,7 +191,7 @@ function readJson(input: string): unknown {
 export function validateFargatePreflight(
   runtime: RunnerControllerRuntime,
   input?: string,
-): string | undefined {
+): FargatePreflight | undefined {
   if (input === undefined) return undefined;
   const { spec } = runtime;
   const enabled = new Set(
@@ -196,7 +221,7 @@ export function validateFargatePreflight(
   }
   if (
     !isRecord(value) ||
-    !containsOnly(value, ["profiles", "quota"]) ||
+    !containsOnly(value, ["profiles", "quota", "quotaSource"]) ||
     !isRecord(value.profiles) ||
     Object.entries(value.profiles).some(
       ([profile, approval]) =>
@@ -205,5 +230,8 @@ export function validateFargatePreflight(
     (value.quota != null && !validQuota(value.quota, spec.aws))
   )
     return invalid();
-  return input;
+
+  const quotaSource = value.quotaSource;
+  if (quotaSource != null && !validQuotaSource(quotaSource)) return invalid();
+  return { environment: input, quotaSource: quotaSource ?? undefined };
 }

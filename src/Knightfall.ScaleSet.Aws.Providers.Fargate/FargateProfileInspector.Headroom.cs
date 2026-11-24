@@ -74,9 +74,7 @@ public sealed partial class FargateProfileInspector
 
         int? ipSlots = Fresh(task.SubnetSampleStartedAt, now) && task.Subnets.All(subnet => subnet.AvailableIpAddresses is >= 0)
             ? ClampSlots(task.Subnets.Sum(subnet => (long)subnet.AvailableIpAddresses!.Value) - reservedIp) : null;
-        int? cpuSlots = quota is { RemainingCpuUnits: >= 0, ReservedCpuUnits: >= 0 } &&
-            quota.Account == task.Scope.Account && quota.Region == task.Scope.Region &&
-            Fresh(quota.ObservedAt, now) && quota.ExpiresAt > now
+        int? cpuSlots = quota?.IsCurrentFor(task.Scope.Account, task.Scope.Region, now) == true
             ? ClampSlots(Math.Max(0, Math.Max(0, quota.RemainingCpuUnits - quota.ReservedCpuUnits) - reservedCpu) / task.CpuUnits) : null;
         int? launchSlots = ipSlots.HasValue && cpuSlots.HasValue ? Math.Min(ipSlots.Value, cpuSlots.Value) : null;
         return new FargateHeadroom(ipSlots, cpuSlots, launchSlots);

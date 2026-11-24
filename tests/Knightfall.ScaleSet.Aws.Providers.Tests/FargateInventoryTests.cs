@@ -325,16 +325,46 @@ public sealed class FargateInventoryTests
     }
 
     [Fact]
+    public async Task PlanningKeepsAmbiguousStandaloneTasksAndExcludesPositiveForeignIdentities()
+    {
+        var token = TestContext.Current.CancellationToken;
+        var knownService = TaskRow(SecondTask);
+        knownService["group"] = "service:unrelated";
+        var peerRunner = TaskRow(ThirdTask, OtherAllocation);
+        var profileTag = peerRunner["tags"]!.AsArray().Single(tag => tag!["key"]!.GetValue<string>() == RunnerOwnershipTags.Profile);
+        profileTag!["value"] = "another-profile";
+        using var aws = new FargateInspectionFixture
+        {
+            ListTasks = query => query.GetProperty("desiredStatus").GetString() == "STOPPED" ? ListReply([]) :
+                ListReply([FirstTask, SecondTask, ThirdTask]),
+            DescribeTasks = _ => TasksReply(TaskRow(FirstTask), knownService, peerRunner),
+        };
+
+        var configuration = await ConfigurationAsync(token);
+        var inventory = await aws.Inspector.ReadInventoryAsync(configuration, Profile, token);
+        Assert.True(inventory.IsProfileComplete);
+        Assert.Equal(3, inventory.ForeignSubnetOccupancy);
+        var planning = inventory.ToPlanningInventory(new FargateHeadroom(2, 1, 1));
+        var ambiguous = Assert.Single(planning.Slots);
+        Assert.Equal(FirstTask, ambiguous.Id);
+        Assert.False(ambiguous.OwnershipVerified);
+        Assert.Equal(2, planning.BackendCapacityCeiling);
+        Assert.All(inventory.Tasks.Where(task => task.ResourceArn != FirstTask), task => Assert.True(task.IsForeign));
+    }
+
+    [Fact]
     public async Task HeadroomSubtractsUnattachedPendingOnceAndLeavesForeignTasksOutsideProfileSlots()
     {
         var token = TestContext.Current.CancellationToken;
         var pending = Guid.Parse("10203040-5060-7080-90a0-b0c0d0e0f001");
+        var unrelatedService = TaskRow(ThirdTask);
+        unrelatedService["group"] = "service:unrelated";
         using var aws = new FargateInspectionFixture
         {
             ListTasks = query => query.GetProperty("desiredStatus").GetString() == "STOPPED" ? ListReply([]) :
                 ListReply([FirstTask, SecondTask, ThirdTask]),
             DescribeTasks = _ => TasksReply(TaskRow(FirstTask, FirstAllocation), TaskRow(SecondTask, pending, state: "PENDING", attachedSubnet: null),
-                TaskRow(ThirdTask)),
+                unrelatedService),
         };
         var config = await ConfigurationAsync(token);
         var inventory = await aws.Inspector.ReadInventoryAsync(config, Profile, token);
