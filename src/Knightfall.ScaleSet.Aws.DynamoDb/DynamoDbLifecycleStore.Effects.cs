@@ -82,6 +82,13 @@ public sealed partial class DynamoDbLifecycleStore
         CancellationToken cancellationToken) =>
         WriteEffectAsync(profile, lease, transitionId, write, LeaseAccess.Active, cancellationToken, guard, attemptDeadline);
 
+    internal Task<LifecycleWriteOutcome> WriteExactRunnerEffectAsync(
+        DeploymentLeaseFence lease, Guid transitionId, EffectJournalSnapshot expected, EffectJournalEntry replacement,
+        DateTimeOffset? leaseValidThrough, CancellationToken cancellationToken) =>
+        WriteEffectAsync(replacement.Envelope.Profile, lease, transitionId,
+            new EffectWrite(replacement.Envelope.IntentId, expected.Revision, replacement.State, replacement.WritePayload()),
+            LeaseAccess.Active, cancellationToken, leaseValidThrough: leaseValidThrough, exactPrevious: expected);
+
     private async Task<LifecycleWriteOutcome> WriteEffectAsync(
         LifecycleProfile profile,
         DeploymentLeaseFence lease,
@@ -90,7 +97,8 @@ public sealed partial class DynamoDbLifecycleStore
         LeaseAccess leaseAccess,
         CancellationToken cancellationToken,
         EffectDispatchGuard? guard = null,
-        DateTimeOffset? attemptDeadline = null)
+        DateTimeOffset? leaseValidThrough = null,
+        EffectJournalSnapshot? exactPrevious = null)
     {
         RequireProfileLease(profile, lease);
         ArgumentNullException.ThrowIfNull(write);
@@ -146,11 +154,20 @@ public sealed partial class DynamoDbLifecycleStore
             operation.Add("dueAtMillis", NumberValue(due.ToUnixTimeMilliseconds()));
         }
 
-        var leaseCondition = LeaseCondition(lease, leaseAccess, attemptDeadline);
+        var leaseCondition = LeaseCondition(lease, leaseAccess, leaseValidThrough);
+        var writeOperation = CompareAndPut(operationKey, operation, write.ExpectedRevision, profile.Deployment);
+        if (exactPrevious is not null)
+        {
+            var put = writeOperation.Write.Put;
+            put.ConditionExpression += " AND transitionId = :previousTransition AND effectState = :previousState AND payload = :previousPayload";
+            put.ExpressionAttributeValues[":previousTransition"] = StringValue(exactPrevious.TransitionId.ToString("D"));
+            put.ExpressionAttributeValues[":previousState"] = StringValue(EffectStateValue(exactPrevious.Entry.State));
+            put.ExpressionAttributeValues[":previousPayload"] = StringValue(exactPrevious.Entry.WritePayload());
+        }
         var actions = new List<TransactionAction>
         {
             leaseCondition,
-            CompareAndPut(operationKey, operation, write.ExpectedRevision, profile.Deployment),
+            writeOperation,
             WriteIndex(profile, nextIndex, head.Revision, transitionId),
         };
         if (guard is not null)
@@ -158,6 +175,15 @@ public sealed partial class DynamoDbLifecycleStore
             RequireAppliedCatalog(leaseCondition, guard.Catalog);
             actions.Add(CatalogProfileCondition(guard.Catalog));
             actions.Add(RecordRevisionCondition(new LifecycleRecordCondition(LifecycleKey.Runner(profile, guard.AllocationId), guard.AllocationRevision)));
+            if (guard.Handoff is not null)
+            {
+                actions.AddRange(BuildHandoffBeginConditions(guard.Handoff));
+            }
+            if (guard.Removal is { } removal)
+            {
+                actions.Add(ExactJitHandoffCondition(removal));
+                actions.Add(OfferAbsentCondition(removal));
+            }
         }
         if (delta > 0)
         {
@@ -167,7 +193,8 @@ public sealed partial class DynamoDbLifecycleStore
         {
             actions.Add(DeleteMarker(profile, head.Generation, write.IntentId));
         }
-        return await WriteAsync(actions, transitionId, cancellationToken).ConfigureAwait(false);
+        // An exact runner transition can reuse its durable proof with a newer index revision.
+        return await WriteAsync(actions, exactPrevious is null ? transitionId : Guid.NewGuid(), cancellationToken).ConfigureAwait(false);
     }
 
     public async Task<ActiveEffectPage?> ReadActiveOperationsAsync(

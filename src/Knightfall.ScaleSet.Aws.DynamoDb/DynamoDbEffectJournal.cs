@@ -7,21 +7,26 @@ public sealed record EffectJournalSnapshot(long Revision, Guid TransitionId, Eff
 
 public sealed record EffectBeginOutcome(LifecycleWriteOutcome Outcome, EffectSendAuthorization? Permission);
 
-internal sealed record EffectDispatchGuard(CatalogProfile Catalog, EffectIndexHead Index, string AllocationId, long? AllocationRevision);
+internal sealed record EffectDispatchGuard(
+    CatalogProfile Catalog, EffectIndexHead Index, string AllocationId, long? AllocationRevision,
+    JitHandoffSnapshot? Handoff = null, JitHandoffSnapshot? Removal = null);
 
 /// <summary>Evidence that an attempt was durably begun under its recorded lease epoch.</summary>
 /// <remarks>A caller must retain current ownership and respect the attempt deadline when sending.</remarks>
 public sealed class EffectSendAuthorization
 {
+    private static readonly DiscardWitness Consumed = new(Guid.Empty, default);
     private readonly TimeProvider _clock;
     private readonly long _beganAt;
     private readonly DateTimeOffset _upperUtcNow;
-    private int _consumed;
+    private DiscardWitness? _disposition;
 
     internal EffectSendAuthorization(
         EffectEnvelope envelope,
         EffectAttempt attempt,
         long revision,
+        Guid beginTransitionId,
+        DeploymentLeaseFence lease,
         TimeProvider clock,
         long beganAt,
         DateTimeOffset upperUtcNow)
@@ -29,6 +34,8 @@ public sealed class EffectSendAuthorization
         Envelope = envelope;
         Attempt = attempt;
         Revision = revision;
+        BeginTransitionId = beginTransitionId;
+        Lease = lease;
         _clock = clock;
         _beganAt = beganAt;
         _upperUtcNow = upperUtcNow;
@@ -37,17 +44,44 @@ public sealed class EffectSendAuthorization
     public EffectEnvelope Envelope { get; }
     public EffectAttempt Attempt { get; }
     public long Revision { get; }
+    public bool HasStartedSending => ReferenceEquals(Volatile.Read(ref _disposition), Consumed);
+    internal Guid BeginTransitionId { get; }
+    internal DeploymentLeaseFence Lease { get; }
 
     public bool TryConsume(out TimeSpan remaining)
     {
+        remaining = Attempt.Deadline - EstimateUtcNow();
+        if (remaining <= TimeSpan.Zero)
+        {
+            _ = TryDiscard();
+            return false;
+        }
+        return Interlocked.CompareExchange(ref _disposition, Consumed, null) is null;
+    }
+
+    internal DiscardWitness? TryDiscard()
+    {
+        var discarded = Volatile.Read(ref _disposition);
+        if (discarded is null)
+        {
+            var proposed = new DiscardWitness(Guid.NewGuid(), EstimateUtcNow().ToUniversalTime());
+            discarded = Interlocked.CompareExchange(ref _disposition, proposed, null) ?? proposed;
+        }
+        return ReferenceEquals(discarded, Consumed) ? null : discarded;
+    }
+
+    internal DateTimeOffset EstimateUtcNow()
+    {
         var estimate = _upperUtcNow + _clock.GetElapsedTime(_beganAt);
         var local = _clock.GetUtcNow();
-        remaining = Attempt.Deadline - (estimate > local ? estimate : local);
-        return Interlocked.CompareExchange(ref _consumed, 1, 0) == 0 && remaining > TimeSpan.Zero;
+        var latest = estimate > local ? estimate : local;
+        return latest > Attempt.BeganAt ? latest : Attempt.BeganAt;
     }
+
+    internal sealed record DiscardWitness(Guid TransitionId, DateTimeOffset ObservedAt);
 }
 
-public sealed class DynamoDbEffectJournal
+public sealed partial class DynamoDbEffectJournal
 {
     private readonly DynamoDbLifecycleStore _store;
     private readonly TimeProvider _timeProvider;
@@ -128,6 +162,11 @@ public sealed class DynamoDbEffectJournal
         {
             return new EffectBeginOutcome(LifecycleWriteOutcome.Conflict, null);
         }
+        if ((current.Entry.Envelope.Request is GitHubJitGenerateEffectRequest && guard?.Handoff is null) ||
+            (current.Entry.Envelope.Request is GitHubRunnerRemoveEffectRequest && guard?.Removal is null))
+        {
+            return new EffectBeginOutcome(LifecycleWriteOutcome.Conflict, null);
+        }
 
         var now = UpperNow(upperUtcNow, beganAt);
         if (guard is not null && (current.Entry.State != EffectState.Planned || now >= requestedDeadline ||
@@ -143,13 +182,27 @@ public sealed class DynamoDbEffectJournal
             : await _store.WriteDispatchedEffectAsync(entry.Envelope.Profile, lease.Fence, transitionId,
                 new EffectWrite(entry.Envelope.IntentId, current.Revision, entry.State, entry.WritePayload()),
                 guard, attempt.Deadline, cancellationToken).ConfigureAwait(false);
-        // A write can commit at the end of the window. The durable attempt remains unresolved.
-        var permission = outcome == LifecycleWriteOutcome.Committed && !cancellationToken.IsCancellationRequested &&
-            UpperNow(upperUtcNow, beganAt) < attempt.Deadline
-            ? new EffectSendAuthorization(entry.Envelope, attempt, checked(current.Revision + 1),
-                _timeProvider, beganAt, upperUtcNow)
-            : null;
-        return new EffectBeginOutcome(outcome, permission);
+        if (outcome != LifecycleWriteOutcome.Committed)
+        {
+            return new EffectBeginOutcome(outcome, null);
+        }
+        var permission = new EffectSendAuthorization(entry.Envelope, attempt, checked(current.Revision + 1), transitionId, lease.Fence,
+            _timeProvider, beganAt, upperUtcNow);
+        if (cancellationToken.IsCancellationRequested)
+        {
+            await FinalizeInterruptedRunnerEffectAsync(lease, permission, leaseReserve).ConfigureAwait(false);
+            return new EffectBeginOutcome(outcome, null);
+        }
+        if (permission.EstimateUtcNow() < attempt.Deadline)
+        {
+            return new EffectBeginOutcome(outcome, permission);
+        }
+        if (entry.Envelope.Request is GitHubJitGenerateEffectRequest or GitHubRunnerRemoveEffectRequest)
+        {
+            // The known commit completed too late, before any caller could use the send authorization.
+            _ = await AbandonUnsentRunnerEffectAsync(lease, permission, cancellationToken).ConfigureAwait(false);
+        }
+        return new EffectBeginOutcome(outcome, null);
     }
 
     public async Task<LifecycleWriteOutcome> RenewAttemptDeadlineAsync(
@@ -243,6 +296,12 @@ public sealed class DynamoDbEffectJournal
             return await _store.WriteRecoveredEffectAsync(entry.Envelope.Profile, lease.Fence, transitionId,
                 new EffectWrite(entry.Envelope.IntentId, current.Revision, EffectState.Settled, entry.WritePayload()),
                 cancellationToken).ConfigureAwait(false);
+        }
+
+        if (current.Entry.State == EffectState.Planned && evidence.Kind == EffectResolutionKind.Absent)
+        {
+            return await _store.WriteExactRunnerEffectAsync(lease.Fence, transitionId, current, entry, null, cancellationToken)
+                .ConfigureAwait(false);
         }
 
         return await WriteAsync(lease, entry, current.Revision, transitionId, cancellationToken).ConfigureAwait(false);

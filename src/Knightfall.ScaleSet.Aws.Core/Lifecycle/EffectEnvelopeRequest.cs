@@ -13,6 +13,8 @@ namespace Knightfall.ScaleSet.Aws.Core.Lifecycle;
 [JsonDerivedType(typeof(FargateStopEffectRequest), "fargate-stop")]
 [JsonDerivedType(typeof(GitHubSessionRetireEffectRequest), "github-session-retire")]
 [JsonDerivedType(typeof(GitHubScaleSetCreateEffectRequest), "github-scale-set-create")]
+[JsonDerivedType(typeof(GitHubJitGenerateEffectRequest), "github-jit-generate")]
+[JsonDerivedType(typeof(GitHubRunnerRemoveEffectRequest), "github-runner-remove")]
 public abstract record EffectEnvelopeRequest
 {
     private protected EffectEnvelopeRequest()

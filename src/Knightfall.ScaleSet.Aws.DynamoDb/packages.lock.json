@@ -62,6 +62,9 @@
           "JsonSchema.Net": "[9.7.0, 9.7.0]"
         }
       },
+      "knightfall.scaleset.aws.handoff": {
+        "type": "Project"
+      },
       "JsonSchema.Net": {
         "type": "CentralTransitive",
         "requested": "[9.7.0, 9.7.0]",

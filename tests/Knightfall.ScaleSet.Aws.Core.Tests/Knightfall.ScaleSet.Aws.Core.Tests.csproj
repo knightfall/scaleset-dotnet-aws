@@ -9,6 +9,7 @@
   <ItemGroup>
     <ProjectReference Include="../../src/Knightfall.ScaleSet.Aws.Core/Knightfall.ScaleSet.Aws.Core.csproj" />
     <ProjectReference Include="../../src/Knightfall.ScaleSet.Aws.Controller/Knightfall.ScaleSet.Aws.Controller.csproj" />
+    <ProjectReference Include="../../src/Knightfall.ScaleSet.Aws.Handoff/Knightfall.ScaleSet.Aws.Handoff.csproj" />
     <PackageReference Include="xunit.v3" />
   </ItemGroup>
   <ItemGroup>

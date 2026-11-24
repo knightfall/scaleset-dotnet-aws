@@ -55,7 +55,7 @@ public sealed partial class DynamoDbLifecycleStore
             }
             else if (guard.Key.Kind is LifecycleItemKind.Demand or LifecycleItemKind.Admission or LifecycleItemKind.Checkpoint or
                      LifecycleItemKind.RunnerInventory or LifecycleItemKind.Drain or LifecycleItemKind.Runner or
-                     LifecycleItemKind.RunnerIdentity or LifecycleItemKind.Job or LifecycleItemKind.Acquisition)
+                     LifecycleItemKind.RunnerIdentity or LifecycleItemKind.Job or LifecycleItemKind.Acquisition or LifecycleItemKind.HandoffHead)
             {
                 checks.Add(RecordRevisionCondition(guard));
             }

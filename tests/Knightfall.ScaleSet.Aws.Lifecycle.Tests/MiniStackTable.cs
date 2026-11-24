@@ -187,9 +187,11 @@ internal sealed class MiniStackWire : DelegatingHandler
     private readonly ConcurrentQueue<MiniStackCall> _requests = new();
     private int _dropTransactionBeforeSend;
     private int _dropSuccessfulTransaction;
+    private int _dropSuccessfulBootstrapDelete;
     private TransactionBarrier? _transactionBarrier;
     private PausedRequest? _pausedRead;
     private PausedRequest? _pausedWrite;
+    private PausedRequest? _pausedSuccessfulWrite;
     private StorageFailure? _failedGetItem;
     private StorageFailure? _failedTransactWrite;
 
@@ -207,6 +209,8 @@ internal sealed class MiniStackWire : DelegatingHandler
     internal void DropNextTransactionBeforeSend() => Interlocked.Exchange(ref _dropTransactionBeforeSend, 1);
 
     internal void DropNextSuccessfulTransactionResponse() => Interlocked.Exchange(ref _dropSuccessfulTransaction, 1);
+
+    internal void DropNextSuccessfulBootstrapDeleteResponse() => Interlocked.Exchange(ref _dropSuccessfulBootstrapDelete, 1);
 
     internal void HoldNextTwoTransactions() => _transactionBarrier = new TransactionBarrier();
 
@@ -227,6 +231,13 @@ internal sealed class MiniStackWire : DelegatingHandler
     {
         var pause = new PausedRequest(key);
         _pausedWrite = pause;
+        return pause;
+    }
+
+    internal PausedRequest PauseAfterNextSuccessfulTransactionWrite(LifecycleKey key)
+    {
+        var pause = new PausedRequest(key);
+        _pausedSuccessfulWrite = pause;
         return pause;
     }
 
@@ -265,13 +276,18 @@ internal sealed class MiniStackWire : DelegatingHandler
             await barrier.WaitAsync(cancellationToken);
         }
         if (operation == "TransactWriteItems" && _pausedWrite is { } writePause &&
-            call.Request.GetProperty("TransactItems").EnumerateArray().Any(action =>
-                action.TryGetProperty("Put", out var put) && writePause.Matches(put.GetProperty("Item"))) &&
+            MatchesTransactionPut(call, writePause) &&
             Interlocked.CompareExchange(ref _pausedWrite, null, writePause) == writePause)
         {
             await writePause.AwaitResumeAsync(cancellationToken);
         }
         var actual = await base.SendAsync(request, cancellationToken);
+        if (operation == "TransactWriteItems" && actual.IsSuccessStatusCode && _pausedSuccessfulWrite is { } afterWrite &&
+            MatchesTransactionPut(call, afterWrite) &&
+            Interlocked.CompareExchange(ref _pausedSuccessfulWrite, null, afterWrite) == afterWrite)
+        {
+            await afterWrite.AwaitResumeAsync(cancellationToken);
+        }
         if (operation == "GetItem" && _pausedRead is { } pause &&
             pause.Matches(call.Request.GetProperty("Key")) &&
             Interlocked.CompareExchange(ref _pausedRead, null, pause) == pause)
@@ -285,6 +301,13 @@ internal sealed class MiniStackWire : DelegatingHandler
             throw new HttpRequestException("Lost response after MiniStack committed the transaction.",
                 new SocketException((int)SocketError.ConnectionReset));
         }
+        if (operation == "DeleteItem" && actual.IsSuccessStatusCode &&
+            Interlocked.Exchange(ref _dropSuccessfulBootstrapDelete, 0) == 1)
+        {
+            actual.Dispose();
+            throw new HttpRequestException("Lost response after MiniStack deleted the bootstrap offer.",
+                new SocketException((int)SocketError.ConnectionReset));
+        }
 
         if (call.IsDueQuery && actual.IsSuccessStatusCode && DueQueryResponse is { } body)
         {
@@ -296,6 +319,10 @@ internal sealed class MiniStackWire : DelegatingHandler
         }
         return actual;
     }
+
+    private static bool MatchesTransactionPut(MiniStackCall call, PausedRequest pause) =>
+        call.Request.GetProperty("TransactItems").EnumerateArray().Any(action =>
+            action.TryGetProperty("Put", out var put) && pause.Matches(put.GetProperty("Item")));
 
     private static bool MatchesKey(JsonElement item, LifecycleKey key) =>
         item.GetProperty("PK").GetProperty("S").GetString() == key.PartitionKey &&
