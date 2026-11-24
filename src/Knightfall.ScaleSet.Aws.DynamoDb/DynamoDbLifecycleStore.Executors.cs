@@ -15,6 +15,26 @@ public sealed partial class DynamoDbLifecycleStore
         PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
     };
 
+    /// <summary>Resolves an existing deployment claim and confirms its exact executor binding.</summary>
+    public async Task<ExecutorBinding?> ReadExecutorBindingForResourceAsync(
+        string deployment, string resourceArn, CancellationToken cancellationToken)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(deployment);
+        ArgumentException.ThrowIfNullOrWhiteSpace(resourceArn);
+        var claim = await ReadRecordAsync(LifecycleKey.Claim("aws-resource#" + resourceArn), cancellationToken).ConfigureAwait(false);
+        if (claim is null)
+        {
+            return null;
+        }
+        var binding = ParseExecutorRecord<ExecutorBinding>(claim);
+        if (binding.Profile.Deployment != deployment || binding.ResourceArn != resourceArn)
+        {
+            return null;
+        }
+        var executor = await ReadExecutorAsync(binding.Profile, binding.AllocationId, cancellationToken).ConfigureAwait(false);
+        return executor?.Binding == binding ? binding : null;
+    }
+
     public async Task<ExecutorSnapshot?> ReadExecutorAsync(
         LifecycleProfile profile, string allocationId, CancellationToken cancellationToken)
     {
