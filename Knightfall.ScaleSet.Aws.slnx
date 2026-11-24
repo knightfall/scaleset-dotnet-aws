@@ -1,0 +1,15 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/Knightfall.ScaleSet.Aws.Controller/Knightfall.ScaleSet.Aws.Controller.csproj" />
+    <Project Path="src/Knightfall.ScaleSet.Aws.Core/Knightfall.ScaleSet.Aws.Core.csproj" />
+    <Project Path="src/Knightfall.ScaleSet.Aws.DynamoDb/Knightfall.ScaleSet.Aws.DynamoDb.csproj" />
+    <Project Path="src/Knightfall.ScaleSet.Aws.GitHub/Knightfall.ScaleSet.Aws.GitHub.csproj" />
+    <Project Path="src/Knightfall.ScaleSet.Aws.Handoff/Knightfall.ScaleSet.Aws.Handoff.csproj" />
+    <Project Path="src/Knightfall.ScaleSet.Aws.Providers.Ec2/Knightfall.ScaleSet.Aws.Providers.Ec2.csproj" />
+    <Project Path="src/Knightfall.ScaleSet.Aws.Providers.Fargate/Knightfall.ScaleSet.Aws.Providers.Fargate.csproj" />
+    <Project Path="src/Knightfall.ScaleSet.Aws.RunnerBootstrap/Knightfall.ScaleSet.Aws.RunnerBootstrap.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/Knightfall.ScaleSet.Aws.SdkContract.Tests/Knightfall.ScaleSet.Aws.SdkContract.Tests.csproj" />
+  </Folder>
+</Solution>

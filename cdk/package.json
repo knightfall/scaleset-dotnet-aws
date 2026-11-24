@@ -1,0 +1,34 @@
+{
+  "name": "scaleset-dotnet-aws-cdk",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": "24.22.3"
+  },
+  "devEngines": {
+    "packageManager": {
+      "name": "npm",
+      "version": "11.19.1"
+    }
+  },
+  "scripts": {
+    "lint": "eslint --max-warnings 0 .",
+    "format:check": "prettier --check .",
+    "typecheck": "tsc --noEmit",
+    "test": "node --test 'test/**/*.test.ts'",
+    "synth": "cdk synth --strict --no-lookups --app 'node test/fixtures/synth-app.ts'"
+  },
+  "dependencies": {
+    "aws-cdk-lib": "2.278.0",
+    "constructs": "10.8.1"
+  },
+  "devDependencies": {
+    "@types/node": "24.19.2",
+    "aws-cdk": "2.1149.0",
+    "eslint": "10.15.0",
+    "prettier": "3.10.1",
+    "typescript": "6.0.3",
+    "typescript-eslint": "8.73.0"
+  }
+}

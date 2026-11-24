@@ -5,9 +5,8 @@ using the released `Knightfall.ScaleSet.Client` and `Knightfall.ScaleSet.Listene
 packages. The controller will run on ECS Fargate and provision ephemeral runners
 on Direct EC2 or standalone Fargate tasks.
 
-This repository currently contains the planning baseline. The controller,
-infrastructure, build commands, and tests described below are implementation
-work, not available functionality.
+The repository contains the planning baseline and build toolchain. The
+controller and deployment infrastructure are tracked in the task index.
 
 - [Implementation plan](docs/implementation-plan.md): architecture, configuration,
   lifecycle rules, and verification boundaries.
@@ -17,7 +16,15 @@ work, not available functionality.
   dependencies, deliverables, and acceptance criteria.
 - [Agent instructions](AGENTS.md): repository layout and engineering conventions.
 
-Merge the planning-baseline PR before creating the milestone and task issues.
-Keep detailed requirements in these documents and use issues to track
-dependencies, implementation PRs, and verification evidence. Begin with T01
-(tooling) and T02 (released SDK contracts).
+## Build and test
+
+Install the .NET SDK from `global.json` and Node.js from `.node-version`. Run
+the build checks from the repository root.
+
+```sh
+make check
+```
+
+CI uses the same command to restore locked dependencies, build and test the .NET
+solution in Release, check CDK linting, formatting, and types, run the CDK tests,
+and synthesize the CDK baseline offline.
