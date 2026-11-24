@@ -88,7 +88,8 @@ public sealed class FargateBootstrapTests
         var runner = new FixtureRunner();
         var app = new FargateBootstrapApplication(Settings, new FixtureClock());
 
-        var error = await Assert.ThrowsAsync<InvalidDataException>(() => app.RunAsync(Metadata, http, sts, ddb, runner, token));
+        var error = await Assert.ThrowsAsync<InvalidDataException>(() => app.RunAsync(Metadata, http, sts, ddb, runner,
+            static (_, _) => throw new InvalidOperationException("Bootstrap registered with unverified identity."), token));
 
         Assert.Empty(ddbWire.Requests);
         Assert.Equal(0, runner.Starts);
@@ -135,7 +136,7 @@ public sealed class FargateBootstrapTests
                     return AwsWireTransport.Json("""{"__type":"ConditionalCheckFailedException"}""", HttpStatusCode.BadRequest);
                 }
                 helloExists = true;
-                var hello = BootstrapItems.DecodeHello(helloKey, ReadItem(raw));
+                var hello = BootstrapItems.DecodeHello(helloKey, ReadItem(raw), clock.GetUtcNow());
                 var allocation = Guid.Parse("00012233-4455-6677-8899-aabbccddeeff");
                 // Precomputed from the canonical task ARN, revision-7 definition ARN, and allocation.
                 var incarnation = Guid.Parse("8333bcc2-7c30-5503-0f71-d9a70c81a309");
@@ -169,10 +170,13 @@ public sealed class FargateBootstrapTests
         using var ddb = new AmazonDynamoDBClient(AwsWireTransport.Credentials, ddbWire.Configure(new AmazonDynamoDBConfig()));
         var runner = new FixtureRunner();
         FargateBootstrapApplication Application() => new(Settings, clock);
+        Task<LifecycleWriteOutcome> RegisterHelloAsync(JitHello hello, CancellationToken cancellation) =>
+            BrokerHelloFixture.RegisterAsync(ddb, Settings.TableName, UserId, hello, clock, cancellation);
 
-        Assert.Equal(outcome, await Application().RunAsync(Metadata, http, sts, ddb, runner, token));
+        Assert.Equal(outcome, await Application().RunAsync(Metadata, http, sts, ddb, runner, RegisterHelloAsync, token));
         Assert.Equal(outcome == RunnerBootstrapOutcome.Completed ? 1 : 0, runner.Starts);
-        Assert.Equal(RunnerBootstrapOutcome.HelloRejected, await Application().RunAsync(Metadata, http, sts, ddb, runner, token));
+        Assert.Equal(RunnerBootstrapOutcome.HelloRejected,
+            await Application().RunAsync(Metadata, http, sts, ddb, runner, RegisterHelloAsync, token));
         Assert.Equal(outcome == RunnerBootstrapOutcome.Completed ? 1 : 0, runner.Starts);
 
         string[] expected = ["DynamoDB_20120810.PutItem", "DynamoDB_20120810.DeleteItem", "DynamoDB_20120810.PutItem"];

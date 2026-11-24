@@ -44,6 +44,7 @@ public sealed class RunnerBootstrap(
     TimeProvider clock,
     TimeSpan offerWait,
     TimeSpan pollDelay,
+    Func<JitHello, CancellationToken, Task<LifecycleWriteOutcome>> registerHello,
     Func<BootstrapRunnerObservation, CancellationToken, Task>? observe = null,
     Func<JitHandoffIdentity, bool>? validateProviderBinding = null,
     RunnerProvisionerType? telemetryProvider = null)
@@ -63,7 +64,7 @@ public sealed class RunnerBootstrap(
 
         using var recipient = JitRecipientKey.Create();
         var hello = recipient.Hello;
-        var registered = await offers.RegisterHelloAsync(hello, cancellationToken).ConfigureAwait(false);
+        var registered = await registerHello(hello, cancellationToken).ConfigureAwait(false);
         if (registered != LifecycleWriteOutcome.Committed)
         {
             return registered == LifecycleWriteOutcome.Indeterminate

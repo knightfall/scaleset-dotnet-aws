@@ -277,8 +277,23 @@ export function grantFargate(
 
 export function bootstrapPolicy(table: ITable) {
   return [
-    bootstrapStatement(table, "dynamodb:PutItem", "HELLO#${aws:userid}"),
     bootstrapStatement(table, "dynamodb:DeleteItem", "OFFER#${aws:userid}"),
+    new iam.PolicyStatement({
+      effect: iam.Effect.DENY,
+      actions: [
+        "dynamodb:PutItem",
+        "dynamodb:UpdateItem",
+        "dynamodb:DeleteItem",
+        "dynamodb:BatchWriteItem",
+        "dynamodb:PartiQLInsert",
+        "dynamodb:PartiQLUpdate",
+        "dynamodb:PartiQLDelete",
+      ],
+      resources: [table.tableArn],
+      conditions: {
+        "ForAnyValue:StringLike": { "dynamodb:LeadingKeys": ["HELLO#*"] },
+      },
+    }),
   ];
 }
 

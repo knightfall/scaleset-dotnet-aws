@@ -916,23 +916,33 @@ function verifyBootstrapPolicies(
   for (const policy of bootstrap) {
     const statements = policy.Properties.PolicyDocument
       .Statement as Statement[];
+    const allowed = statements.filter(({ Effect }) => Effect === "Allow");
     assert.deepEqual(
-      new Set(statements.flatMap(({ Action }) => Action)),
-      new Set(["dynamodb:PutItem", "dynamodb:DeleteItem"]),
+      new Set(allowed.flatMap(({ Action }) => Action)),
+      new Set([
+        "dynamodb:DeleteItem",
+        "lambda:InvokeFunctionUrl",
+        "lambda:InvokeFunction",
+      ]),
     );
-    for (const [action, key] of [
-      ["dynamodb:PutItem", "HELLO#${aws:userid}"],
-      ["dynamodb:DeleteItem", "OFFER#${aws:userid}"],
-    ] as const) {
-      verifyGrants(
-        statements,
-        action,
-        scope([table], {
-          "ForAllValues:StringEquals": { "dynamodb:LeadingKeys": [key] },
-          Null: { "dynamodb:LeadingKeys": "false" },
-        }),
-      );
-    }
+    verifyGrants(
+      allowed,
+      "dynamodb:DeleteItem",
+      scope([table], {
+        "ForAllValues:StringEquals": {
+          "dynamodb:LeadingKeys": ["OFFER#${aws:userid}"],
+        },
+        Null: { "dynamodb:LeadingKeys": "false" },
+      }),
+    );
+    const deny = statements.find(
+      ({ Effect, Action }) =>
+        Effect === "Deny" && Action.includes("dynamodb:PutItem"),
+    );
+    assert.ok(deny);
+    assert.deepEqual(deny.Condition, {
+      "ForAnyValue:StringLike": { "dynamodb:LeadingKeys": ["HELLO#*"] },
+    });
   }
 }
 

@@ -56,9 +56,12 @@ internal static class FargateBootstrapCommand
             var transport = new BootstrapHttpFactory();
             using var sts = new AmazonSecurityTokenServiceClient(taskCredentials, Configure(new AmazonSecurityTokenServiceConfig(), region, transport));
             using var ddb = new AmazonDynamoDBClient(taskCredentials, Configure(new AmazonDynamoDBConfig(), region, transport));
+            using var helloTransport = HelloEndpointRegistration.CreateTransport();
+            var registration = new HelloEndpointRegistration(helloTransport, settings.HelloEndpoint, settings.Region,
+                taskCredentials, TimeProvider.System);
             var application = new FargateBootstrapApplication(settings, TimeProvider.System);
             var runner = new LinuxOneJobRunner(boundary, stopGrace: TimeSpan.FromSeconds(20));
-            var outcome = await application.RunAsync(metadataEndpoint, metadata, sts, ddb, runner, stopping.Token)
+            var outcome = await application.RunAsync(metadataEndpoint, metadata, sts, ddb, runner, registration.RegisterAsync, stopping.Token)
                 .ConfigureAwait(false);
             Console.WriteLine(outcome);
             return outcome == RunnerBootstrapOutcome.Completed ? 0 : 1;

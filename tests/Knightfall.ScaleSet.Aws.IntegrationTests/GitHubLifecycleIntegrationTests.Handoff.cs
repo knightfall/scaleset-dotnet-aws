@@ -8,6 +8,7 @@ using Knightfall.ScaleSet.Aws.DynamoDb;
 using Knightfall.ScaleSet.Aws.GitHub;
 using Knightfall.ScaleSet.Aws.Handoff;
 using ScaleSet.Listener;
+using Knightfall.ScaleSet.Aws.Lifecycle.Tests;
 using Xunit;
 
 namespace Knightfall.ScaleSet.Aws.IntegrationTests;
@@ -25,7 +26,8 @@ public sealed partial class GitHubLifecycleIntegrationTests
         var (executor, identity) = await BindHandoffExecutorAsync(rig, originalClient, token);
         using var recipient = JitRecipientKey.Create();
         var bootstrap = new DynamoDbBootstrapOfferClient(rig.Table.Client, rig.Table.Name, identity.AwsUserId, identity.ResourceArn, rig.Clock);
-        Assert.Equal(LifecycleWriteOutcome.Committed, await bootstrap.RegisterHelloAsync(recipient.Hello, token));
+        Assert.Equal(LifecycleWriteOutcome.Committed, await BrokerHelloFixture.RegisterAsync(rig.Table.Client,
+            rig.Table.Name, identity.AwsUserId, recipient.Hello, rig.Clock, token));
         string offerId = JitOfferBinding.GetOfferId(identity);
         string intent = "jit-" + offerId;
         rig.Simulator.FailNext(SimulatorOperation.GenerateJit, SimulatorFault.DropAfterCommit);
@@ -91,7 +93,8 @@ public sealed partial class GitHubLifecycleIntegrationTests
         var (executor, identity) = await BindHandoffExecutorAsync(rig, originalClient, token);
         using var recipient = JitRecipientKey.Create();
         var bootstrap = new DynamoDbBootstrapOfferClient(rig.Table.Client, rig.Table.Name, identity.AwsUserId, identity.ResourceArn, rig.Clock);
-        Assert.Equal(LifecycleWriteOutcome.Committed, await bootstrap.RegisterHelloAsync(recipient.Hello, token));
+        Assert.Equal(LifecycleWriteOutcome.Committed, await BrokerHelloFixture.RegisterAsync(rig.Table.Client,
+            rig.Table.Name, identity.AwsUserId, recipient.Hello, rig.Clock, token));
         var handoff = new GitHubJitHandoff(rig.Store, rig.Clock, HandoffTiming);
         var issued = await handoff.IssueAsync(new ActiveControllerAuthority(rig.Lease, ClockEvidence(rig.Clock)),
             identity, rig.Clock.Now, originalClient, CancellationToken.None, token);

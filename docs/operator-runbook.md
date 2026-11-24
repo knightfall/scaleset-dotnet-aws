@@ -138,6 +138,32 @@ npm --prefix cdk run deploy:controller -- \
 3. Run the receiver smoke check from the intended network, then confirm queryable metrics, traces, and logs for the new `service.instance.id`. Confirm that enabled profiles have fresh readiness and that the resource and profile attributes match the artifact. Investigate zero readiness or absent data with the [telemetry playbook](operator-telemetry.md).
 4. Record activation time, exact owner task ARN and lease epoch, runtime version and generation, task definition ARN, image digest, and the qualification evidence for each profile. Retain the previous compatible YAML, runtime, image digest, and assembly.
 
+## Cut over runner HELLO registration
+
+The controller stack reports a `Bootstrap…HelloUrl` output for each enabled
+bootstrap role. The output description identifies the matching role ARN. A
+dry-run deployment provides stable URLs with the brokers disabled. The active
+stack grants each role its own AWS IAM Function URL invocation and
+principal-scoped OFFER consumption. Each role has four concurrent broker
+invocations. Profiles sharing a role also share its invocation budget.
+Confirm that the target Region supports Function URLs. Runner subnets need an
+approved outbound Internet route for HTTPS to the role's exact endpoint.
+[Function URL regional availability and networking](https://docs.aws.amazon.com/lambda/latest/dg/urls-configuration.html)
+
+The broker takes the principal from AWS authentication, validates up to 1 KiB
+of HELLO input, and conditionally creates one canonical `HELLO#BROKER#` item
+per principal. JIT staging and begin require that exact broker record. Legacy
+runner grants cannot address the broker's partition namespace.
+The broker sets a one-hour TTL. Exact retries keep the same item and expiry.
+The controller rejects expired registrations immediately, and DynamoDB removes
+the physical record asynchronously. The active bootstrap role denies direct
+HELLO changes on the lifecycle table. [Lambda Function URL authentication](https://docs.aws.amazon.com/lambda/latest/dg/urls-auth.html) · [DynamoDB TTL](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/TTL.html)
+
+1. For a deployment using direct HELLO writes, drain launches and settle staged or executing JIT operations, issued offers, and running jobs before changing the bootstrap grants. Old runners can finish consuming their already issued offers during this phase. Hold the cutover until outstanding handoffs can be accounted for on the retained table.
+2. Fence the old controller and apply the dry-run generation. Revoke any remaining direct HELLO writers, including out-of-band role grants, and verify denial before continuing. Preserve the table and the lease, catalog, executor, effect and handoff records. The controller ignores any retained HELLO from the old partition namespace, even if it contains the broker's issuer field. Remove obsolete legacy rows with the operator recovery identity after accounting for all pre-cutover handoffs.
+3. Use the matching stack outputs in `helloEndpoint` for the rebuilt AMIs and Fargate runner images. Review the exact Launch Template and task-definition revisions with the new controller. Check the IAM policies, TLS network path, and expected invocation throughput for each role. Apply the active generation with the updated bindings and verify that older runner binaries cannot start a direct registration.
+4. Use a compatible forward generation for rollback of unrelated settings. Preserve the broker URLs, runner revisions, and grants through the rollback. A controller from before this cutover cannot stage a broker-issued TTL record. Reverting the entire protocol requires a drained deployment and a separately reviewed migration.
+
 ## Add, drain, and retire a profile
 
 1. Add a distinct profile binding to YAML at a new generation. Preserve existing profile IDs, scope, grants, and resource bindings. Review its labels, group, capacity, and backend before running the protected deploy. Check readiness for the new and existing profiles.

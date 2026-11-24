@@ -11,6 +11,7 @@ The settings file is root-owned, mode `0600`, with root-owned parent directories
 ```json
 {
   "tableName": "scale-set-lifecycle",
+  "helloEndpoint": "https://exampleid.lambda-url.ap-southeast-2.on.aws/",
   "authority": {
     "account": "111122223333",
     "region": "ap-southeast-2",
@@ -36,6 +37,8 @@ The settings file is root-owned, mode `0600`, with root-owned parent directories
 ```
 
 Provision the spent directory on the instance's encrypted persistent `xfs` or `ext4` volume at mode `0700`. The supervisor creates and flushes the per-instance marker and its parent before HELLO. Retain that marker through reboot, update and failure. An unavailable offer can be polled with the same in-process key and nonce for up to five minutes. A lost DELETE response, invalid envelope or supervisor restart ends the attempt without re-registering.
+
+Set `helloEndpoint` to the stack output for the configured instance role. The supervisor uses the verified role credentials to sign its registration and the same principal for one-time OFFER consumption. Qualify access to the exact HTTPS endpoint from the supervisor and keep the existing IMDS and process isolation checks for workflow code. See the [HELLO cutover](operator-runbook.md#cut-over-runner-hello-registration) for retained tables and older AMIs.
 
 Install the architecture-matched GitHub Actions runner from the checksum-verified release package. The locally inspected Linux artifact was version `2.338.2` at commit `d1eb12d4b115c301201de27d667284e1a80f2ab5`. Mount the whole mutable runner root as a private executable `tmpfs` with `nosuid,nodev`, root ownership and the dedicated runner group, and set mode `1770`. Ensure that swap is off, or use an explicitly `noswap` mount and a cgroup v2 swap limit of zero for the supervisor and descendants. Follow the filesystem layout in the archive and protect packaged programs and libraries from modification by the runner UID. Create the mount anew at boot and unmount it at shutdown. [GitHub Actions runner release](https://github.com/actions/runner/releases/tag/v2.338.2), [Linux tmpfs documentation](https://docs.kernel.org/filesystems/tmpfs.html), [cgroup v2 swap limits](https://docs.kernel.org/admin-guide/cgroup-v2.html#memory-interface-files).
 

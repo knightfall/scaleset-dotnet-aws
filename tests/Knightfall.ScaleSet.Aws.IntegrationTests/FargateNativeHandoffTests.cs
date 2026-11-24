@@ -12,6 +12,7 @@ using Knightfall.ScaleSet.Aws.RunnerBootstrap;
 using Knightfall.ScaleSet.Aws.RunnerBootstrap.Fargate;
 using Microsoft.Extensions.Logging;
 using ScaleSet.Listener;
+using Knightfall.ScaleSet.Aws.Lifecycle.Tests;
 using Xunit;
 
 namespace Knightfall.ScaleSet.Aws.IntegrationTests;
@@ -74,14 +75,19 @@ public sealed class FargateNativeHandoffTests
         string firstMetadata = metadata.ForTask(first.Identity.ResourceArn).AbsoluteUri;
         string secondMetadata = metadata.ForTask(second.Identity.ResourceArn).AbsoluteUri;
         await Assert.ThrowsAsync<InvalidDataException>(() => new FargateBootstrapApplication(settings, aws.Clock)
-            .RunAsync(firstMetadata, metadataHttp, secondSts, secondDdb, first.Job, token));
+            .RunAsync(firstMetadata, metadataHttp, secondSts, secondDdb, first.Job,
+                static (_, _) => throw new InvalidOperationException("Bootstrap registered with unverified identity."), token));
         Assert.DoesNotContain(aws.Wire.Requests, request => request.Operation is "PutItem" or "DeleteItem");
 
         var firstApp = new FargateBootstrapApplication(settings, aws.Clock);
         var secondApp = new FargateBootstrapApplication(settings, aws.Clock);
         using var bootstrapCancellation = CancellationTokenSource.CreateLinkedTokenSource(token);
-        var firstExit = firstApp.RunAsync(firstMetadata, metadataHttp, firstSts, firstDdb, first.Job, bootstrapCancellation.Token);
-        var secondExit = secondApp.RunAsync(secondMetadata, metadataHttp, secondSts, secondDdb, second.Job, bootstrapCancellation.Token);
+        var firstExit = firstApp.RunAsync(firstMetadata, metadataHttp, firstSts, firstDdb, first.Job,
+            (hello, cancellation) => BrokerHelloFixture.RegisterAsync(aws.Table.Client, aws.Table.Name,
+                first.Identity.AwsUserId, hello, aws.Clock, cancellation), bootstrapCancellation.Token);
+        var secondExit = secondApp.RunAsync(secondMetadata, metadataHttp, secondSts, secondDdb, second.Job,
+            (hello, cancellation) => BrokerHelloFixture.RegisterAsync(aws.Table.Client, aws.Table.Name,
+                second.Identity.AwsUserId, hello, aws.Clock, cancellation), bootstrapCancellation.Token);
         try
         {
             await Task.WhenAll(WaitForHelloAsync(aws, first, firstExit, token), WaitForHelloAsync(aws, second, secondExit, token));
@@ -268,8 +274,9 @@ public sealed class FargateNativeHandoffTests
         {
             var helloKey = LifecycleKey.Hello(task.Identity.AwsUserId);
             var offerKey = LifecycleKey.Offer(task.Identity.AwsUserId);
-            Assert.Contains(aws.Wire.Requests, request => request.Operation == "PutItem" &&
+            Assert.DoesNotContain(aws.Wire.Requests, request => request.Operation == "PutItem" &&
                 HasBootstrapKey(request.Body, "Item", helloKey));
+            Assert.Equal("iam-url-v1", (await aws.Table.ReadAsync(helloKey, token))["helloIssuer"].S);
             Assert.Contains(aws.Wire.Requests, request => request.Operation == "DeleteItem" &&
                 HasBootstrapKey(request.Body, "Key", offerKey, "ALL_OLD"));
             var encryptedOffer = Assert.Single(aws.Table.Wire.Requests.Where(request => request.Operation == "TransactWriteItems")

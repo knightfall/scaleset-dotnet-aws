@@ -24,11 +24,14 @@ internal sealed class Ec2BootstrapApplication(Ec2BootstrapSettings settings, Tim
         var identity = await verifier.VerifyAsync(settings.Authority, cancellationToken, qualification?.ImageId).ConfigureAwait(false);
 
         using var dynamodb = CreateDynamoDb(identity.Credentials, settings.Authority.Region);
+        using var helloTransport = HelloEndpointRegistration.CreateTransport();
+        var registration = new HelloEndpointRegistration(helloTransport, settings.HelloEndpoint, settings.Authority.Region,
+            identity.Credentials, clock);
         var offers = new DynamoDbBootstrapOfferClient(dynamodb, settings.TableName, identity.AwsUserId, identity.ResourceArn, clock);
         var spent = new Ec2SpentMarker(settings.SpentDirectory, identity.ResourceArn);
         var bootstrap = new RunnerBootstrap(offers, settings.Target, identity.ResourceArn, identity.AwsUserId, spent.TryReserve,
             new LinuxOneJobRunner(boundary), clock, TimeSpan.FromMinutes(5), TimeSpan.FromSeconds(2),
-            ReportAsync, telemetryProvider: RunnerProvisionerType.Ec2);
+            registration.RegisterAsync, ReportAsync, telemetryProvider: RunnerProvisionerType.Ec2);
         return await bootstrap.RunAsync(cancellationToken).ConfigureAwait(false);
 
         async Task ReportAsync(BootstrapRunnerObservation observation, CancellationToken token)
@@ -82,7 +85,8 @@ internal sealed class Ec2BootstrapApplication(Ec2BootstrapSettings settings, Tim
 
 internal sealed record Ec2BootstrapSettings(
     string TableName, Ec2BootstrapAuthority Authority, RunnerBootstrapTarget Target, string SpentDirectory,
-    LinuxRunnerSettings Runner, bool PublishStatus = false, Ec2StatusQualification? StatusQualification = null)
+    LinuxRunnerSettings Runner, bool PublishStatus = false, Ec2StatusQualification? StatusQualification = null,
+    string? HelloEndpoint = null)
 {
     private static readonly SearchValues<char> LowercaseHex = SearchValues.Create("0123456789abcdef");
 

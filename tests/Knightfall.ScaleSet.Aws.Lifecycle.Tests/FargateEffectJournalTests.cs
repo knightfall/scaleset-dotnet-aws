@@ -534,7 +534,8 @@ public sealed class FargateEffectJournalTests
         var identity = new JitHandoffIdentity(fixture.Profile.Deployment, fixture.Profile.ProfileId, catalog.Binding.ScopeIdentity, 37,
             Guid.Parse(binding.AllocationId), binding.ResourceArn, binding.Incarnation, BootstrapUser);
         var bootstrap = new DynamoDbBootstrapOfferClient(table.Client, table.Name, BootstrapUser, binding.ResourceArn, fixture.Clock);
-        Assert.Equal(LifecycleWriteOutcome.Committed, await bootstrap.RegisterHelloAsync(recipient.Hello, token));
+        Assert.Equal(LifecycleWriteOutcome.Committed, await BrokerHelloFixture.RegisterAsync(table.Client,
+            table.Name, BootstrapUser, recipient.Hello, fixture.Clock, token));
         return (catalog, identity, "ss-" + JitOfferBinding.GetOfferId(identity)[..48], bootstrap);
     }
 

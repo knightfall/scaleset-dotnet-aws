@@ -133,7 +133,7 @@ public sealed record LifecycleKey
         ProfileItem(profile, "OP#" + Identity(intentId, nameof(intentId)), LifecycleItemKind.Operation);
 
     public static LifecycleKey Hello(string awsUserId) =>
-        BootstrapItem("HELLO#", awsUserId, LifecycleItemKind.Hello);
+        BootstrapItem("HELLO#BROKER#", awsUserId, LifecycleItemKind.Hello);
 
     public static LifecycleKey Offer(string awsUserId) =>
         BootstrapItem("OFFER#", awsUserId, LifecycleItemKind.Offer);

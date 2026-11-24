@@ -637,9 +637,14 @@ test("active profiles alone supply provider permissions, event rules and role-sc
       );
     }
     const policy = JSON.stringify(template.findResources("AWS::IAM::Policy"));
-    assert.ok(policy.includes("HELLO#${aws:userid}"));
+    assert.ok(!policy.includes("HELLO#${aws:userid}"));
     assert.ok(policy.includes("OFFER#${aws:userid}"));
     assert.ok(!policy.includes("STATUS#"));
+    assert.ok(policy.includes("ForAnyValue:StringLike"));
+    assert.ok(policy.includes("lambda:InvokedViaFunctionUrl"));
+    template.hasResourceProperties("AWS::Lambda::Url", {
+      AuthType: "AWS_IAM",
+    });
   }
 });
 
@@ -764,6 +769,10 @@ test("dry run uses neither lifecycle mutations nor event consumers", () => {
     template.resourceCountIs("AWS::ECS::Service", 1);
     template.resourceCountIs("AWS::SQS::Queue", 0);
     template.resourceCountIs("AWS::Events::Rule", 0);
+    template.hasResourceProperties("AWS::Lambda::Function", {
+      ReservedConcurrentExecutions: 0,
+      Environment: { Variables: Match.objectLike({ HELLO_ENABLED: "false" }) },
+    });
     const [task] = Object.values(
       template.findResources("AWS::ECS::TaskDefinition"),
     );

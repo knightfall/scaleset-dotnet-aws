@@ -36,6 +36,7 @@ import {
 } from "./deployment-input.ts";
 import type { ControllerDeploymentEnvironment } from "./deployment-input.ts";
 import { validateFargatePreflight } from "./fargate-preflight.ts";
+import { helloIngress } from "./hello-ingress.ts";
 import {
   bootstrapPolicy,
   ec2Profiles,
@@ -144,6 +145,7 @@ export class ControllerInfrastructure extends Stack {
     grantTableAccess(this.controllerRole, this.trackingTable, active, inspect);
     grantEc2(this.controllerRole, runtime, ec2, active);
     grantFargate(this.controllerRole, runtime, fargate, clusters, active);
+    this.configureBootstrapRoles(enabled, active);
 
     const args = [
       "run",
@@ -161,18 +163,16 @@ export class ControllerInfrastructure extends Stack {
     if (active) {
       grantHostFence(this.controllerRole, this.hostingCluster);
       grantGitHubCredentials(this.controllerRole, runtime, enabled);
-      this.attachBootstrapPolicies(enabled);
-      for (const { provisioner } of ec2) {
-        if (provisioner.statusQualification === undefined) continue;
-        const id = stableId(
-          "Ec2SupervisorStatus",
-          provisioner.bootstrapRoleArn,
-        );
-        const role = iam.Role.fromRoleArn(
-          this,
-          id,
-          provisioner.bootstrapRoleArn,
-        );
+      const statusRoles = new Set(
+        ec2
+          .filter(
+            ({ provisioner }) => provisioner.statusQualification !== undefined,
+          )
+          .map(({ provisioner }) => provisioner.bootstrapRoleArn),
+      );
+      for (const arn of statusRoles) {
+        const id = stableId("Ec2SupervisorStatus", arn);
+        const role = iam.Role.fromRoleArn(this, id, arn);
         new iam.Policy(this, `${id}Policy`, {
           roles: [role],
           statements: [ec2SupervisorStatusPolicy(this.trackingTable)],
@@ -298,7 +298,10 @@ export class ControllerInfrastructure extends Stack {
     return aliases;
   }
 
-  private attachBootstrapPolicies(profiles: readonly RunnerProfile[]) {
+  private configureBootstrapRoles(
+    profiles: readonly RunnerProfile[],
+    active: boolean,
+  ) {
     const roleArns = [
       ...new Set(
         profiles.map(({ provisioner }) => provisioner.bootstrapRoleArn),
@@ -307,10 +310,13 @@ export class ControllerInfrastructure extends Stack {
     for (const arn of roleArns) {
       const id = stableId("Bootstrap", arn);
       const role = iam.Role.fromRoleArn(this, id, arn);
-      new iam.Policy(this, `${id}Policy`, {
-        roles: [role],
-        statements: bootstrapPolicy(this.trackingTable),
-      });
+      const ingress = helloIngress(this, id, this.trackingTable, role, active);
+      if (active) {
+        new iam.Policy(this, `${id}Policy`, {
+          roles: [role],
+          statements: [...bootstrapPolicy(this.trackingTable), ...ingress],
+        });
+      }
     }
   }
 

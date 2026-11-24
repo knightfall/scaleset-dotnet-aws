@@ -3,6 +3,7 @@ using Amazon.SecurityToken;
 using Knightfall.ScaleSet.Aws.Core.Configuration;
 using Knightfall.ScaleSet.Aws.Core.Lifecycle;
 using Knightfall.ScaleSet.Aws.DynamoDb;
+using Knightfall.ScaleSet.Aws.Handoff;
 
 namespace Knightfall.ScaleSet.Aws.RunnerBootstrap.Fargate;
 
@@ -22,7 +23,8 @@ internal sealed record FargateBootstrapSettings(
     string RunnerDotnet,
     string RunnerChild,
     string WorkScratch,
-    long? ScaleSetId = null)
+    long? ScaleSetId = null,
+    string? HelloEndpoint = null)
 {
     internal RunnerBootstrapTarget Validate()
     {
@@ -64,7 +66,8 @@ internal sealed class FargateBootstrapApplication(FargateBootstrapSettings setti
     private int _spent;
 
     internal async Task<RunnerBootstrapOutcome> RunAsync(string? metadataEndpoint, HttpClient metadata,
-        IAmazonSecurityTokenService sts, IAmazonDynamoDB ddb, IOneJobRunner runner, CancellationToken cancellationToken)
+        IAmazonSecurityTokenService sts, IAmazonDynamoDB ddb, IOneJobRunner runner,
+        Func<JitHello, CancellationToken, Task<LifecycleWriteOutcome>> registerHello, CancellationToken cancellationToken)
     {
         var target = settings.Validate();
         var principal = await FargateBootstrapIdentity.ReadAsync(metadataEndpoint, metadata, sts, settings.Identity, clock, cancellationToken)
@@ -72,7 +75,7 @@ internal sealed class FargateBootstrapApplication(FargateBootstrapSettings setti
         var offers = new DynamoDbBootstrapOfferClient(ddb, settings.TableName, principal.AwsUserId, principal.TaskArn, clock);
         var bootstrap = new RunnerBootstrap(offers, target, principal.TaskArn, principal.AwsUserId,
             () => Interlocked.Exchange(ref _spent, 1) == 0, runner, clock, TimeSpan.FromMinutes(2), TimeSpan.FromSeconds(1),
-            validateProviderBinding: principal.MatchesOffer, telemetryProvider: RunnerProvisionerType.Fargate);
+            registerHello, validateProviderBinding: principal.MatchesOffer, telemetryProvider: RunnerProvisionerType.Fargate);
         return await bootstrap.RunAsync(cancellationToken).ConfigureAwait(false);
     }
 }

@@ -139,7 +139,7 @@ public sealed partial class DynamoDbLifecycleStore
         try
         {
             var item = await ReadItemAsync(key, cancellationToken).ConfigureAwait(false);
-            return item is null ? null : BootstrapItems.DecodeHello(key, item);
+            return item is null ? null : BootstrapItems.DecodeHello(key, item, _timeProvider.GetUtcNow());
         }
         catch (Exception error) when (error is InvalidDataException or CryptographicException or JsonException or ArgumentException)
         {
@@ -169,12 +169,15 @@ public sealed partial class DynamoDbLifecycleStore
     {
         var key = LifecycleKey.Hello(handoff.Identity.AwsUserId);
         return ExactJitCondition(key, "awsUserId = :principal AND helloSha256 = :hello AND protocolVersion = :version AND payload = :payload " +
-            "AND attribute_not_exists(expiresAt)", new Dictionary<string, AttributeValue>(StringComparer.Ordinal)
+            "AND helloIssuer = :issuer AND expiresAt > :now",
+            new Dictionary<string, AttributeValue>(StringComparer.Ordinal)
             {
                 [":principal"] = StringValue(handoff.Identity.AwsUserId),
                 [":hello"] = StringValue(handoff.HelloSha256),
                 [":version"] = NumberValue(handoff.Hello.ProtocolVersion),
                 [":payload"] = StringValue(BootstrapItems.Serialize(handoff.Hello)),
+                [":issuer"] = StringValue(BootstrapItems.TrustedHelloIssuer),
+                [":now"] = NumberValue(_timeProvider.GetUtcNow().ToUnixTimeSeconds()),
             });
     }
 

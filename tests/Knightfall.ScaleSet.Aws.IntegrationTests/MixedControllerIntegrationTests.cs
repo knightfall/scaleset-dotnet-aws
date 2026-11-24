@@ -8,6 +8,7 @@ using Knightfall.ScaleSet.Aws.DynamoDb;
 using Knightfall.ScaleSet.Aws.Handoff;
 using Knightfall.ScaleSet.Aws.Providers.Fargate;
 using Knightfall.ScaleSet.Aws.Telemetry.Tests;
+using Knightfall.ScaleSet.Aws.Lifecycle.Tests;
 using Xunit;
 
 namespace Knightfall.ScaleSet.Aws.IntegrationTests;
@@ -352,7 +353,8 @@ public sealed class MixedControllerIntegrationTests(ITestOutputHelper output)
         string principal = simulated.BootstrapRoleId + ":" + resource[(resource.LastIndexOf('/') + 1)..];
         var bootstrap = new DynamoDbBootstrapOfferClient(fixture.Table.Client, fixture.Table.Name, principal, resource, TimeProvider.System);
         using var recipient = JitRecipientKey.Create();
-        Assert.Equal(LifecycleWriteOutcome.Committed, await bootstrap.RegisterHelloAsync(recipient.Hello, token));
+        Assert.Equal(LifecycleWriteOutcome.Committed, await BrokerHelloFixture.RegisterAsync(fixture.Table.Client,
+            fixture.Table.Name, principal, recipient.Hello, TimeProvider.System, token));
         BootstrapOfferReceipt? receipt = null;
         await WaitAsync(async () =>
         {

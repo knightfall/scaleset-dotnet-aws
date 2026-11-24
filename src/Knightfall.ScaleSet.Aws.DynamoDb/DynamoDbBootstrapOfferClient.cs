@@ -24,7 +24,7 @@ public sealed record BootstrapOfferReceipt(BootstrapOfferStatus Status, JitOffer
     public bool Expired { get; init; }
 }
 
-/// <summary>Performs only the HELLO put and one-shot OFFER delete allowed to the runner's own bootstrap principal.</summary>
+/// <summary>Consumes the bootstrap principal's exact OFFER with a one-shot conditional delete.</summary>
 public sealed class DynamoDbBootstrapOfferClient
 {
     private const int ReadyToConsume = 0;
@@ -50,22 +50,6 @@ public sealed class DynamoDbBootstrapOfferClient
         _awsUserId = awsUserId;
         _resourceArn = resourceArn;
         _clock = timeProvider;
-    }
-
-    public async Task<LifecycleWriteOutcome> RegisterHelloAsync(JitHello hello, CancellationToken cancellationToken)
-    {
-        var key = LifecycleKey.Hello(_awsUserId);
-        var item = BootstrapItems.Key(key);
-        item.Add("awsUserId", BootstrapItems.String(_awsUserId));
-        item.Add("helloSha256", BootstrapItems.String(BootstrapItems.HelloDigest(hello)));
-        item.Add("protocolVersion", BootstrapItems.Number(hello.ProtocolVersion));
-        item.Add("payload", BootstrapItems.String(BootstrapItems.Serialize(hello)));
-        return await BootstrapItems.PutAsync(_client, new PutItemRequest
-        {
-            TableName = _tableName,
-            Item = item,
-            ConditionExpression = "attribute_not_exists(PK)",
-        }, cancellationToken).ConfigureAwait(false);
     }
 
     /// <summary>Only a known receipt contains ciphertext. An indeterminate result must not be retried.</summary>
