@@ -1,0 +1,100 @@
+# Replace the example AWS identifiers and image digest before using this file in a deployment.
+apiVersion: scaleset-aws/v1alpha1
+kind: RunnerController
+metadata:
+  name: engineering-runners
+spec:
+  aws:
+    account: "111122223333"
+    region: ap-southeast-2
+  mode: dry-run
+  dryRun:
+    demand:
+      type: none
+    inspectAws: false
+  controller:
+    image: "111122223333.dkr.ecr.ap-southeast-2.amazonaws.com/scaleset-controller@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+    hosting:
+      type: ecs-fargate
+      cluster: controller
+      network: controller-private
+      cpuArchitecture: arm64
+      cpu: 512
+      memoryMiB: 1024
+  tracking:
+    table:
+      type: import
+      name: engineering-runners-runner-lifecycle
+  networks:
+    controller-private:
+      vpcId: vpc-0123456789abcdef0
+      subnets:
+        - id: subnet-0123456789abcdef0
+          az: ap-southeast-2a
+        - id: subnet-0123456789abcdef1
+          az: ap-southeast-2b
+      securityGroupIds: [sg-0123456789abcdef0]
+    runner-private:
+      vpcId: vpc-0123456789abcdef0
+      subnets:
+        - id: subnet-0123456789abcdef2
+          az: ap-southeast-2a
+        - id: subnet-0123456789abcdef3
+          az: ap-southeast-2b
+      securityGroupIds: [sg-0123456789abcdef1]
+  ecsClusters:
+    controller:
+      type: create
+      name: engineering-runners-controller
+    fargate-runners:
+      type: import
+      arn: arn:aws:ecs:ap-southeast-2:111122223333:cluster/engineering-fargate-runners
+  github:
+    builds:
+      scopeURL: https://github.com/example-engineering/builds
+      auth:
+        type: github-app
+        secretArn: arn:aws:secretsmanager:ap-southeast-2:111122223333:secret:builds-github-app-a1b2c3
+  profiles:
+    - id: build-ec2
+      state: active
+      purpose: ec2-general
+      platform: { os: linux, arch: x64 }
+      capacity: { idleReserve: 0, maxRunners: 4, startupTimeoutSeconds: 600 }
+      github:
+        connection: builds
+        runnerGroup: Engineering-EC2
+        scaleSet: build-ec2
+        scaleSetId: "11037"
+        labels: [build-ec2]
+        registration: existing
+      provisioner:
+        type: ec2
+        launchTemplateId: lt-0123456789abcdef0
+        launchTemplateVersion:
+          type: pinned
+          version: "7"
+        network: runner-private
+        instanceProfileArn: arn:aws:iam::111122223333:instance-profile/engineering-ec2-bootstrap
+        bootstrapRoleArn: arn:aws:iam::111122223333:role/engineering-ec2-bootstrap
+        bootstrapProtocol: v1
+    - id: build-fargate
+      state: active
+      purpose: fargate-compatible
+      platform: { os: linux, arch: arm64 }
+      capacity: { idleReserve: 0, maxRunners: 3, startupTimeoutSeconds: 420 }
+      github:
+        connection: builds
+        runnerGroup: Engineering-Fargate
+        scaleSet: build-fargate
+        labels: [build-fargate]
+        registration: create-if-missing
+      provisioner:
+        type: fargate
+        cluster: fargate-runners
+        network: runner-private
+        taskDefinitionArn: arn:aws:ecs:ap-southeast-2:111122223333:task-definition/engineering-fargate-runner:11
+        runnerContainer: runner
+        bootstrapRoleArn: arn:aws:iam::111122223333:role/engineering-fargate-bootstrap
+        executionRoleArn: arn:aws:iam::111122223333:role/engineering-fargate-execution
+        bootstrapProtocol: v1
