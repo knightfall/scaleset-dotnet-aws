@@ -5,11 +5,14 @@ namespace Knightfall.ScaleSet.Aws.DynamoDb;
 
 public sealed record EffectJournalSnapshot(long Revision, Guid TransitionId, EffectJournalEntry Entry);
 
-public sealed record EffectBeginOutcome(LifecycleWriteOutcome Outcome, EffectSendAuthorization? Permission);
+public sealed record EffectBeginOutcome(LifecycleWriteOutcome Outcome, EffectSendAuthorization? Permission)
+{
+    internal bool AbandonedBeforeSend { get; init; }
+}
 
 internal sealed record EffectDispatchGuard(
     CatalogProfile Catalog, EffectIndexHead Index, string AllocationId, long? AllocationRevision,
-    JitHandoffSnapshot? Handoff = null, JitHandoffSnapshot? Removal = null);
+    JitHandoffSnapshot? Handoff = null, JitHandoffSnapshot? Removal = null, Ec2LaunchLineageSnapshot? Ec2Lineage = null);
 
 /// <summary>Evidence that an attempt was durably begun under its recorded lease epoch.</summary>
 /// <remarks>A caller must retain current ownership and respect the attempt deadline when sending.</remarks>
@@ -120,8 +123,24 @@ public sealed partial class DynamoDbEffectJournal
             return registration;
         }
 
+        if (envelope.Request is Ec2LaunchEffectRequest { OwnershipTags: not null } launch)
+        {
+            return launch.AttemptOrdinal == 0
+                ? await _store.PlanTrackedEc2LaunchAsync(lease, envelope, null, transitionId, cancellationToken).ConfigureAwait(false)
+                : LifecycleWriteOutcome.Conflict;
+        }
         return await WriteAsync(lease, EffectJournalEntry.Plan(envelope), null, transitionId, cancellationToken)
             .ConfigureAwait(false);
+    }
+
+    public Task<LifecycleWriteOutcome> PlanNextEc2LaunchAsync(
+        ControllerLease lease, EffectJournalSnapshot predecessor, EffectEnvelope next, Guid transitionId, CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(lease);
+        ArgumentNullException.ThrowIfNull(predecessor);
+        ArgumentNullException.ThrowIfNull(next);
+        ArgumentOutOfRangeException.ThrowIfEqual(transitionId, Guid.Empty);
+        return _store.PlanTrackedEc2LaunchAsync(lease, next, predecessor, transitionId, cancellationToken);
     }
 
     public Task<EffectBeginOutcome> BeginAsync(
@@ -163,7 +182,9 @@ public sealed partial class DynamoDbEffectJournal
             return new EffectBeginOutcome(LifecycleWriteOutcome.Conflict, null);
         }
         if ((current.Entry.Envelope.Request is GitHubJitGenerateEffectRequest && guard?.Handoff is null) ||
-            (current.Entry.Envelope.Request is GitHubRunnerRemoveEffectRequest && guard?.Removal is null))
+            (current.Entry.Envelope.Request is GitHubRunnerRemoveEffectRequest && guard?.Removal is null) ||
+            (current.Entry.Envelope.Request is Ec2LaunchEffectRequest { OwnershipTags: not null } &&
+            !DynamoDbLifecycleStore.MatchesEc2Lineage(guard?.Ec2Lineage, current.Entry.Envelope)))
         {
             return new EffectBeginOutcome(LifecycleWriteOutcome.Conflict, null);
         }
@@ -197,10 +218,11 @@ public sealed partial class DynamoDbEffectJournal
         {
             return new EffectBeginOutcome(outcome, permission);
         }
-        if (entry.Envelope.Request is GitHubJitGenerateEffectRequest or GitHubRunnerRemoveEffectRequest)
+        if (EffectJournalEntry.AllowsAbandonmentBeforeSend(entry.Envelope))
         {
             // The known commit completed too late, before any caller could use the send authorization.
-            _ = await AbandonUnsentRunnerEffectAsync(lease, permission, cancellationToken).ConfigureAwait(false);
+            var abandoned = await AbandonUnsentEffectAsync(lease, permission, cancellationToken).ConfigureAwait(false);
+            return new EffectBeginOutcome(outcome, null) { AbandonedBeforeSend = abandoned == LifecycleWriteOutcome.Committed };
         }
         return new EffectBeginOutcome(outcome, null);
     }
@@ -257,6 +279,11 @@ public sealed partial class DynamoDbEffectJournal
         {
             throw new InvalidOperationException("An active lease is required for ordinary effect resolution.");
         }
+        ArgumentNullException.ThrowIfNull(evidence);
+        if (evidence.Ec2LaunchRejection is not null)
+        {
+            return Task.FromResult(LifecycleWriteOutcome.Conflict);
+        }
 
         return ResolveCoreAsync(lease, expected, transitionId, evidence, cancellationToken);
     }
@@ -272,6 +299,11 @@ public sealed partial class DynamoDbEffectJournal
         if (lease.Mode != ControllerLeaseMode.RecoveryOnly)
         {
             throw new InvalidOperationException("A recovery-only lease is required for fenced effect resolution.");
+        }
+        ArgumentNullException.ThrowIfNull(evidence);
+        if (evidence.Ec2LaunchRejection is not null)
+        {
+            return Task.FromResult(LifecycleWriteOutcome.Conflict);
         }
 
         return ResolveCoreAsync(lease, expected, transitionId, evidence, cancellationToken);
@@ -291,6 +323,11 @@ public sealed partial class DynamoDbEffectJournal
         }
 
         var entry = current.Entry.Resolve(evidence);
+        if (evidence.ExecutorBinding is not null)
+        {
+            return await _store.WriteEc2ResourceSettlementAsync(lease, current, entry, transitionId, cancellationToken)
+                .ConfigureAwait(false);
+        }
         if (lease.Mode == ControllerLeaseMode.RecoveryOnly)
         {
             return await _store.WriteRecoveredEffectAsync(entry.Envelope.Profile, lease.Fence, transitionId,
@@ -300,7 +337,7 @@ public sealed partial class DynamoDbEffectJournal
 
         if (current.Entry.State == EffectState.Planned && evidence.Kind == EffectResolutionKind.Absent)
         {
-            return await _store.WriteExactRunnerEffectAsync(lease.Fence, transitionId, current, entry, null, cancellationToken)
+            return await _store.WriteExactEffectAsync(lease.Fence, transitionId, current, entry, null, cancellationToken)
                 .ConfigureAwait(false);
         }
 

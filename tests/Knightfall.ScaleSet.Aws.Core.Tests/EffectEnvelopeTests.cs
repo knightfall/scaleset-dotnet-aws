@@ -111,6 +111,10 @@ public sealed class EffectEnvelopeTests
         Assert.Equal(1, original.MinCount);
         Assert.Equal(1, original.MaxCount);
         Assert.Contains("\"maxCount\":1", replay.CanonicalJson, StringComparison.Ordinal);
+        Assert.DoesNotContain("\"attemptOrdinal\"", replay.CanonicalJson, StringComparison.Ordinal);
+        Assert.DoesNotContain("\"tenancy\"", replay.CanonicalJson, StringComparison.Ordinal);
+        Assert.DoesNotContain("\"ownershipTags\"", replay.CanonicalJson, StringComparison.Ordinal);
+        Assert.Equal("ec2-launch-" + Allocation.ToString("D"), EffectIntentIdentity.ForAllocation(original));
         Assert.Equal("us-east-1/us-east-1a/subnet-0123456789abcdef0", replay.Target.Scope);
         Assert.NotEqual(replay.Target, changedSubnet.Target);
         Assert.NotEqual(replay.Sha256, changedSubnet.Sha256);

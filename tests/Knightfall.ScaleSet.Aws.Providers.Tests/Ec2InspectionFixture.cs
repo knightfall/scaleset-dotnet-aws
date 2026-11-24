@@ -6,6 +6,7 @@ using Amazon.EC2;
 using Amazon.IdentityManagement;
 using Amazon.SecurityToken;
 using Knightfall.ScaleSet.Aws.Core.Configuration;
+using Knightfall.ScaleSet.Aws.Core.Lifecycle;
 using Knightfall.ScaleSet.Aws.Providers.Ec2;
 using Knightfall.ScaleSet.Aws.SdkContract.Tests.Aws;
 
@@ -50,6 +51,16 @@ internal sealed class Ec2InspectionFixture : IDisposable
     }
 
     internal Ec2ProfileInspector Inspector { get; }
+
+    internal Ec2EffectProvider CreateProvider(RuntimeConfiguration configuration)
+    {
+        var ec2 = _wire.Configure(new AmazonEC2Config());
+        ec2.AuthenticationRegion = Region;
+        ec2.AllowAutoRedirect = false;
+        return new Ec2EffectProvider(configuration, new LifecycleProfile(RunnerOwnershipTags.DeploymentIdentity(configuration), ProfileId), AwsWireTransport.Credentials,
+            ec2, _wire.Configure(new AmazonIdentityManagementServiceConfig()),
+            _wire.Configure(new AmazonSecurityTokenServiceConfig()), new FixtureClock());
+    }
     internal IReadOnlyList<AwsWireRequest> WireRequests => _wire.Requests;
     internal NameValueCollection[] Requests => _wire.Requests.Select(ParseQuery).ToArray();
     internal string IdentityResponse { get; set; } = CallerIdentity();
@@ -63,20 +74,31 @@ internal sealed class Ec2InspectionFixture : IDisposable
     internal string GroupsResponse { get; set; } = Groups();
     internal Func<NameValueCollection, HttpResponseMessage> RouteTableResponse { get; set; } =
         static _ => AwsWireTransport.Xml(RouteTables());
+    internal Func<NameValueCollection, HttpResponseMessage>? LaunchResponse { get; set; }
+    internal Func<NameValueCollection, HttpResponseMessage>? TerminationResponse { get; set; }
     internal Func<NameValueCollection, HttpResponseMessage> InventoryResponse { get; set; } =
         static _ => AwsWireTransport.Xml(InventoryPage());
 
     internal static async Task<RuntimeConfiguration> ConfigurationAsync(
-        CancellationToken cancellationToken, string selector = "$Latest", bool inspectAws = true, string? instanceType = null)
+        CancellationToken cancellationToken, string selector = "$Latest", bool inspectAws = true, string? instanceType = null,
+        bool active = false, string? subnetStrategy = null)
     {
         string path = Path.Combine(AppContext.BaseDirectory, "ec2-only-latest.json");
         var document = JsonNode.Parse(await File.ReadAllTextAsync(path, cancellationToken))!;
         var spec = document["spec"]!;
         spec["dryRun"]!["inspectAws"] = inspectAws;
+        if (active)
+        {
+            spec["mode"] = "active";
+        }
         var provisioner = spec["profiles"]![0]!["provisioner"]!;
         if (instanceType is not null)
         {
             provisioner["instanceType"] = instanceType;
+        }
+        if (subnetStrategy is not null)
+        {
+            provisioner["subnetStrategy"] = subnetStrategy;
         }
         provisioner["launchTemplateVersion"] = selector.StartsWith('$')
             ? new JsonObject { ["type"] = "alias", ["name"] = selector }
@@ -159,11 +181,12 @@ internal sealed class Ec2InspectionFixture : IDisposable
         </GetRoleResponse>
         """;
 
-    internal static string Subnets(string firstVpc = Vpc, string firstPublic = "false", string firstZone = Region + "a") => $"""
+    internal static string Subnets(string firstVpc = Vpc, string firstPublic = "false", string firstZone = Region + "a",
+        string secondAvailable = "0") => $"""
         <DescribeSubnetsResponse xmlns="{Namespace}">
           <requestId>subnets-1</requestId><subnetSet>
             <item><subnetId>{Subnet2}</subnetId><vpcId>{Vpc}</vpcId>
-              <availabilityZone>{Region}b</availabilityZone><availableIpAddressCount>0</availableIpAddressCount>
+              <availabilityZone>{Region}b</availabilityZone><availableIpAddressCount>{secondAvailable}</availableIpAddressCount>
               <state>available</state><mapPublicIpOnLaunch>false</mapPublicIpOnLaunch></item>
             <item><subnetId>{Subnet1}</subnetId><vpcId>{firstVpc}</vpcId>
               <availabilityZone>{firstZone}</availabilityZone><availableIpAddressCount>7</availableIpAddressCount>
@@ -256,6 +279,8 @@ internal sealed class Ec2InspectionFixture : IDisposable
             "DescribeSecurityGroups" => AwsWireTransport.Xml(GroupsResponse),
             "DescribeRouteTables" => RouteTableResponse(query),
             "DescribeInstances" => InventoryResponse(query),
+            "RunInstances" when LaunchResponse is not null => LaunchResponse(query),
+            "TerminateInstances" when TerminationResponse is not null => TerminationResponse(query),
             _ => throw new InvalidOperationException("The fixture only supports the EC2 inspection read surface."),
         };
     }

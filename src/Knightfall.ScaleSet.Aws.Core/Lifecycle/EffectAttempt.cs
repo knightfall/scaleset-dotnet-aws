@@ -1,4 +1,5 @@
 using System.Text.Json;
+using System.Text.Json.Serialization;
 
 namespace Knightfall.ScaleSet.Aws.Core.Lifecycle;
 
@@ -19,7 +20,20 @@ public sealed record EffectEvidence(
     EffectTargetBinding Target,
     DateTimeOffset ObservedAt,
     Guid? AttemptId = null,
-    DateTimeOffset? EarliestObservedAt = null);
+    DateTimeOffset? EarliestObservedAt = null)
+{
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public ExecutorBinding? ExecutorBinding { get; init; }
+
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public ExecutorResourceObservation? ResourceObservation { get; init; }
+
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public Ec2LaunchRejection? Ec2LaunchRejection { get; init; }
+
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public DateTimeOffset? LatestObservedAt { get; init; }
+}
 
 public sealed class EffectJournalEntry
 {
@@ -112,13 +126,13 @@ public sealed class EffectJournalEntry
         return Settle(evidence);
     }
 
-    internal EffectJournalEntry AbandonRunnerEffectBeforeSend(EffectAttempt attempt, DateTimeOffset observedAt)
+    internal EffectJournalEntry AbandonBeforeSend(EffectAttempt attempt, DateTimeOffset observedAt)
     {
         var evidence = new EffectEvidence(EffectResolutionKind.AbandonedBeforeSend, Envelope.Sha256, Envelope.Target,
             observedAt, attempt.Id);
         if (State != EffectState.Executing || Attempt != attempt || !ValidAbandonment(evidence))
         {
-            throw new InvalidOperationException("Only the exact initial runner effect attempt may be abandoned before send.");
+            throw new InvalidOperationException("Only the exact initial effect attempt may be abandoned before send.");
         }
 
         return Settle(evidence);
@@ -137,6 +151,7 @@ public sealed class EffectJournalEntry
                 {
                     ObservedAt = evidence.ObservedAt.ToUniversalTime(),
                     EarliestObservedAt = evidence.EarliestObservedAt?.ToUniversalTime(),
+                    LatestObservedAt = evidence.LatestObservedAt?.ToUniversalTime(),
                 },
             });
 
@@ -220,7 +235,9 @@ public sealed class EffectJournalEntry
         return evidence.Kind switch
         {
             EffectResolutionKind.Applied => evidence.AttemptId is null && evidence.ObservedAt >= Envelope.EarliestPossibleFirstSend,
-            EffectResolutionKind.Rejected => !EarlierSendUncertain && evidence.AttemptId == attempt.Id && evidence.ObservedAt >= attempt.BeganAt,
+            EffectResolutionKind.Rejected => !EarlierSendUncertain && evidence.AttemptId == attempt.Id &&
+                (evidence.Ec2LaunchRejection is null ? evidence.ObservedAt >= attempt.BeganAt :
+                    evidence.LatestObservedAt >= attempt.BeganAt && evidence.LatestObservedAt <= attempt.Deadline),
             EffectResolutionKind.Absent => evidence.AttemptId is null &&
                 evidence.EarliestObservedAt is { } lowerBound && lowerBound >= LatestAuthorizedDeadline,
             _ => false,
@@ -229,13 +246,43 @@ public sealed class EffectJournalEntry
 
     private bool MatchesEvidence(EffectEvidence evidence) =>
         evidence.EnvelopeSha256 == Envelope.Sha256 && evidence.Target == Envelope.Target &&
-        evidence.ObservedAt != default && !(evidence.EarliestObservedAt > evidence.ObservedAt);
+        evidence.ObservedAt != default && !(evidence.EarliestObservedAt > evidence.ObservedAt) &&
+        !(evidence.LatestObservedAt < evidence.ObservedAt) && MatchesProviderEvidence(evidence);
+
+    internal static bool AllowsAbandonmentBeforeSend(EffectEnvelope envelope) =>
+        envelope.ProviderReplayDeadline is null && envelope.Request is (GitHubJitGenerateEffectRequest or
+            GitHubRunnerRemoveEffectRequest or Ec2LaunchEffectRequest { OwnershipTags: not null });
 
     private bool ValidAbandonment(EffectEvidence evidence) =>
         MatchesEvidence(evidence) && evidence.EarliestObservedAt is null && !EarlierSendUncertain &&
-        Envelope.ProviderReplayDeadline is null && Envelope.Request is GitHubJitGenerateEffectRequest or GitHubRunnerRemoveEffectRequest &&
+        AllowsAbandonmentBeforeSend(Envelope) &&
         Attempt is { } attempt && evidence.AttemptId == attempt.Id && evidence.ObservedAt >= attempt.BeganAt &&
         LatestAuthorizedDeadline == attempt.Deadline;
+
+    private bool MatchesProviderEvidence(EffectEvidence evidence)
+    {
+        if (evidence.Ec2LaunchRejection is { } rejected)
+        {
+            return Envelope.Request is Ec2LaunchEffectRequest { OwnershipTags: not null } && Enum.IsDefined(rejected) &&
+                evidence is { Kind: EffectResolutionKind.Rejected, LatestObservedAt: not null, ExecutorBinding: null, ResourceObservation: null };
+        }
+        if (evidence.LatestObservedAt is not null)
+        {
+            return false;
+        }
+        if (evidence.ExecutorBinding is { } binding && evidence.ResourceObservation is { } resource)
+        {
+            return evidence.Kind == EffectResolutionKind.Applied && resource.ObservedAt <= evidence.ObservedAt && Envelope.Request switch
+            {
+                Ec2LaunchEffectRequest { OwnershipTags: not null } launch => Ec2LaunchProof.Matches(Envelope.Profile, launch, binding, resource),
+                Ec2TerminateEffectRequest terminate => Ec2LaunchProof.Matches(Envelope.Profile, terminate, binding, resource),
+                _ => false,
+            };
+        }
+        return evidence is { ExecutorBinding: null, ResourceObservation: null } &&
+            (Envelope.Request is not Ec2LaunchEffectRequest { OwnershipTags: not null } ||
+             evidence.Kind is not (EffectResolutionKind.Applied or EffectResolutionKind.Rejected));
+    }
 
     private bool ValidState()
     {

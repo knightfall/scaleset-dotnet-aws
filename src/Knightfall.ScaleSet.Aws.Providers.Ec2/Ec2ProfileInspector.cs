@@ -353,14 +353,14 @@ public sealed partial class Ec2ProfileInspector : IDisposable
         long.TryParse(value, NumberStyles.None, CultureInfo.InvariantCulture, out parsed) &&
         parsed > 0 && value == parsed.ToString(CultureInfo.InvariantCulture);
 
-    private static bool IsResourceId(string? value, string prefix) =>
+    internal static bool IsResourceId(string? value, string prefix) =>
         value?.StartsWith(prefix, StringComparison.Ordinal) == true &&
         value.Length - prefix.Length is 8 or 17 &&
         value.AsSpan(prefix.Length).IndexOfAnyExcept(LowercaseHex) == -1;
 
     private static string ArnName(string arn) => arn[(arn.LastIndexOf('/') + 1)..];
 
-    private static bool IsReadFailure(Exception error, CancellationToken cancellationToken) =>
+    internal static bool IsReadFailure(Exception error, CancellationToken cancellationToken) =>
         !cancellationToken.IsCancellationRequested &&
         error is AmazonServiceException or AmazonClientException or HttpRequestException or IOException or TimeoutException or OperationCanceledException;
 

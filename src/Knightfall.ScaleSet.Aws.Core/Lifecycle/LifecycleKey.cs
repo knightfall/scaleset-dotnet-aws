@@ -26,6 +26,7 @@ public enum LifecycleItemKind
     Drain = 21,
     Handoff = 22,
     HandoffHead = 23,
+    Ec2LaunchLineage = 24,
 }
 
 public sealed record LifecycleProfile
@@ -118,6 +119,9 @@ public sealed record LifecycleKey
 
     public static LifecycleKey HandoffHead(LifecycleProfile profile) =>
         ProfileItem(profile, "HANDOFFS", LifecycleItemKind.HandoffHead);
+
+    public static LifecycleKey Ec2LaunchLineage(LifecycleProfile profile, Guid allocationId) =>
+        ProfileItem(profile, "EC2-LAUNCH#" + GuidIdentity(allocationId, nameof(allocationId)), LifecycleItemKind.Ec2LaunchLineage);
 
     public static LifecycleKey RunnerIdentity(LifecycleProfile profile, long runnerId)
     {

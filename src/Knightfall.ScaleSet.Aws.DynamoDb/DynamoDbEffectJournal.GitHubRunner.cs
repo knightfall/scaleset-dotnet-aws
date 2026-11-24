@@ -37,7 +37,7 @@ public sealed partial class DynamoDbEffectJournal
                 current.Entry.Attempt == authorization.Attempt && current.Entry.Envelope.Matches(envelope))
             {
                 var uncertain = current.Entry.MarkUncertain(authorization.Attempt.Id);
-                _ = await _store.WriteExactRunnerEffectAsync(lease.Fence, Guid.NewGuid(), current, uncertain,
+                _ = await _store.WriteExactEffectAsync(lease.Fence, Guid.NewGuid(), current, uncertain,
                     authorization.EstimateUtcNow(), cleanup.Token).ConfigureAwait(false);
             }
         }
@@ -61,9 +61,23 @@ public sealed partial class DynamoDbEffectJournal
         {
             return LifecycleWriteOutcome.LeaseRejected;
         }
+        if (authorization.Envelope.Request is not (GitHubJitGenerateEffectRequest or GitHubRunnerRemoveEffectRequest))
+        {
+            return LifecycleWriteOutcome.Conflict;
+        }
+        return await AbandonUnsentEffectAsync(lease, authorization, cancellationToken).ConfigureAwait(false);
+    }
+
+    internal async Task<LifecycleWriteOutcome> AbandonUnsentEffectAsync(
+        ControllerLease lease, EffectSendAuthorization authorization, CancellationToken cancellationToken)
+    {
+        if (lease.Mode != ControllerLeaseMode.Active || lease.Fence != authorization.Lease)
+        {
+            return LifecycleWriteOutcome.LeaseRejected;
+        }
+
         var envelope = authorization.Envelope;
-        if (envelope.Request is not (GitHubJitGenerateEffectRequest or GitHubRunnerRemoveEffectRequest) ||
-            envelope.ProviderReplayDeadline is not null || authorization.TryDiscard() is not { } discard)
+        if (!EffectJournalEntry.AllowsAbandonmentBeforeSend(envelope) || authorization.TryDiscard() is not { } discard)
         {
             return LifecycleWriteOutcome.Conflict;
         }
@@ -87,8 +101,8 @@ public sealed partial class DynamoDbEffectJournal
             return LifecycleWriteOutcome.Conflict;
         }
 
-        var settled = current.Entry.AbandonRunnerEffectBeforeSend(authorization.Attempt, discard.ObservedAt);
-        var outcome = await _store.WriteExactRunnerEffectAsync(owner.Fence, discard.TransitionId, current, settled,
+        var settled = current.Entry.AbandonBeforeSend(authorization.Attempt, discard.ObservedAt);
+        var outcome = await _store.WriteExactEffectAsync(owner.Fence, discard.TransitionId, current, settled,
             authorization.EstimateUtcNow(), cancellationToken).ConfigureAwait(false);
         if (outcome is LifecycleWriteOutcome.Conflict or LifecycleWriteOutcome.Indeterminate &&
             MatchesAbandonment(await ReadAsync(envelope.Profile, envelope.IntentId, cancellationToken).ConfigureAwait(false), authorization, discard))
@@ -133,7 +147,7 @@ public sealed partial class DynamoDbEffectJournal
         {
             return LifecycleWriteOutcome.Conflict;
         }
-        var outcome = await _store.WriteExactRunnerEffectAsync(owner.Fence, transition, current, planned, null, cancellationToken)
+        var outcome = await _store.WriteExactEffectAsync(owner.Fence, transition, current, planned, null, cancellationToken)
             .ConfigureAwait(false);
         if (outcome is LifecycleWriteOutcome.Conflict or LifecycleWriteOutcome.Indeterminate)
         {

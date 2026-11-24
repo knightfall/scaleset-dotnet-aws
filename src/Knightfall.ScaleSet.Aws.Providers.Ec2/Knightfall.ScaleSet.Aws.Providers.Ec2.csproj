@@ -8,5 +8,6 @@
     <PackageReference Include="AWSSDK.EC2" />
     <PackageReference Include="AWSSDK.IdentityManagement" />
     <PackageReference Include="AWSSDK.SecurityToken" />
+    <PackageReference Include="AWSSDK.SQS" />
   </ItemGroup>
 </Project>

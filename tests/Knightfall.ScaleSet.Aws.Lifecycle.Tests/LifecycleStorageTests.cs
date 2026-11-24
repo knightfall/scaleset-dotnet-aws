@@ -41,6 +41,7 @@ public sealed class LifecycleStorageTests
             (LifecycleKey.Drain(profile), "PROFILE#d#p", "DRAIN"),
             (LifecycleKey.Handoff(profile, session), "PROFILE#d#p", $"HANDOFF#{session:D}"),
             (LifecycleKey.HandoffHead(profile), "PROFILE#d#p", "HANDOFFS"),
+            (LifecycleKey.Ec2LaunchLineage(profile, session), "PROFILE#d#p", $"EC2-LAUNCH#{session:D}"),
         ];
 
         Assert.Equal(Enum.GetValues<LifecycleItemKind>(), expected.Select(row => row.Key.Kind));
