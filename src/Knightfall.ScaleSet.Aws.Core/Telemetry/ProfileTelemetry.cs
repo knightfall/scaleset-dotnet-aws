@@ -55,7 +55,7 @@ public sealed class ProfileTelemetry : IDisposable
         Gauge("capacity.configured_max", "{runner}", static (profile, _) => profile.Limits.MaxRunners);
         Gauge("capacity.configured_idle_reserve", "{runner}", static (profile, _) => profile.Limits.IdleReserve);
         Gauge("effects.unfinished", "{operation}", static (profile, now) => profile.Sample?.Current(now)?.UnfinishedEffects);
-        Gauge("profile.ready", "1", static (profile, now) => profile.Sample?.Current(now)?.IsReady == true ? 1 : 0, always: true);
+        Gauge("profile.ready", "1", static (profile, now) => profile.Sample?.IsReadyAt(now) == true ? 1 : 0, always: true);
 
         AgeGauge("inventory.age", static (profile, _) => profile.LastCompleteInventoryAt);
         AgeGauge("reconcile.age", static (profile, _) => profile.Sample?.ReconciledAt);
@@ -66,35 +66,48 @@ public sealed class ProfileTelemetry : IDisposable
     }
 
     /// <summary>Updates the confirmed active lease. An explicitly ended epoch cannot be reopened.</summary>
-    public void SetOwnership(ControllerLease lease)
+    public void SetOwnership(ControllerLease lease, ControllerClockEvidence clockEvidence, TimeSpan reserve)
     {
         ArgumentNullException.ThrowIfNull(lease);
-        if (lease.Deployment != _deployment || lease.Mode != ControllerLeaseMode.Active || lease.ValidUntil <= _clock.GetUtcNow())
+        ArgumentNullException.ThrowIfNull(clockEvidence);
+        var now = _clock.GetUtcNow();
+        if (lease.Deployment != _deployment || lease.Mode != ControllerLeaseMode.Active ||
+            !clockEvidence.TryGetUpperBound(now, lease.ValidUntil, reserve, out _))
         {
             return;
         }
 
+        var leaseCutoff = lease.ValidUntil - reserve - clockEvidence.MaximumAbsoluteSkew;
+        var proofCutoff = clockEvidence.ValidUntil - clockEvidence.MaximumAbsoluteSkew;
+        var cutoff = leaseCutoff < proofCutoff ? leaseCutoff : proofCutoff;
         ImmutableInterlocked.Update(ref _cache, static (cache, candidate) =>
         {
-            if (cache.Lease is { } current)
+            if (cache.Authority is { } authority)
             {
-                if (candidate.Epoch < current.Epoch || (candidate.Epoch == current.Epoch &&
-                    (cache.Ended || candidate.Fence != current.Fence || candidate.Revision <= current.Revision)))
+                var current = authority.Lease;
+                if (candidate.Lease.Epoch < current.Epoch || (candidate.Lease.Epoch == current.Epoch &&
+                    (cache.Ended || candidate.Lease.Fence != current.Fence || candidate.Lease.Revision < current.Revision ||
+                    candidate.ClockObservedAt < authority.ClockObservedAt)))
                 {
                     return cache;
                 }
-                if (candidate.Fence == current.Fence)
+                if (candidate.Lease.Fence == current.Fence)
                 {
-                    return cache with { Lease = candidate };
+                    if (candidate.Lease.Revision == current.Revision &&
+                        (candidate.Lease != current || (candidate.ClockObservedAt == authority.ClockObservedAt && candidate.Cutoff >= authority.Cutoff)))
+                    {
+                        return cache;
+                    }
+                    return cache with { Authority = candidate };
                 }
             }
             return new Cache(candidate, false, ClearSamples(cache.Profiles));
-        }, lease);
+        }, new Authority(lease, clockEvidence.ObservedAt, cutoff));
     }
 
     public void EndOwnership(DeploymentLeaseFence fence) =>
         ImmutableInterlocked.Update(ref _cache, static (cache, expected) =>
-            cache.Lease?.Fence == expected && !cache.Ended
+            cache.Authority?.Lease.Fence == expected && !cache.Ended
                 ? cache with { Ended = true, Profiles = ClearSamples(cache.Profiles) }
                 : cache, fence);
 
@@ -171,7 +184,7 @@ public sealed class ProfileTelemetry : IDisposable
     {
         var cache = Volatile.Read(ref _cache);
         var now = _clock.GetUtcNow();
-        bool owned = cache is { Ended: false, Lease.ValidUntil: var expires } && expires > now;
+        bool owned = cache.IsCurrent(now);
         if (owned || always)
         {
             foreach (var profile in cache.Profiles.Values)
@@ -188,10 +201,15 @@ public sealed class ProfileTelemetry : IDisposable
         profiles.ToImmutableDictionary(pair => pair.Key,
             pair => pair.Value with { Sample = null, LastCompleteInventoryAt = null, CooldownUntil = null }, profiles.KeyComparer);
 
-    private sealed record Cache(ControllerLease? Lease, bool Ended, ImmutableDictionary<string, Profile> Profiles)
+    private sealed record Authority(ControllerLease Lease, DateTimeOffset ClockObservedAt, DateTimeOffset Cutoff);
+
+    private sealed record Cache(Authority? Authority, bool Ended, ImmutableDictionary<string, Profile> Profiles)
     {
+        internal bool IsCurrent(DateTimeOffset now) => !Ended && Authority is { } authority &&
+            authority.ClockObservedAt <= now && now < authority.Cutoff;
+
         internal bool Owns(DeploymentLeaseFence fence, DateTimeOffset now) =>
-            !Ended && Lease is { } lease && lease.ValidUntil > now && lease.Fence == fence;
+            IsCurrent(now) && Authority?.Lease.Fence == fence;
     }
 
     private sealed record Profile(TelemetryProfile Identity, RunnerCapacityConfiguration Limits, Sample? Sample,
@@ -212,6 +230,8 @@ public sealed class ProfileTelemetry : IDisposable
             ? InventoryCounts : null;
 
         internal int? Deficit(DateTimeOffset now) => Fresh(DemandAt, now) && Inventory(now) is not null ? DeficitCount : null;
+
+        internal bool IsReadyAt(DateTimeOffset now) => IsReady && Fresh(DemandAt, now) && Inventory(now) is not null;
 
         private static bool Fresh(DateTimeOffset? timestamp, DateTimeOffset now) => timestamp is { } at &&
             CapacityPlanner.GetObservationStatus(at, now) == ObservationStatus.Fresh;

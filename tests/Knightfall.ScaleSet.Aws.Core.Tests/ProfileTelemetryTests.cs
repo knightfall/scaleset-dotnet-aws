@@ -27,7 +27,7 @@ public sealed class ProfileTelemetryTests
         Assert.All(capture.Read("profile.ready"), sample => Assert.Equal(0, sample.Value));
         Assert.Empty(capture.Read("capacity.assigned"));
 
-        meter.SetOwnership(first);
+        ConfirmOwnership(meter, first, clock);
         foreach (var profile in config.Profiles)
         {
             Observe(meter, first, profile, clock, 0);
@@ -59,9 +59,10 @@ public sealed class ProfileTelemetryTests
         Assert.Empty(capture.Read("capacity.assigned"));
         Assert.Empty(capture.Read("capacity.orphan_candidates"));
         Assert.All(capture.Read("inventory.age"), sample => Assert.Equal(604, sample.Value));
+        Assert.All(capture.Read("profile.ready"), sample => Assert.Equal(0, sample.Value));
 
         meter.EndOwnership(first.Fence);
-        meter.SetOwnership(first with { Revision = 2 });
+        ConfirmOwnership(meter, first with { Revision = 2 }, clock);
         Observe(meter, first, config.Profiles[0], clock, 20);
         Assert.Empty(capture.Read("capacity.assigned"));
         Assert.Empty(capture.Read("inventory.age"));
@@ -69,7 +70,7 @@ public sealed class ProfileTelemetryTests
         Assert.All(capture.Read("profile.ready"), sample => Assert.Equal(0, sample.Value));
 
         var successor = Lease(config, clock, 2);
-        meter.SetOwnership(successor);
+        ConfirmOwnership(meter, successor, clock);
         Observe(meter, successor, config.Profiles[0], clock, 7);
         Observe(meter, successor, config.Profiles[1], clock, 8, complete: false);
         Assert.Equal(7, capture.Read("capacity.assigned").Single(s => s.Profile == one).Value);
@@ -78,6 +79,33 @@ public sealed class ProfileTelemetryTests
         Observe(meter, successor, config.Profiles[0], clock, 9);
         Assert.DoesNotContain(capture.Read("profile.ready"), sample => sample.Profile == one);
         Assert.DoesNotContain(capture.Read("capacity.assigned"), sample => sample.Profile == one);
+    }
+
+    [Fact]
+    public void GaugeAuthorityUsesTheClockBoundAndLeaseReserveAndAcceptsNewProofForTheSameLease()
+    {
+        byte[] bytes = ConfigurationFixtures.Runtime(ConfigurationFixtures.Mixed);
+        var config = RuntimeConfigurationLoader.Load(bytes, ConfigurationFixtures.Sha256(bytes));
+        var clock = new ManualClock(new DateTimeOffset(2026, 1, 1, 0, 0, 0, TimeSpan.Zero));
+        using var meter = new ProfileTelemetry(config, clock);
+        using var capture = new GaugeCapture();
+        var lease = Lease(config, clock, 1) with { ValidUntil = clock.GetUtcNow().AddSeconds(20) };
+        var profile = config.Profiles[0];
+        TimeSpan skew = TimeSpan.FromSeconds(1);
+        TimeSpan reserve = TimeSpan.FromSeconds(2);
+        var original = new ControllerClockEvidence(clock.GetUtcNow(), clock.GetUtcNow().AddSeconds(10), skew);
+        meter.SetOwnership(lease, original, reserve);
+        Observe(meter, lease, profile, clock, 5);
+        Assert.Equal(5, Assert.Single(capture.Read("capacity.assigned")).Value);
+        clock.Advance(TimeSpan.FromSeconds(9));
+        Assert.Empty(capture.Read("capacity.assigned"));
+
+        var refreshed = new ControllerClockEvidence(clock.GetUtcNow(), clock.GetUtcNow().AddSeconds(30), skew);
+        meter.SetOwnership(lease, refreshed, reserve);
+        Assert.Equal(5, Assert.Single(capture.Read("capacity.assigned")).Value);
+        clock.Advance(TimeSpan.FromSeconds(8));
+        Assert.Empty(capture.Read("capacity.assigned"));
+        Assert.All(capture.Read("profile.ready"), sample => Assert.Equal(0, sample.Value));
     }
 
     [Fact]
@@ -111,6 +139,12 @@ public sealed class ProfileTelemetryTests
     private static ControllerLease Lease(RuntimeConfiguration config, ManualClock clock, long epoch) =>
         new(RunnerOwnershipTags.DeploymentIdentity(config), "owner", "task", epoch, 1, clock.GetUtcNow().AddHours(1), 1, Guid.NewGuid(),
             ControllerLeaseMode.Active, null, null);
+
+    private static void ConfirmOwnership(ProfileTelemetry meter, ControllerLease lease, ManualClock clock)
+    {
+        var now = clock.GetUtcNow();
+        meter.SetOwnership(lease, new ControllerClockEvidence(now, now.AddHours(1), TimeSpan.Zero), TimeSpan.Zero);
+    }
 
     private static void Observe(ProfileTelemetry meter, ControllerLease lease, RunnerProfile profile, ManualClock clock,
         int assigned, bool complete = true)

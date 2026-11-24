@@ -97,7 +97,9 @@ public sealed class FargateTaskEventConsumerTests
         using var aws = new FargateInspectionFixture
         {
             ReceiveMessage = _ => ++poll == 1
-                ? Messages(("newest", Event(7, "STOPPED")), ("older", Event(6, "RUNNING")), ("duplicate", Event(7, "STOPPED")))
+                ? Messages(("newest", Event(7, "STOPPED").Replace(
+                    "\"time\":null", "\"time\":\"2026-01-01T00:00:00Z\\ud800\"", StringComparison.Ordinal)),
+                    ("older", Event(6, "RUNNING")), ("duplicate", Event(7, "STOPPED")))
                 : Messages(("late", Event(8, "STOPPED"))),
             DescribeTasks = _ => TasksReply(task),
         };

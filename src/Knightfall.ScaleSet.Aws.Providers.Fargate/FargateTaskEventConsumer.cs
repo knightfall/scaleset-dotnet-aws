@@ -79,6 +79,7 @@ public sealed class FargateTaskEventConsumer : IDisposable
             receive?.Complete("success", result.Messages is { Count: > 0 } ? "batch_received" : "queue_empty");
         }
 
+        var receivedAt = _clock.GetUtcNow();
         var valid = new List<(Message Message, FargateTaskEvent Hint)>();
         foreach (var message in result.Messages ?? [])
         {
@@ -108,7 +109,7 @@ public sealed class FargateTaskEventConsumer : IDisposable
                 var observation = await _inspector.ReadEventAsync(_configuration, newest, cancellationToken).ConfigureAwait(false);
                 if (observation is null)
                 {
-                    FargateDiagnostics.RecordEventAge(null, newest.EventTime, _clock.GetUtcNow());
+                    FargateDiagnostics.RecordEventAge(null, newest.EventTime, receivedAt);
                     process?.Complete("unknown", "no_exact_task");
                     continue;
                 }
@@ -125,7 +126,7 @@ public sealed class FargateTaskEventConsumer : IDisposable
                     using var profileScope = TelemetryProfileScope.Enter(identity);
                     if (!await apply(binding, resource, cancellationToken).ConfigureAwait(false))
                     {
-                        FargateDiagnostics.RecordEventAge(identity, newest.EventTime, _clock.GetUtcNow());
+                        FargateDiagnostics.RecordEventAge(identity, newest.EventTime, receivedAt);
                         process?.Complete("deferred", "readback_not_accepted");
                         continue;
                     }
@@ -144,7 +145,7 @@ public sealed class FargateTaskEventConsumer : IDisposable
 
             foreach (var (message, hint) in group)
             {
-                FargateDiagnostics.RecordEventAge(identity, hint.EventTime, _clock.GetUtcNow());
+                FargateDiagnostics.RecordEventAge(identity, hint.EventTime, receivedAt);
                 await AcknowledgeAsync(message, cancellationToken, identity).ConfigureAwait(false);
             }
         }
@@ -201,9 +202,7 @@ internal sealed record FargateTaskEvent(string ClusterArn, string TaskArn, strin
                 return null;
             }
 
-            DateTimeOffset? eventTime = root.TryGetProperty("time", out var time) && time.ValueKind == JsonValueKind.String &&
-                time.TryGetDateTimeOffset(out var timestamp) ? timestamp : null;
-            return new FargateTaskEvent(cluster, task, definition, parsed, eventTime);
+            return new FargateTaskEvent(cluster, task, definition, parsed, EventTimestamp.Read(root));
         }
         catch (JsonException)
         {

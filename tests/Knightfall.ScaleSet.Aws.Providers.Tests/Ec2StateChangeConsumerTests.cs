@@ -31,7 +31,7 @@ public sealed class Ec2StateChangeConsumerTests
                 Messages = new[]
                 {
                     Message("terminated-receipt", Event("terminated")),
-                    Message("stale-pending-receipt", Event("pending")),
+                    Message("stale-pending-receipt", Event("pending")[..^1] + ""","time":"2026-01-01T00:00:00Z\ud800"}"""),
                     Message("wrong-account-receipt", Event("running", "999999999999")),
                 },
             })),

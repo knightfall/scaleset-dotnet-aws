@@ -2,6 +2,7 @@ using System.Text.Json;
 using Amazon.SQS;
 using Amazon.SQS.Model;
 using Knightfall.ScaleSet.Aws.Core.Configuration;
+using Knightfall.ScaleSet.Aws.Core.Telemetry;
 
 namespace Knightfall.ScaleSet.Aws.Providers.Ec2;
 
@@ -62,6 +63,7 @@ public sealed class Ec2StateChangeConsumer
             receive?.Complete("success", response.Messages is { Count: > 0 } ? "batch_received" : "queue_empty");
         }
 
+        var receivedAt = _clock.GetUtcNow();
         int acknowledged = 0;
         foreach (var message in response.Messages ?? [])
         {
@@ -72,7 +74,7 @@ public sealed class Ec2StateChangeConsumer
                 process?.Complete("rejected", "invalid_event");
                 continue;
             }
-            Ec2Diagnostics.RecordEventAge(observation.EventTime, _clock.GetUtcNow());
+            Ec2Diagnostics.RecordEventAge(observation.EventTime, receivedAt);
             if (!await refresh(observation.Hint, cancellationToken).ConfigureAwait(false))
             {
                 process?.Complete("deferred", "readback_not_accepted");
@@ -121,9 +123,7 @@ public sealed class Ec2StateChangeConsumer
             {
                 return null;
             }
-            DateTimeOffset? eventTime = root.TryGetProperty("time", out var time) && time.ValueKind == JsonValueKind.String &&
-                time.TryGetDateTimeOffset(out var parsed) ? parsed : null;
-            return (new Ec2StateChangeHint(instanceId!, arn), eventTime);
+            return (new Ec2StateChangeHint(instanceId!, arn), EventTimestamp.Read(root));
         }
         catch (JsonException)
         {
