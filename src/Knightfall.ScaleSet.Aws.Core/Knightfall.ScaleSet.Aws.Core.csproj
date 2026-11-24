@@ -2,4 +2,15 @@
   <PropertyGroup>
     <TargetFramework>net10.0</TargetFramework>
   </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="JsonSchema.Net" />
+    <EmbeddedResource Include="../../cdk/config/schema/controller-common-v1alpha1.json"
+                      LogicalName="Knightfall.ScaleSet.Aws.Core.Configuration.controller-common-v1alpha1.json" />
+    <EmbeddedResource Include="../../cdk/config/schema/controller-runtime-v1alpha1.json"
+                      LogicalName="Knightfall.ScaleSet.Aws.Core.Configuration.controller-runtime-v1alpha1.json" />
+    <EmbeddedResource Include="../../cdk/config/unicode/CaseFolding-17.0.0.txt"
+                      LogicalName="Knightfall.ScaleSet.Aws.Core.Configuration.CaseFolding-17.0.0.txt" />
+    <EmbeddedResource Include="../../cdk/config/unicode/LICENSE.txt"
+                      LogicalName="Knightfall.ScaleSet.Aws.Core.Configuration.Unicode-LICENSE.txt" />
+  </ItemGroup>
 </Project>
