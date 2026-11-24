@@ -72,7 +72,7 @@ internal sealed class FargateBootstrapApplication(FargateBootstrapSettings setti
         var offers = new DynamoDbBootstrapOfferClient(ddb, settings.TableName, principal.AwsUserId, principal.TaskArn, clock);
         var bootstrap = new RunnerBootstrap(offers, target, principal.TaskArn, principal.AwsUserId,
             () => Interlocked.Exchange(ref _spent, 1) == 0, runner, clock, TimeSpan.FromMinutes(2), TimeSpan.FromSeconds(1),
-            validateProviderBinding: principal.MatchesOffer);
+            validateProviderBinding: principal.MatchesOffer, telemetryProvider: RunnerProvisionerType.Fargate);
         return await bootstrap.RunAsync(cancellationToken).ConfigureAwait(false);
     }
 }
