@@ -3,11 +3,13 @@ using Knightfall.ScaleSet.Aws.Core.Telemetry;
 using Knightfall.ScaleSet.Aws.DynamoDb;
 using Knightfall.ScaleSet.Aws.GitHub;
 using Knightfall.ScaleSet.Aws.Handoff;
+using Microsoft.Extensions.Logging;
 
 namespace Knightfall.ScaleSet.Aws.Controller.Lifecycle;
 
 public sealed class ControllerJitCoordinator(
-    DynamoDbLifecycleStore store, AwsBootstrapPrincipalResolver principals, GitHubJitHandoff handoff)
+    DynamoDbLifecycleStore store, AwsBootstrapPrincipalResolver principals, GitHubJitHandoff handoff,
+    ILogger<ControllerJitCoordinator>? logger = null)
 {
     public async Task<GitHubJitResult> AdvanceAsync(
         RuntimeConfiguration configuration, ControllerLeaseOwnership ownership, BootstrapProviderObservation observation,
@@ -37,17 +39,7 @@ public sealed class ControllerJitCoordinator(
 
         var result = await handoff.IssueAsync(authority, identity, observation.ObservedAt, connection, ownership.OwnershipLost, token)
             .ConfigureAwait(false);
-        var (outcome, reason) = result.Status switch
-        {
-            GitHubJitStatus.Offered => ("success", "offer_confirmed"),
-            GitHubJitStatus.RegisteredWithoutOffer => ("deferred", "registration_without_offer"),
-            GitHubJitStatus.WaitingForHello => ("deferred", "waiting_for_hello"),
-            GitHubJitStatus.OwnershipUnavailable => ("deferred", "ownership_unavailable"),
-            GitHubJitStatus.Held => ("deferred", "handoff_held"),
-            GitHubJitStatus.Finished => ("deferred", "handoff_finished"),
-            _ => ("unknown", "recovery_required"),
-        };
-        diagnostics.Complete(outcome, reason);
+        diagnostics.CompleteAdvance(result.Status, logger);
         return result;
     }
 

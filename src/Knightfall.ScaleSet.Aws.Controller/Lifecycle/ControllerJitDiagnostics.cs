@@ -1,10 +1,13 @@
 using System.Diagnostics;
 using System.Diagnostics.Metrics;
+using Knightfall.ScaleSet.Aws.Controller.Telemetry;
 using Knightfall.ScaleSet.Aws.Core.Telemetry;
+using Knightfall.ScaleSet.Aws.GitHub;
+using Microsoft.Extensions.Logging;
 
 namespace Knightfall.ScaleSet.Aws.Controller.Lifecycle;
 
-internal static class ControllerJitDiagnostics
+internal static partial class ControllerJitDiagnostics
 {
     private const string Name = "Knightfall.ScaleSet.Aws.Controller";
     private static readonly ActivitySource Source = new(Name);
@@ -28,6 +31,40 @@ internal static class ControllerJitDiagnostics
         {
             _outcome = outcome;
             _reason = reason;
+        }
+
+        internal void CompleteAdvance(GitHubJitStatus status, ILogger? logger)
+        {
+            var (outcome, reason, level) = status switch
+            {
+                GitHubJitStatus.Offered => ("success", "offer_confirmed", LogLevel.Information),
+                GitHubJitStatus.RegisteredWithoutOffer => ("deferred", "registration_without_offer", LogLevel.Warning),
+                GitHubJitStatus.WaitingForHello => ("deferred", "waiting_for_hello", LogLevel.None),
+                GitHubJitStatus.OwnershipUnavailable => ("deferred", "ownership_unavailable", LogLevel.None),
+                GitHubJitStatus.Held => ("deferred", "handoff_held", LogLevel.Information),
+                GitHubJitStatus.Finished => ("deferred", "handoff_finished", LogLevel.None),
+                _ => ("unknown", "recovery_required", LogLevel.Warning),
+            };
+            Complete(outcome, reason);
+            if (logger is null || _profile is null || level == LogLevel.None)
+            {
+                return;
+            }
+
+            try
+            {
+                using var scope = logger.BeginScope(new KeyValuePair<string, object?>[]
+                {
+                    new("profile", _profile.Id),
+                    new("provider", _profile.Provider),
+                    new("reason", reason),
+                });
+                LogAdvance(logger, level, _operation, outcome);
+            }
+            catch (Exception error) when (error is AggregateException or IOException or InvalidOperationException)
+            {
+                // A logging failure must not change the durable handoff outcome.
+            }
         }
 
         public void Dispose()
@@ -56,4 +93,7 @@ internal static class ControllerJitDiagnostics
             _activity?.Dispose();
         }
     }
+
+    [LoggerMessage(EventId = 901, Message = TelemetryNames.EventTemplate)]
+    private static partial void LogAdvance(ILogger logger, LogLevel level, string operation, string outcome);
 }
