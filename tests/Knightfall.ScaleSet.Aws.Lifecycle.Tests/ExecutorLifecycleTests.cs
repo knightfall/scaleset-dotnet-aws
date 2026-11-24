@@ -113,6 +113,46 @@ public sealed class ExecutorLifecycleTests
     [Theory]
     [InlineData(true)]
     [InlineData(false)]
+    public async Task ReadyAfterIrreversibleTerminationPreservesOccupiedConflictInEitherOrder(bool observeTerminationFirst)
+    {
+        var token = TestContext.Current.CancellationToken;
+        using var table = await MiniStackTable.CreateAsync(token);
+        var clock = new ContractClock { Now = MiniStackTable.Now.AddSeconds(2) };
+        var store = new DynamoDbLifecycleStore(table.Client, table.Name, clock);
+        var profile = table.Profile("executor-cross-axis-conflict");
+        var binding = Ec2(profile, 1);
+        const long runner = 109;
+        await BindAsync(store, table.Lease, binding, runner, token);
+        var terminal = Resource(ExecutorResourceState.IrreversiblyTerminated, clock.Now.AddSeconds(-1));
+        var ready = new ExecutorProcessObservation(runner, ExecutorProcessState.Ready, clock.Now, Guid.NewGuid());
+
+        if (observeTerminationFirst)
+        {
+            Assert.Equal(LifecycleWriteOutcome.Committed, await store.ObserveResourceAsync(table.Lease, binding, terminal, token));
+            Assert.Empty((await store.ReadExecutorInventoryAsync(profile, token)).Executors);
+            Assert.Equal(LifecycleWriteOutcome.Committed, await store.ObserveProcessAsync(table.Lease, binding, ready, token));
+        }
+        else
+        {
+            Assert.Equal(LifecycleWriteOutcome.Committed, await store.ObserveProcessAsync(table.Lease, binding, ready, token));
+            Assert.Equal(LifecycleWriteOutcome.Committed, await store.ObserveResourceAsync(table.Lease, binding, terminal, token));
+        }
+
+        var inventory = await store.ReadExecutorInventoryAsync(profile, token);
+        Assert.True(inventory.IsConsistent);
+        var executor = Assert.Single(inventory.Executors);
+        Assert.Equal(terminal, executor.State.Resource);
+        Assert.Equal(ready, executor.State.Process);
+        Assert.True(executor.State.HasConflict);
+        var classification = Classify(executor, clock.Now);
+        Assert.True(classification.Occupied);
+        Assert.True(classification.Recovering);
+        Assert.False(classification.CompletedCleanupCandidate);
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
     public async Task ConcurrentDeliveryAndResourceUpdatesPreserveBothFacts(bool delayDelivery)
     {
         var token = TestContext.Current.CancellationToken;

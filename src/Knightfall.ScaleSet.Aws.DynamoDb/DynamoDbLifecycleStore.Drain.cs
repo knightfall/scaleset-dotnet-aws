@@ -64,15 +64,17 @@ public sealed partial class DynamoDbLifecycleStore
     }
 
     internal async Task<DrainProof> ReadDrainProofAsync(
-        LifecycleProfile profile,
+        CatalogProfile catalog,
         DeploymentLeaseFence lease,
         ProfileRetirementTiming timing,
         ProfileHandoffObservation? handoffs,
         CancellationToken cancellationToken)
     {
+        var profile = catalog.Profile;
         RequireProfileLease(profile, lease);
         var session = await ReadSessionAsync(profile, cancellationToken).ConfigureAwait(false);
         if (session is not { Phase: SessionPhase.Active or SessionPhase.Retired, SessionId: Guid current } ||
+            session.Binding.ScopeIdentity != catalog.Binding.ScopeIdentity || session.Binding.ScaleSetId != catalog.Binding.ScaleSetId ||
             handoffs is not { IsComplete: true, OutstandingOffers: 0, ReadGuards.IsDefaultOrEmpty: false })
         {
             return new DrainProof(false, session, []);
@@ -99,8 +101,11 @@ public sealed partial class DynamoDbLifecycleStore
 
         long? checkpointRevision = await ReadClearCheckpointsAsync(profile, session, current, cancellationToken).ConfigureAwait(false);
         var now = _timeProvider.GetUtcNow();
+        // After confirmed closure, no delivery can refresh this session's zero demand.
+        bool requiresFreshDemand = catalog.State != CatalogProfileState.ClosureHeld || session.Phase != SessionPhase.Retired;
         if (!checkpointRevision.HasValue || !Fresh(handoffs.ObservedAt, now, timing.Freshness) ||
-            !Fresh(coverage.ObservedAt, now, timing.Freshness) || !Fresh(currentDemand.ObservedAt, now, timing.Freshness) ||
+            !Fresh(coverage.ObservedAt, now, timing.Freshness) || currentDemand.ObservedAt == default || currentDemand.ObservedAt > now ||
+            (requiresFreshDemand && !Fresh(currentDemand.ObservedAt, now, timing.Freshness)) ||
             inventory.Executors.Any(executor => ExecutorClassifier.Classify(executor.State, now, timing.Freshness, timing.LogFlushGrace).Occupied))
         {
             return new DrainProof(false, session, []);
@@ -122,7 +127,7 @@ public sealed partial class DynamoDbLifecycleStore
             return new DrainProof(false, session, []);
         }
         var external = coverage.ObservedAt < handoffs.ObservedAt ? coverage.ObservedAt : handoffs.ObservedAt;
-        var oldest = currentDemand.ObservedAt < external ? currentDemand.ObservedAt : external;
+        var oldest = requiresFreshDemand && currentDemand.ObservedAt < external ? currentDemand.ObservedAt : external;
         return new DrainProof(true, session, supplied.Select(group => group.First()).ToImmutableArray(), oldest, external);
     }
 

@@ -34,12 +34,12 @@ public static class ExecutorObservations
             {
                 current = observation;
             }
-            conflict |= presentAt >= current.ObservedAt;
+            conflict |= presentAt >= current.ObservedAt || executor.LastProcessReadyAt >= current.ObservedAt;
         }
         else if (observation.State == ExecutorResourceState.IrreversiblyTerminated)
         {
             current = observation;
-            conflict |= presentAt >= observation.ObservedAt;
+            conflict |= presentAt >= observation.ObservedAt || executor.LastProcessReadyAt >= observation.ObservedAt;
         }
         else if (current is null || observation.ObservedAt > current.ObservedAt)
         {
@@ -70,7 +70,8 @@ public static class ExecutorObservations
             readyAt = observation.ObservedAt;
         }
         var current = executor.Process;
-        bool conflict = executor.HasConflict;
+        bool conflict = executor.HasConflict ||
+            (executor.Resource is { State: ExecutorResourceState.IrreversiblyTerminated } resource && readyAt >= resource.ObservedAt);
         if (current?.State == ExecutorProcessState.Exited)
         {
             if (observation.State == ExecutorProcessState.Exited && observation.ObservedAt < current.ObservedAt)

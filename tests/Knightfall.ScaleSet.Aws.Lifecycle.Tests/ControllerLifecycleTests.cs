@@ -18,6 +18,7 @@ namespace Knightfall.ScaleSet.Aws.Lifecycle.Tests;
 public sealed class ControllerLifecycleTests
 {
     private const string SecondTask = "arn:aws:ecs:us-east-1:000000000000:task/controller/00000000000000000000000000000002";
+    private const string ThirdTask = "arn:aws:ecs:us-east-1:000000000000:task/controller/00000000000000000000000000000003";
     private const string ProfileId = "linux-shell";
     private const string Scope = "https://github.com/enterprises/engineering";
     private static readonly string[] CurrentStage = ["AWSCURRENT"];
@@ -124,19 +125,30 @@ public sealed class ControllerLifecycleTests
         Assert.Null(rotation.Permission);
         Assert.DoesNotContain(table.Wire.Requests, request => request.Operation == "TransactWriteItems");
 
+        // Restart after the retired session's final demand observation has expired.
+        clock.Now += RetirementTiming.Freshness + TimeSpan.FromSeconds(1);
+        var closer = await AcquireAsync(store, configuration, clock, ThirdTask, cancellation, SecondTask);
+        await ApplyCatalogAsync(store, closer, configuration, cancellation);
+        var resumed = new ProfileRetirementCoordinator(store, clock, RetirementTiming, Handoffs);
+        Assert.Equal(ProfileRetirementStatus.ReconciliationPending,
+            (await resumed.AdvanceAsync(profile, Authority(closer, clock), cancellation)).Status);
+        var staleCoverage = await store.ReadExecutorInventoryAsync(profile, cancellation);
+        Assert.Equal(LifecycleWriteOutcome.Committed, await store.PublishExecutorInventoryAsync(profile, closer.Fence, staleCoverage.Revision,
+            new ExecutorInventoryObservation(clock.Now, IsComplete: true), cancellation));
+
         offers = 1;
         Assert.Equal(ProfileRetirementStatus.ReconciliationPending,
-            (await restarted.AdvanceAsync(profile, Authority(successor, clock), cancellation)).Status);
+            (await resumed.AdvanceAsync(profile, Authority(closer, clock), cancellation)).Status);
         offers = 0;
         Assert.Equal(ProfileRetirementStatus.Retired,
-            (await restarted.AdvanceAsync(profile, Authority(successor, clock), cancellation)).Status);
+            (await resumed.AdvanceAsync(profile, Authority(closer, clock), cancellation)).Status);
         var tombstone = Assert.IsType<CatalogProfile>(await store.ReadCatalogProfileAsync(profile, cancellation));
         Assert.Equal(CatalogProfileState.Tombstoned, tombstone.State);
         Assert.NotNull(tombstone.RetiredAt);
         Assert.Equal(84, tombstone.Binding.ScaleSetId);
         Assert.NotNull(await checkpoint.ReadAsync(checkpoint.SessionKey, cancellation));
         Assert.Equal(ProfileRetirementStatus.Retired,
-            (await coordinator.AdvanceAsync(profile, Authority(successor, clock), cancellation)).Status);
+            (await coordinator.AdvanceAsync(profile, Authority(closer, clock), cancellation)).Status);
     }
 
     [Fact]
@@ -253,12 +265,12 @@ public sealed class ControllerLifecycleTests
     }
 
     private static async Task<ControllerLease> AcquireAsync(DynamoDbLifecycleStore store, RuntimeConfiguration configuration,
-        FixtureClock clock, string task, CancellationToken cancellationToken)
+        FixtureClock clock, string task, CancellationToken cancellationToken, string stoppedTask = MiniStackTable.FirstTask)
     {
         var acquisition = await store.TryAcquireLeaseAsync(ControllerLeaseRecoveryCoordinator.DeploymentKey(configuration), task, task,
             ControllerLease.CurrentWriterProtocol, clock.Now.AddSeconds(-1), clock.Now + LeaseDuration, cancellationToken);
         Assert.Equal(LifecycleWriteOutcome.Committed, acquisition.Outcome);
-        var recovery = new ControllerLeaseRecoveryCoordinator(store, new StoppedObserver(), clock, Reserve);
+        var recovery = new ControllerLeaseRecoveryCoordinator(store, new StoppedObserver(stoppedTask), clock, Reserve);
         var activated = await recovery.TryActivateAsync(Assert.IsType<ControllerLease>(acquisition.Lease), configuration, ClockProof(clock),
             [], cancellationToken);
         Assert.Equal(LeaseActivationStatus.Activated, activated.Status);
@@ -306,12 +318,12 @@ public sealed class ControllerLifecycleTests
         public override DateTimeOffset GetUtcNow() => Now;
     }
 
-    private sealed class StoppedObserver : IControllerTaskFenceObserver
+    private sealed class StoppedObserver(string stoppedTask) : IControllerTaskFenceObserver
     {
         public Task<ControllerTaskFenceStatus> ReadAsync(string taskArn, CancellationToken cancellationToken)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            Assert.Equal(MiniStackTable.FirstTask, taskArn);
+            Assert.Equal(stoppedTask, taskArn);
             return Task.FromResult(ControllerTaskFenceStatus.Stopped);
         }
     }

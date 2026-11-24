@@ -76,7 +76,7 @@ public sealed class ProfileRetirementCoordinator
         }
 
         var handoffs = await _handoffs(profile, cancellationToken).ConfigureAwait(false);
-        var proof = await _store.ReadDrainProofAsync(profile, lease.Fence, _timing, handoffs, cancellationToken).ConfigureAwait(false);
+        var proof = await _store.ReadDrainProofAsync(catalog, lease.Fence, _timing, handoffs, cancellationToken).ConfigureAwait(false);
         if (!HasTime(authority, lease))
         {
             return new ProfileRetirementResult(ProfileRetirementStatus.OwnershipUnavailable);
@@ -110,7 +110,7 @@ public sealed class ProfileRetirementCoordinator
             return new SessionChange(LifecycleWriteOutcome.Conflict);
         }
         var handoffs = await _handoffs(profile, cancellationToken).ConfigureAwait(false);
-        var proof = await _store.ReadDrainProofAsync(profile, lease.Fence, _timing, handoffs, cancellationToken).ConfigureAwait(false);
+        var proof = await _store.ReadDrainProofAsync(catalog, lease.Fence, _timing, handoffs, cancellationToken).ConfigureAwait(false);
         var now = _clock.GetUtcNow();
         if (!authority.Clock.TryGetUpperBound(now, lease.ValidUntil, _timing.WriteReserve, out var upper))
         {
