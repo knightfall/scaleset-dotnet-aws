@@ -15,8 +15,14 @@ public sealed record PendingEc2Launch(Guid AllocationId, int AttemptOrdinal, str
 
 public sealed record PendingEc2LaunchPage(ImmutableArray<PendingEc2Launch> Launches, long IndexRevision, ActiveEffectCursor? Continuation);
 
+public sealed record RejectedEc2Launch(Guid AllocationId, int AttemptOrdinal, string AvailabilityZone, DateTimeOffset ObservedAt);
+
+public sealed record RejectedEc2LaunchPage(ImmutableArray<RejectedEc2Launch> Launches, string? Continuation);
+
 public sealed partial class DynamoDbLifecycleStore
 {
+    private const string Ec2LaunchLineagePrefix = "EC2-LAUNCH#";
+
     /// <summary>Reads one pinned active-index page of EC2 capacity reservations for placement planning.</summary>
     public async Task<PendingEc2LaunchPage?> ReadPendingEc2LaunchesAsync(
         LifecycleProfile profile, DeploymentLeaseFence lease, ActiveEffectCursor? continuation, CancellationToken cancellationToken)
@@ -58,10 +64,50 @@ public sealed partial class DynamoDbLifecycleStore
         ArgumentNullException.ThrowIfNull(profile);
         var key = LifecycleKey.Ec2LaunchLineage(profile, allocationId);
         var item = await ReadItemAsync(key, cancellationToken).ConfigureAwait(false);
-        if (item is null)
+        return item is null ? null : DecodeEc2LaunchLineage(profile, allocationId, item);
+    }
+
+    /// <summary>Discovers settled placement rejections after their active effect marker has been removed.</summary>
+    public async Task<RejectedEc2LaunchPage?> ReadRejectedEc2LaunchesAsync(
+        LifecycleProfile profile, long generation, string? continuation, CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(profile);
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(generation);
+        var page = await ReadBasePageAsync(profile.PartitionKey, Ec2LaunchLineagePrefix, continuation, cancellationToken).ConfigureAwait(false);
+        var launches = ImmutableArray.CreateBuilder<RejectedEc2Launch>();
+        foreach (var item in page.Items)
         {
-            return null;
+            string sortKey = Text(item, "SK");
+            if (!sortKey.StartsWith(Ec2LaunchLineagePrefix, StringComparison.Ordinal) ||
+                !Guid.TryParseExact(sortKey.AsSpan(Ec2LaunchLineagePrefix.Length), "D", out var allocation) || allocation == Guid.Empty ||
+                sortKey != LifecycleKey.Ec2LaunchLineage(profile, allocation).SortKey)
+            {
+                throw InvalidRecord();
+            }
+            RequireKey(item, profile.PartitionKey, sortKey);
+            var lineage = DecodeEc2LaunchLineage(profile, allocation, item);
+            var stored = await ReadEffectAsync(profile, lineage.IntentId, cancellationToken).ConfigureAwait(false);
+            if (stored is null)
+            {
+                return null;
+            }
+            var entry = EffectJournalEntry.Read(profile, stored);
+            if (!MatchesEc2Lineage(lineage, entry.Envelope))
+            {
+                return null;
+            }
+            if (entry.Envelope.Generation == generation && entry is { State: EffectState.Settled,
+                    Resolution: { Kind: EffectResolutionKind.Rejected, Ec2LaunchRejection: not null } rejection })
+            {
+                launches.Add(new RejectedEc2Launch(allocation, lineage.AttemptOrdinal, lineage.TriedAvailabilityZones[^1], rejection.ObservedAt));
+            }
         }
+        return new RejectedEc2LaunchPage(launches.ToImmutable(), page.Continuation);
+    }
+
+    private static Ec2LaunchLineageSnapshot DecodeEc2LaunchLineage(
+        LifecycleProfile profile, Guid allocationId, Dictionary<string, AttributeValue> item)
+    {
         CheckNoExpiration(item);
         try
         {
