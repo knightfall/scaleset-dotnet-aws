@@ -1,9 +1,15 @@
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
+using Knightfall.ScaleSet.Aws.Bootstrap.LinuxChecks;
 using Knightfall.ScaleSet.Aws.Handoff;
 using Knightfall.ScaleSet.Aws.RunnerBootstrap;
 using Knightfall.ScaleSet.Aws.RunnerBootstrap.Linux;
+
+if (OperatingSystem.IsLinux() && args is ["fargate"])
+{
+    return await FargateLinuxCheck.RunAsync();
+}
 
 if (!OperatingSystem.IsLinux() || !LinuxFiles.IsRoot())
 {
@@ -144,3 +150,4 @@ catch (ObjectDisposedException)
 }
 
 Console.WriteLine("EC2 Linux launch smoke passed.");
+return 0;

@@ -23,6 +23,15 @@ internal static partial class LinuxFiles
         }
     }
 
+    internal static void ProhibitPrivilegeGain()
+    {
+        const int noNewPrivileges = 38;
+        if (ProcessControl(noNewPrivileges, 1, 0, 0, 0) != 0)
+        {
+            throw new IOException("The runner could not prohibit privilege gain.");
+        }
+    }
+
     internal static bool IsTrustedFile(string path, bool ownerOnly, string? privateRoot = null)
     {
         var file = Read(path);

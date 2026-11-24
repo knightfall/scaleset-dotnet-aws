@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.Globalization;
+using System.Runtime.InteropServices;
 using System.Runtime.Versioning;
 using Knightfall.ScaleSet.Aws.Handoff;
 
@@ -12,13 +13,13 @@ internal interface ILinuxOneJobBoundary
 
     void PrepareHome();
 
-    ProcessStartInfo StartInfo();
+    Process? StartRunner();
 
     void RemoveConfigFiles();
 }
 
 [SupportedOSPlatform("linux")]
-internal sealed class LinuxOneJobRunner(ILinuxOneJobBoundary boundary) : IOneJobRunner
+internal sealed partial class LinuxOneJobRunner(ILinuxOneJobBoundary boundary, TimeSpan? stopGrace = null) : IOneJobRunner
 {
     public async Task<OneJobCompletion> RunAsync(JitPlaintext configuration, string expectedName,
         Func<long, CancellationToken, Task> ready, CancellationToken cancellationToken)
@@ -39,9 +40,10 @@ internal sealed class LinuxOneJobRunner(ILinuxOneJobBoundary boundary) : IOneJob
             }
 
             boundary.PrepareHome();
-            using var process = Process.Start(boundary.StartInfo()) ?? throw new IOException("The one-job runner could not start.");
+            using var process = boundary.StartRunner() ?? throw new IOException("The one-job runner could not start.");
             process.StandardInput.Close();
-            using var output = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            using var output = stopGrace.HasValue ? new CancellationTokenSource() :
+                CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
             Task stdout = ReadReadyAsync(process.StandardOutput, runnerId, ready, output.Token);
             Task stderr = process.StandardError.BaseStream.CopyToAsync(Stream.Null, output.Token);
             try
@@ -49,6 +51,24 @@ internal sealed class LinuxOneJobRunner(ILinuxOneJobBoundary boundary) : IOneJob
                 await process.WaitForExitAsync(cancellationToken).ConfigureAwait(false);
                 await Task.WhenAll(stdout, stderr).WaitAsync(TimeSpan.FromSeconds(5), cancellationToken).ConfigureAwait(false);
                 return new OneJobCompletion(runnerId, process.ExitCode);
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested && stopGrace is { } grace)
+            {
+                if (!process.HasExited)
+                {
+                    const int sigterm = 15;
+                    _ = SendSignal(process.Id, sigterm);
+                }
+                try
+                {
+                    await Task.WhenAll(process.WaitForExitAsync(CancellationToken.None), stdout, stderr)
+                        .WaitAsync(grace, CancellationToken.None).ConfigureAwait(false);
+                }
+                catch (TimeoutException)
+                {
+                    // The finalizer below kills the remaining process tree if graceful exit timed out.
+                }
+                throw;
             }
             finally
             {
@@ -65,6 +85,9 @@ internal sealed class LinuxOneJobRunner(ILinuxOneJobBoundary boundary) : IOneJob
             boundary.RemoveConfigFiles();
         }
     }
+
+    [LibraryImport("libc", EntryPoint = "kill")]
+    private static partial int SendSignal(int processId, int signal);
 
     internal static async Task ReadReadyAsync(TextReader stdout, long runnerId, Func<long, CancellationToken, Task> ready,
         CancellationToken cancellationToken)

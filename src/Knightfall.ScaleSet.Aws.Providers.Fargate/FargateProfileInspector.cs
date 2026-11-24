@@ -211,7 +211,8 @@ public sealed partial class FargateProfileInspector
     private static bool ValidContainer(TaskDefinition definition, string runnerContainer, FargateContainerApproval approval)
     {
         if (definition.ContainerDefinitions is not [var container] || container is null || container.Name != runnerContainer ||
-            container.Essential == false || container.Privileged == true || container.Image != approval.Image ||
+            container.Essential == false || container.Privileged == true || container.RestartPolicy?.Enabled == true ||
+            container.ReadonlyRootFilesystem != true || container.Image != approval.Image ||
             !(container.EntryPoint ?? []).SequenceEqual(approval.EntryPoint, StringComparer.Ordinal) ||
             !(container.Command ?? []).SequenceEqual(approval.Command, StringComparer.Ordinal))
         {

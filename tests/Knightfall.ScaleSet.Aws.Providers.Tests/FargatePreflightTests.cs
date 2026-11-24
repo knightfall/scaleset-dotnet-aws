@@ -109,6 +109,8 @@ public sealed class FargatePreflightTests
     [InlineData("command")]
     [InlineData("image")]
     [InlineData("nonessential")]
+    [InlineData("restart")]
+    [InlineData("writable-root")]
     [InlineData("environment")]
     [InlineData("secret-logs")]
     public async Task RejectsUnapprovedContainerRuntime(string fault)
@@ -127,6 +129,8 @@ public sealed class FargatePreflightTests
             case "command": runner["command"] = new JsonArray("run", "--other"); break;
             case "image": runner["image"] = "docker.io/runner:latest"; break;
             case "nonessential": runner["essential"] = false; break;
+            case "restart": runner["restartPolicy"] = new JsonObject { ["enabled"] = true }; break;
+            case "writable-root": runner["readonlyRootFilesystem"] = false; break;
             case "environment": runner["environment"] = JsonNode.Parse("""[{"name":"TOKEN","value":"fixture-plaintext-token"}]"""); break;
             case "secret-logs": runner["logConfiguration"] = JsonNode.Parse("""{"logDriver":"splunk","options":{"splunk-token":"fixture-plaintext-token"}}"""); break;
         }
