@@ -9,7 +9,18 @@ async function emitRuntime(args: string[]): Promise<void> {
   }
 
   const [source, destination] = args;
-  const { json, sha256 } = compileConfig(await readFile(source, "utf8"));
+  const bytes = await readFile(source);
+  let yaml: string;
+  try {
+    yaml = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+  } catch {
+    throw new ConfigValidationError(
+      "yaml",
+      "",
+      "YAML input must be valid UTF-8.",
+    );
+  }
+  const { json, sha256 } = compileConfig(yaml);
   const output = resolve(destination);
   const temporary = await mkdtemp(join(dirname(output), ".runtime-"));
   try {

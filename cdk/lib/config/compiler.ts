@@ -58,8 +58,25 @@ function requireShape<T>(input: unknown, validate: ValidateFunction<T>): T {
 export function validateRuntime(value: unknown): RunnerControllerRuntime {
   rejectDeferredGitHubConfig(value);
   const runtime = requireShape(value, validateRuntimeShape);
+  requireUnicodeText(runtime);
   validateSemantics(runtime);
   return runtime;
+}
+
+function requireUnicodeText(value: unknown): void {
+  if (typeof value === "string" && !value.isWellFormed()) {
+    throw new ConfigValidationError(
+      "schema",
+      "",
+      "Configuration strings must contain valid Unicode text.",
+    );
+  }
+  if (value && typeof value === "object") {
+    for (const [key, item] of Object.entries(value)) {
+      requireUnicodeText(key);
+      requireUnicodeText(item);
+    }
+  }
 }
 
 function formatJson(value: unknown, indent: string): string {

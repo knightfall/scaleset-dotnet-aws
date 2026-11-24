@@ -452,6 +452,33 @@ for (const rejection of rejections) {
   });
 }
 
+test("authored and runtime values preserve supplementary characters and reject lone surrogates", () => {
+  const source = fixture("ec2-only-latest.yaml");
+  const groupPath = "/spec/profiles/0/github/runnerGroup";
+  const supplementary = "Build \u{10400}";
+  const valid = compileConfig(
+    JSON.stringify(
+      edited(parseYaml(source), [{ path: groupPath, value: supplementary }]),
+    ),
+  );
+  assert.equal(
+    validateRuntime(JSON.parse(valid.json)).spec.profiles[0].github.runnerGroup,
+    supplementary,
+  );
+
+  const surrogate = "Build \ud800";
+  const authored = edited(parseYaml(source), [
+    { path: groupPath, value: surrogate },
+  ]);
+  const runtime = edited(JSON.parse(valid.json), [
+    { path: groupPath, value: surrogate },
+  ]);
+  assert.throws(() => compileConfig(JSON.stringify(authored)), {
+    code: "yaml",
+  });
+  assert.throws(() => validateRuntime(runtime), { code: "schema" });
+});
+
 test("the emit CLI prints the digest of the exact committed runtime output", () => {
   const directory = mkdtempSync(join(tmpdir(), "scaleset-config-test-"));
   try {
@@ -482,6 +509,15 @@ test("the emit CLI prints the digest of the exact committed runtime output", () 
     assert.equal(failed.status, 1);
     assert.equal(failed.stdout, "");
     assert.match(failed.stderr, /yaml/i);
+    assert.deepEqual(readFileSync(output), golden);
+
+    writeFileSync(invalid, Buffer.from([0xff]));
+    const badEncoding = spawnSync(process.execPath, [cli, invalid, output], {
+      encoding: "utf8",
+    });
+    assert.equal(badEncoding.status, 1);
+    assert.equal(badEncoding.stdout, "");
+    assert.match(badEncoding.stderr, /UTF-8/);
     assert.deepEqual(readFileSync(output), golden);
   } finally {
     rmSync(directory, { recursive: true, force: true });

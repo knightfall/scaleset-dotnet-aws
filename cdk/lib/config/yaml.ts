@@ -43,6 +43,13 @@ function isIntegralDecimal(source: string): boolean {
 }
 
 export function parseYaml(source: string): unknown {
+  if (!source.isWellFormed()) {
+    throw new ConfigValidationError(
+      "yaml",
+      "",
+      "YAML input must contain valid Unicode text.",
+    );
+  }
   const lineCounter = new LineCounter();
   const documents = parseAllDocuments(source, {
     lineCounter,
@@ -107,6 +114,16 @@ export function parseYaml(source: string): unknown {
       if (key.value === "<<") {
         rejectYaml("YAML merge keys are unsupported.", key.range?.[0]);
       }
+    }
+    if (
+      isScalar(node) &&
+      typeof node.value === "string" &&
+      !node.value.isWellFormed()
+    ) {
+      rejectYaml(
+        "YAML strings must contain valid Unicode text.",
+        node.range?.[0],
+      );
     }
     if (isScalar(node) && typeof node.value === "number") {
       const number = node.value;
