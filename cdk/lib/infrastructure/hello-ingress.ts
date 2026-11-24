@@ -37,7 +37,8 @@ export function helloIngress(
     value: endpoint.url,
     description: `HELLO ingress for ${bootstrapRole.roleArn}`,
   });
-  if (!active) return [];
+  const dependencies = [broker, endpoint];
+  if (!active) return { dependencies, statements: [] };
 
   broker.addToRolePolicy(
     new iam.PolicyStatement({
@@ -51,7 +52,7 @@ export function helloIngress(
       },
     }),
   );
-  return [
+  const statements = [
     new iam.PolicyStatement({
       actions: ["lambda:InvokeFunctionUrl"],
       resources: [broker.functionArn],
@@ -71,4 +72,5 @@ export function helloIngress(
       conditions: { BoolIfExists: { "lambda:InvokedViaFunctionUrl": "false" } },
     }),
   ];
+  return { dependencies, statements };
 }

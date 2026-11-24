@@ -19,6 +19,7 @@ import * as kms from "aws-cdk-lib/aws-kms";
 import * as sqs from "aws-cdk-lib/aws-sqs";
 import type { Construct } from "constructs";
 import type { compileConfig } from "../config/compiler.ts";
+import { awsPartition } from "../config/semantics.ts";
 import type {
   RunnerControllerRuntime,
   RunnerProfile,
@@ -86,6 +87,12 @@ export class ControllerInfrastructure extends Stack {
     const enabled = spec.profiles
       .filter(({ state }) => state !== "disabled")
       .toSorted((a, b) => (a.id < b.id ? -1 : Number(a.id > b.id)));
+    const supportsHelloIngress = awsPartition(spec.aws.region) === "aws";
+    if (active && enabled.length > 0 && !supportsHelloIngress) {
+      throw new Error(
+        "Active runner HELLO requires Lambda Function URLs, which are unavailable in this AWS partition.",
+      );
+    }
     const selected = active || inspect ? enabled : [];
     const ec2 = ec2Profiles(selected);
     const fargate = fargateProfiles(selected);
@@ -145,7 +152,9 @@ export class ControllerInfrastructure extends Stack {
     grantTableAccess(this.controllerRole, this.trackingTable, active, inspect);
     grantEc2(this.controllerRole, runtime, ec2, active);
     grantFargate(this.controllerRole, runtime, fargate, clusters, active);
-    this.configureBootstrapRoles(enabled, active);
+    const runnerPolicyDependencies = supportsHelloIngress
+      ? this.configureBootstrapRoles(enabled, active)
+      : [];
 
     const args = [
       "run",
@@ -173,10 +182,11 @@ export class ControllerInfrastructure extends Stack {
       for (const arn of statusRoles) {
         const id = stableId("Ec2SupervisorStatus", arn);
         const role = iam.Role.fromRoleArn(this, id, arn);
-        new iam.Policy(this, `${id}Policy`, {
+        const policy = new iam.Policy(this, `${id}Policy`, {
           roles: [role],
           statements: [ec2SupervisorStatusPolicy(this.trackingTable)],
         });
+        runnerPolicyDependencies.push(policy);
       }
       if (ec2.length > 0) {
         const { queue, dlq } = this.observationQueues("Ec2");
@@ -219,7 +229,7 @@ export class ControllerInfrastructure extends Stack {
     }
 
     this.runtimeArguments = args;
-    createControllerService(this, {
+    const service = createControllerService(this, {
       spec,
       clusterArn: this.hostingCluster.arn,
       taskRole: this.controllerRole,
@@ -227,6 +237,7 @@ export class ControllerInfrastructure extends Stack {
       fargatePreflight: fargatePreflight?.environment,
       telemetry,
     });
+    service.node.addDependency(...runnerPolicyDependencies);
     new CfnOutput(this, "DeploymentIdentity", {
       value: deploymentIdentity(runtime),
     });
@@ -302,6 +313,7 @@ export class ControllerInfrastructure extends Stack {
     profiles: readonly RunnerProfile[],
     active: boolean,
   ) {
+    const dependencies: Construct[] = [];
     const roleArns = [
       ...new Set(
         profiles.map(({ provisioner }) => provisioner.bootstrapRoleArn),
@@ -312,12 +324,17 @@ export class ControllerInfrastructure extends Stack {
       const role = iam.Role.fromRoleArn(this, id, arn);
       const ingress = helloIngress(this, id, this.trackingTable, role, active);
       if (active) {
-        new iam.Policy(this, `${id}Policy`, {
+        const policy = new iam.Policy(this, `${id}Policy`, {
           roles: [role],
-          statements: [...bootstrapPolicy(this.trackingTable), ...ingress],
+          statements: [
+            ...bootstrapPolicy(this.trackingTable),
+            ...ingress.statements,
+          ],
         });
+        dependencies.push(...ingress.dependencies, policy);
       }
     }
+    return dependencies;
   }
 
   private grantSnapshot(runtime: RunnerControllerRuntime) {

@@ -146,9 +146,10 @@ dry-run deployment provides stable URLs with the brokers disabled. The active
 stack grants each role its own AWS IAM Function URL invocation and
 principal-scoped OFFER consumption. Each role has four concurrent broker
 invocations. Profiles sharing a role also share its invocation budget.
-Confirm that the target Region supports Function URLs. Runner subnets need an
-approved outbound Internet route for HTTPS to the role's exact endpoint.
-[Function URL regional availability and networking](https://docs.aws.amazon.com/lambda/latest/dg/urls-configuration.html)
+Active runner deployment requires a commercial AWS Region with Function URLs.
+GovCloud and China configurations remain available for dry-run without the broker.
+Runner subnets need an approved outbound Internet route for HTTPS to the role's exact endpoint.
+[Function URL regional availability and networking](https://docs.aws.amazon.com/lambda/latest/dg/urls-configuration.html) · [GovCloud service differences](https://docs.aws.amazon.com/govcloud-us/latest/UserGuide/govcloud-lambda.html) · [China service differences](https://docs.amazonaws.cn/en_us/aws/latest/userguide/lambda.html)
 
 The broker takes the principal from AWS authentication, validates up to 1 KiB
 of HELLO input, and conditionally creates one canonical `HELLO#BROKER#` item
@@ -159,9 +160,9 @@ The controller rejects expired registrations immediately, and DynamoDB removes
 the physical record asynchronously. The active bootstrap role denies direct
 HELLO changes on the lifecycle table. [Lambda Function URL authentication](https://docs.aws.amazon.com/lambda/latest/dg/urls-auth.html) · [DynamoDB TTL](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/TTL.html)
 
-1. For a deployment using direct HELLO writes, drain launches and settle staged or executing JIT operations, issued offers, and running jobs before changing the bootstrap grants. Old runners can finish consuming their already issued offers during this phase. Hold the cutover until outstanding handoffs can be accounted for on the retained table.
-2. Fence the old controller and apply the dry-run generation. Revoke any remaining direct HELLO writers, including out-of-band role grants, and verify denial before continuing. Preserve the table and the lease, catalog, executor, effect and handoff records. The controller ignores any retained HELLO from the old partition namespace, even if it contains the broker's issuer field. Remove obsolete legacy rows with the operator recovery identity after accounting for all pre-cutover handoffs.
-3. Use the matching stack outputs in `helloEndpoint` for the rebuilt AMIs and Fargate runner images. Review the exact Launch Template and task-definition revisions with the new controller. Check the IAM policies, TLS network path, and expected invocation throughput for each role. Apply the active generation with the updated bindings and verify that older runner binaries cannot start a direct registration.
+1. For a deployment using direct HELLO writes, use the previous release to [drain and retire every granted profile](#add-drain-and-retire-a-profile). Settle staged or executing JIT operations, issued offers, and running jobs while their original grants remain. Old runners can finish consuming already issued offers during this phase. Keep the old generation through confirmed session retirement and durable catalog tombstones for all prior profiles. This is required because switching to dry-run removes their grants.
+2. Prepare a higher dry-run generation with fresh profile IDs for the new broker-backed bindings. Run `preflight retire` against the exact deployed runtime and confirm it authorizes the grant removal. Fence the old controller and use the protected deployment path for the dry-run generation. Revoke any remaining direct HELLO writers, including out-of-band role grants, and verify denial before continuing. Preserve the table and the lease, catalog, executor, effect and handoff records. The controller ignores any retained HELLO from the old partition namespace, even if it contains the broker's issuer field. Remove obsolete legacy rows with the operator recovery identity after accounting for all pre-cutover handoffs.
+3. Use the matching stack outputs in `helloEndpoint` for the rebuilt AMIs and Fargate runner images. Review the exact Launch Template and task-definition revisions with the new controller. Check the IAM policies, TLS network path, and expected invocation throughput for each role. Exclude untrusted principals from direct invocation of the broker function and its qualifiers. Apply the active generation with the updated bindings and verify that older runner binaries cannot start a direct registration.
 4. Use a compatible forward generation for rollback of unrelated settings. Preserve the broker URLs, runner revisions, and grants through the rollback. A controller from before this cutover cannot stage a broker-issued TTL record. Reverting the entire protocol requires a drained deployment and a separately reviewed migration.
 
 ## Add, drain, and retire a profile

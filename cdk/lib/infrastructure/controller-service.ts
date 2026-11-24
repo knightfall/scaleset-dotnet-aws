@@ -182,4 +182,5 @@ export function createControllerService(
     },
   });
   service.node.addDependency(props.taskRole, executionRole);
+  return service;
 }

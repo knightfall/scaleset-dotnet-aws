@@ -90,6 +90,59 @@ const quota = {
   reservedCpuUnits: 1_024,
 };
 
+test("partitions without Function URLs preserve dry-run synthesis and hold active deployment", () => {
+  const yaml = readFileSync(
+    new URL("../../testdata/config/ec2-only-pinned.yaml", import.meta.url),
+    "utf8",
+  );
+  for (const [region, partition, dnsSuffix] of [
+    ["cn-north-1", "aws-cn", "amazonaws.com.cn"],
+    ["us-gov-west-1", "aws-us-gov", "amazonaws.com"],
+  ]) {
+    const config = compileConfig(
+      yaml
+        .replaceAll("ap-southeast-2", region)
+        .replaceAll("arn:aws:", `arn:${partition}:`)
+        .replaceAll("amazonaws.com", dnsSuffix),
+    );
+    synthesize(config).resourceCountIs("AWS::Lambda::Url", 0);
+    const active = rewrite(config, { ...config.runtime.spec, mode: "active" });
+    assert.throws(
+      () => synthesize(active),
+      /Active runner HELLO requires Lambda Function URLs/u,
+    );
+  }
+});
+
+test("active service waits for its HELLO brokers and runner invocation policies", () => {
+  const template = synthesize(fixture("mixed-ec2-fargate"));
+  const resources = template.toJSON().Resources as Record<
+    string,
+    { Type: string }
+  >;
+  const brokerResources = Object.entries(resources)
+    .filter(
+      ([id, resource]) =>
+        id.includes("HelloBroker") &&
+        ["AWS::Lambda::Function", "AWS::Lambda::Url"].includes(resource.Type),
+    )
+    .map(([id]) => id);
+  const runnerPolicies = Object.entries(resources)
+    .filter(
+      ([id, resource]) =>
+        /^Bootstrap[a-f0-9]{16}Policy/u.test(id) &&
+        resource.Type === "AWS::IAM::Policy",
+    )
+    .map(([id]) => id);
+  assert.equal(brokerResources.length, 8);
+  assert.equal(runnerPolicies.length, 4);
+  const [service] = Object.values(template.findResources("AWS::ECS::Service"));
+  const dependencies = service.DependsOn as string[];
+  for (const id of [...brokerResources, ...runnerPolicies]) {
+    assert.ok(dependencies.includes(id), id);
+  }
+});
+
 test("explicit Fargate preflight changes only the controller task definition environment", () => {
   const config = fixture("mixed-ec2-fargate");
   const raw = JSON.stringify(
