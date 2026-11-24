@@ -19,7 +19,7 @@ public sealed partial class FargateProfileInspector
 
     public Task<FargateInventorySnapshot> ReadAllocationAsync(
         RuntimeConfiguration configuration, string profileId, Guid allocationId, CancellationToken cancellationToken) =>
-        ReadInventoryAsync(GetTarget(configuration, profileId), StartedBy(allocationId), cancellationToken);
+        ReadInventoryAsync(GetTarget(configuration, profileId), allocationId, cancellationToken);
 
     public static string StartedBy(Guid allocationId)
     {
@@ -28,8 +28,9 @@ public sealed partial class FargateProfileInspector
     }
 
     private async Task<FargateInventorySnapshot> ReadInventoryAsync(
-        InspectionTarget target, string? startedBy, CancellationToken cancellationToken)
+        InspectionTarget target, Guid? allocationId, CancellationToken cancellationToken)
     {
+        string? startedBy = allocationId is Guid allocation ? StartedBy(allocation) : null;
         var observedAt = _clock.GetUtcNow();
         var tasks = new List<FargateTaskObservation>();
         try
@@ -41,14 +42,14 @@ public sealed partial class FargateProfileInspector
             var ids = new HashSet<string>(StringComparer.Ordinal);
             bool complete = await ReadTaskIdsAsync(target, startedBy, startedBy is null ? DesiredStatus.RUNNING : null,
                 ids, cancellationToken).ConfigureAwait(false);
-            if (startedBy is null)
-            {
-                // Desired STOPPED may still be stopping. Only LastStatus proves that a task stopped.
-                complete &= await ReadTaskIdsAsync(target, null, DesiredStatus.STOPPED, ids, cancellationToken).ConfigureAwait(false);
-            }
+            var correlation = allocationId is Guid requested
+                ? new AllocationCorrelation(requested, startedBy!, new HashSet<string>(ids, StringComparer.Ordinal))
+                : null;
+            // StartedBy must be the only filter and defaults to desired RUNNING. Find stopped candidates separately.
+            complete &= await ReadTaskIdsAsync(target, null, DesiredStatus.STOPPED, ids, cancellationToken).ConfigureAwait(false);
             foreach (var batch in ids.Order(StringComparer.Ordinal).Chunk(100))
             {
-                complete &= await DescribeBatchAsync(target, startedBy, batch, observedAt, tasks, cancellationToken).ConfigureAwait(false);
+                complete &= await DescribeBatchAsync(target, correlation, batch, observedAt, tasks, cancellationToken).ConfigureAwait(false);
             }
             var duplicateAllocations = tasks.Where(task => task.IsOwned).GroupBy(task => task.AllocationId)
                 .Where(group => group.Count() > 1).Select(group => group.Key).ToHashSet();
@@ -113,7 +114,7 @@ public sealed partial class FargateProfileInspector
         return false;
     }
 
-    private async Task<bool> DescribeBatchAsync(InspectionTarget target, string? startedBy, string[] batch, DateTimeOffset observedAt,
+    private async Task<bool> DescribeBatchAsync(InspectionTarget target, AllocationCorrelation? correlation, string[] batch, DateTimeOffset observedAt,
         List<FargateTaskObservation> destination, CancellationToken cancellationToken)
     {
         var reply = await _ecs.DescribeTasksAsync(new DescribeTasksRequest
@@ -130,14 +131,43 @@ public sealed partial class FargateProfileInspector
                 complete = false;
                 continue;
             }
-            var observation = ParseTask(target, task, startedBy, observedAt, attachmentObservedAt, out bool exact);
+            var tags = ReadOwnershipTags(task.Tags);
+            if (correlation is { ListedTaskArns: var listed } && !listed.Contains(arn) &&
+                IsUnrelatedTask(target, task, tags, correlation))
+            {
+                continue;
+            }
+            var observation = ParseTask(target, task, tags, observedAt, attachmentObservedAt, out bool exact);
+            if (correlation is not null && (task.StartedBy != correlation.StartedBy ||
+                observation.AllocationId != correlation.AllocationId || !observation.IsOwned))
+            {
+                exact = false;
+                observation = observation with { Incarnation = null };
+            }
             destination.Add(observation);
             complete &= exact;
         }
         return complete && missing.Count == 0;
     }
 
-    private static FargateTaskObservation ParseTask(InspectionTarget target, EcsTask task, string? expectedStartedBy,
+    private static bool IsUnrelatedTask(InspectionTarget target, EcsTask task, Dictionary<string, string>? tags, AllocationCorrelation correlation)
+    {
+        if (tags is null || task.StartedBy == correlation.StartedBy ||
+            string.IsNullOrEmpty(task.TaskDefinitionArn) || string.IsNullOrEmpty(task.LastStatus))
+        {
+            return false;
+        }
+        return Guid.TryParse(tags.GetValueOrDefault(RunnerOwnershipTags.Allocation), out var allocation) && allocation != Guid.Empty
+            ? allocation != correlation.AllocationId
+            : !ClaimsProfile(target, tags);
+    }
+
+    private static bool ClaimsProfile(InspectionTarget target, Dictionary<string, string>? tags) =>
+        tags?.GetValueOrDefault(RunnerOwnershipTags.Controller) == RunnerOwnershipTags.ControllerValue &&
+        tags.GetValueOrDefault(RunnerOwnershipTags.Deployment) == target.Scope.Deployment &&
+        tags.GetValueOrDefault(RunnerOwnershipTags.Profile) == target.Scope.ProfileId;
+
+    private static FargateTaskObservation ParseTask(InspectionTarget target, EcsTask task, Dictionary<string, string>? tags,
         DateTimeOffset observedAt, DateTimeOffset attachmentObservedAt, out bool exact)
     {
         var state = task.LastStatus switch
@@ -150,14 +180,10 @@ public sealed partial class FargateProfileInspector
         };
         var attached = ReadAttachedSubnets(task.Attachments);
         bool inScope = attached.Any(subnet => target.Network.Subnets.Any(configured => configured.Id == subnet));
-        var tags = ReadOwnershipTags(task.Tags);
-        bool claimsProfile = tags?.GetValueOrDefault(RunnerOwnershipTags.Controller) == RunnerOwnershipTags.ControllerValue &&
-            tags.GetValueOrDefault(RunnerOwnershipTags.Deployment) == target.Scope.Deployment &&
-            tags.GetValueOrDefault(RunnerOwnershipTags.Profile) == target.Scope.ProfileId;
         exact = tags is not null && state != FargateTaskState.Unknown && !string.IsNullOrEmpty(task.TaskDefinitionArn);
         Guid? allocation = null;
         Guid? incarnation = null;
-        if (claimsProfile)
+        if (ClaimsProfile(target, tags))
         {
             string? tagged = tags!.GetValueOrDefault(RunnerOwnershipTags.Allocation);
             if (Guid.TryParseExact(tagged, "D", out var id) && id != Guid.Empty && tagged == id.ToString("D"))
@@ -174,11 +200,6 @@ public sealed partial class FargateProfileInspector
                 }
             }
             exact &= incarnation.HasValue;
-        }
-        if (expectedStartedBy is not null && (task.StartedBy != expectedStartedBy || !incarnation.HasValue))
-        {
-            exact = false;
-            incarnation = null;
         }
         return new FargateTaskObservation(task.TaskArn, task.TaskDefinitionArn, state, ReadCreatedAt(task.CreatedAt, observedAt),
             allocation, incarnation, attached, attached.IsEmpty ? null : attachmentObservedAt, inScope, task.EnableExecuteCommand);
@@ -257,4 +278,6 @@ public sealed partial class FargateProfileInspector
         byte[] digest = SHA256.HashData(Encoding.UTF8.GetBytes(identity));
         return new Guid(digest.AsSpan(0, 16), bigEndian: true);
     }
+
+    private sealed record AllocationCorrelation(Guid AllocationId, string StartedBy, HashSet<string> ListedTaskArns);
 }

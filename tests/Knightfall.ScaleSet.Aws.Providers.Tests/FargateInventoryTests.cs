@@ -9,6 +9,8 @@ namespace Knightfall.ScaleSet.Aws.Providers.Tests;
 
 public sealed class FargateInventoryTests
 {
+    private static readonly Guid OtherAllocation = Guid.Parse("10112233-4455-6677-8899-aabbccddeeff");
+
     [Theory]
     [InlineData(false)]
     [InlineData(true)]
@@ -78,7 +80,8 @@ public sealed class FargateInventoryTests
         row["overrides"] = JsonNode.Parse("""{"containerOverrides":[{"name":"runner"}]}""");
         using var aws = new FargateInspectionFixture
         {
-            ListTasks = query => query.TryGetProperty("nextToken", out _) ? ListReply([FirstTask]) : ListReply([], "opaque+2"),
+            ListTasks = query => query.TryGetProperty("desiredStatus", out _) || query.TryGetProperty("nextToken", out _)
+                ? ListReply([FirstTask]) : ListReply([], "opaque+2"),
             DescribeTasks = _ => TasksReply(row),
         };
         var config = await ConfigurationAsync(token);
@@ -93,8 +96,8 @@ public sealed class FargateInventoryTests
         Assert.False(planning.IsComplete);
         Assert.Null(planning.BackendLaunchHeadroom);
         var pages = aws.Requests.Where(request => Operation(request) == "ListTasks").Select(Body).ToArray();
-        Assert.Equal(2, pages.Length);
-        Assert.All(pages, page =>
+        Assert.Equal(3, pages.Length);
+        Assert.All(pages[..2], page =>
         {
             Assert.Equal(Cluster, page.GetProperty("cluster").GetString());
             Assert.Equal("ss-00112233445566778899aabbccddeeff", page.GetProperty("startedBy").GetString());
@@ -102,6 +105,90 @@ public sealed class FargateInventoryTests
         Assert.Equal(2, pages[0].EnumerateObject().Count());
         Assert.Equal(3, pages[1].EnumerateObject().Count());
         Assert.Equal("opaque+2", pages[1].GetProperty("nextToken").GetString());
+        Assert.Equal(2, pages[2].EnumerateObject().Count());
+        Assert.Equal(Cluster, pages[2].GetProperty("cluster").GetString());
+        Assert.Equal("STOPPED", pages[2].GetProperty("desiredStatus").GetString());
+        var describe = Assert.Single(aws.Requests, request => Operation(request) == "DescribeTasks");
+        Assert.Equal(FirstTask, Assert.Single(Body(describe).GetProperty("tasks").EnumerateArray()).GetString());
+    }
+
+    [Fact]
+    public async Task AllocationRecoveryFindsTaskThatAlreadyStoppedAndIgnoresUnrelatedTasks()
+    {
+        var token = TestContext.Current.CancellationToken;
+        using var aws = new FargateInspectionFixture
+        {
+            ListTasks = query =>
+            {
+                if (query.TryGetProperty("startedBy", out _))
+                {
+                    return ListReply([]);
+                }
+                return query.TryGetProperty("nextToken", out _) ? ListReply([FirstTask]) : ListReply([SecondTask, ThirdTask], "history+2");
+            },
+            DescribeTasks = _ => TasksReply(TaskRow(FirstTask, FirstAllocation, "STOPPED", attachedSubnet: null),
+                TaskRow(SecondTask, state: "STOPPED"), TaskRow(ThirdTask, OtherAllocation, "STOPPING")),
+        };
+        var config = await ConfigurationAsync(token);
+
+        var result = await aws.Inspector.ReadAllocationAsync(config, Profile, FirstAllocation, token);
+
+        Assert.True(result.IsComplete);
+        Assert.False(result.IsProfileComplete);
+        Assert.Null(result.OwnedOccupancy);
+        var stopped = Assert.Single(result.Tasks);
+        Assert.Equal(FirstTask, stopped.ResourceArn);
+        Assert.Equal(FirstAllocation, stopped.AllocationId);
+        Assert.Equal(FargateTaskState.Stopped, stopped.State);
+        Assert.True(stopped.IsOwned);
+        var pages = aws.Requests.Where(request => Operation(request) == "ListTasks").Select(Body).ToArray();
+        Assert.Equal(3, pages.Length);
+        Assert.Equal(FargateProfileInspector.StartedBy(FirstAllocation), pages[0].GetProperty("startedBy").GetString());
+        Assert.False(pages[0].TryGetProperty("desiredStatus", out _));
+        Assert.All(pages[1..], page =>
+        {
+            Assert.Equal(Cluster, page.GetProperty("cluster").GetString());
+            Assert.Equal("STOPPED", page.GetProperty("desiredStatus").GetString());
+            Assert.False(page.TryGetProperty("startedBy", out _));
+        });
+        Assert.Equal("history+2", pages[2].GetProperty("nextToken").GetString());
+    }
+
+    [Theory]
+    [InlineData("duplicate-list")]
+    [InlineData("missing-description")]
+    [InlineData("wrong-allocation")]
+    [InlineData("wrong-started-by")]
+    public async Task AllocationRecoveryPreservesIncompleteOrConflictingStoppedEvidence(string fault)
+    {
+        var token = TestContext.Current.CancellationToken;
+        using var aws = new FargateInspectionFixture
+        {
+            ListTasks = query =>
+            {
+                if (query.TryGetProperty("startedBy", out _))
+                {
+                    return ListReply([]);
+                }
+                return fault switch
+                {
+                    "duplicate-list" => query.TryGetProperty("nextToken", out _) ? ListReply([FirstTask]) : ListReply([FirstTask], "next"),
+                    "missing-description" => ListReply([FirstTask, SecondTask]),
+                    _ => ListReply([FirstTask]),
+                };
+            },
+            DescribeTasks = _ => TasksReply(TaskRow(FirstTask, fault == "wrong-allocation" ? OtherAllocation : FirstAllocation, "STOPPED",
+                startedBy: fault == "wrong-started-by" ? "different" : FargateProfileInspector.StartedBy(FirstAllocation))),
+        };
+        var config = await ConfigurationAsync(token);
+
+        var result = await aws.Inspector.ReadAllocationAsync(config, Profile, FirstAllocation, token);
+
+        Assert.Equal(FargateInventoryStatus.Incomplete, result.Status);
+        Assert.False(result.IsProfileComplete);
+        var stopped = Assert.Single(result.Tasks);
+        Assert.Equal(FirstTask, stopped.ResourceArn);
+        Assert.Equal(fault is "duplicate-list" or "missing-description", stopped.IsOwned);
     }
 
     [Fact]
@@ -174,7 +261,7 @@ public sealed class FargateInventoryTests
                 returned["overrides"] = JsonNode.Parse("""{"containerOverrides":[{"name":"different"}]}""");
                 break;
         }
-        aws.ListTasks = _ => fault switch
+        aws.ListTasks = query => query.TryGetProperty("desiredStatus", out _) ? ListReply([]) : fault switch
         {
             "list-missing" => "{}",
             "list-loop" => ListReply([FirstTask], "same"),
@@ -203,7 +290,7 @@ public sealed class FargateInventoryTests
         }
         if (fault == "list-loop")
         {
-            Assert.Equal(2, aws.Requests.Count(request => Operation(request) == "ListTasks"));
+            Assert.Equal(2, aws.Requests.Count(request => Operation(request) == "ListTasks" && Body(request).TryGetProperty("startedBy", out _)));
         }
     }
 
