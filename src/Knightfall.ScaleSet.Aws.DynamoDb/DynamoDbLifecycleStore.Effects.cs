@@ -56,11 +56,28 @@ public sealed partial class DynamoDbLifecycleStore
     /// Use a strong effect read to reconcile the transition ID after an indeterminate result
     /// or cancellation during the request before making a new decision.
     /// </remarks>
-    public async Task<LifecycleWriteOutcome> WriteEffectAsync(
+    internal Task<LifecycleWriteOutcome> WriteEffectAsync(
         LifecycleProfile profile,
         DeploymentLeaseFence lease,
         Guid transitionId,
         EffectWrite write,
+        CancellationToken cancellationToken) =>
+        WriteEffectAsync(profile, lease, transitionId, write, LeaseAccess.Active, cancellationToken);
+
+    internal Task<LifecycleWriteOutcome> WriteRecoveredEffectAsync(
+        LifecycleProfile profile,
+        DeploymentLeaseFence lease,
+        Guid transitionId,
+        EffectWrite write,
+        CancellationToken cancellationToken) =>
+        WriteEffectAsync(profile, lease, transitionId, write, LeaseAccess.Recovery, cancellationToken);
+
+    private async Task<LifecycleWriteOutcome> WriteEffectAsync(
+        LifecycleProfile profile,
+        DeploymentLeaseFence lease,
+        Guid transitionId,
+        EffectWrite write,
+        LeaseAccess leaseAccess,
         CancellationToken cancellationToken)
     {
         RequireProfileLease(profile, lease);
@@ -80,6 +97,11 @@ public sealed partial class DynamoDbLifecycleStore
         var operationKey = LifecycleKey.Operation(profile, write.IntentId);
         var existing = await ReadEffectAsync(profile, write.IntentId, cancellationToken).ConfigureAwait(false);
         if (existing?.Revision != write.ExpectedRevision)
+        {
+            return LifecycleWriteOutcome.Conflict;
+        }
+        if (leaseAccess == LeaseAccess.Recovery &&
+            (write.State != EffectState.Settled || existing?.State is not (EffectState.Executing or EffectState.Uncertain)))
         {
             return LifecycleWriteOutcome.Conflict;
         }
@@ -110,7 +132,7 @@ public sealed partial class DynamoDbLifecycleStore
 
         var actions = new List<TransactionAction>
         {
-            LeaseCondition(lease),
+            LeaseCondition(lease, leaseAccess),
             CompareAndPut(operationKey, operation, write.ExpectedRevision, profile.Deployment),
             WriteIndex(profile, nextIndex, head.Revision, transitionId),
         };
@@ -148,7 +170,7 @@ public sealed partial class DynamoDbLifecycleStore
             return null;
         }
 
-        var page = await ReadBasePageAsync(profile, prefix, continuation?.AfterSortKey, cancellationToken).ConfigureAwait(false);
+        var page = await ReadBasePageAsync(profile.PartitionKey, prefix, continuation?.AfterSortKey, cancellationToken).ConfigureAwait(false);
         var current = await ReadEffectIndexAsync(profile, cancellationToken).ConfigureAwait(false);
         if (current != head)
         {

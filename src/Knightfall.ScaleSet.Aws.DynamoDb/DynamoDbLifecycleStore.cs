@@ -78,6 +78,10 @@ public sealed partial class DynamoDbLifecycleStore
             ArgumentNullException.ThrowIfNull(write.Payload);
             var item = Record(write.Key, lease.Deployment, NextRevision(write.ExpectedRevision), transitionId);
             item.Add("payload", StringValue(write.Payload));
+            if (write.Key.Kind == LifecycleItemKind.Profile)
+            {
+                item.Add(CatalogProfileIdentity, StringValue(write.Key.SortKey[CatalogProfilePrefix.Length..]));
+            }
 
             if (write.HistoryRetention is { } retention)
             {
@@ -126,7 +130,7 @@ public sealed partial class DynamoDbLifecycleStore
     }
 
     private async Task<BasePage> ReadBasePageAsync(
-        LifecycleProfile profile,
+        string partition,
         string prefix,
         string? after,
         CancellationToken cancellationToken)
@@ -144,10 +148,10 @@ public sealed partial class DynamoDbLifecycleStore
             KeyConditionExpression = "PK = :pk AND begins_with(SK, :prefix)",
             ExpressionAttributeValues = new Dictionary<string, AttributeValue>(StringComparer.Ordinal)
             {
-                [":pk"] = StringValue(profile.PartitionKey),
+                [":pk"] = StringValue(partition),
                 [":prefix"] = StringValue(prefix),
             },
-            ExclusiveStartKey = after is null ? null : Key(profile.PartitionKey, after),
+            ExclusiveStartKey = after is null ? null : Key(partition, after),
         }, cancellationToken).ConfigureAwait(false);
 
         if (reply.Items is { Count: > HistoryPageSize })
@@ -159,7 +163,7 @@ public sealed partial class DynamoDbLifecycleStore
         if (reply.LastEvaluatedKey is { Count: > 0 } cursor)
         {
             next = Text(cursor, "SK");
-            RequireKey(cursor, profile.PartitionKey, next);
+            RequireKey(cursor, partition, next);
             if (!next.StartsWith(prefix, StringComparison.Ordinal) || next == after)
             {
                 throw InvalidRecord();
@@ -169,37 +173,54 @@ public sealed partial class DynamoDbLifecycleStore
         return new BasePage(reply.Items ?? [], next);
     }
 
-    private TransactionAction LeaseCondition(DeploymentLeaseFence lease)
+    private TransactionAction LeaseCondition(DeploymentLeaseFence lease, LeaseAccess access = LeaseAccess.Active)
     {
         ArgumentNullException.ThrowIfNull(lease);
         ArgumentException.ThrowIfNullOrWhiteSpace(lease.OwnerId);
+        if (!IsTaskArn(lease.OwnerTaskArn))
+        {
+            throw new ArgumentException("An exact ECS task ARN is required.", nameof(lease));
+        }
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(lease.Epoch);
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(lease.WriterProtocol);
 
         var key = LifecycleKey.Lease(lease.Deployment);
-        return new TransactionAction(key, new TransactWriteItem
+        var check = new ConditionCheck
         {
-            ConditionCheck = new ConditionCheck
+            TableName = _tableName,
+            Key = Key(key),
+            ConditionExpression = "#owner = :owner AND #task = :task AND #epoch = :epoch AND #protocol = :protocol AND #until > :now",
+            ExpressionAttributeNames = new Dictionary<string, string>(StringComparer.Ordinal)
             {
-                TableName = _tableName,
-                Key = Key(key),
-                ConditionExpression = "#owner = :owner AND #epoch = :epoch AND #protocol = :protocol AND #until > :now",
-                ExpressionAttributeNames = new Dictionary<string, string>(StringComparer.Ordinal)
-                {
-                    ["#owner"] = "ownerId",
-                    ["#epoch"] = "epoch",
-                    ["#protocol"] = "writerProtocol",
-                    ["#until"] = "validUntil",
-                },
-                ExpressionAttributeValues = new Dictionary<string, AttributeValue>(StringComparer.Ordinal)
-                {
-                    [":owner"] = StringValue(lease.OwnerId),
-                    [":epoch"] = NumberValue(lease.Epoch),
-                    [":protocol"] = NumberValue(lease.WriterProtocol),
-                    [":now"] = NumberValue(_timeProvider.GetUtcNow().ToUnixTimeMilliseconds()),
-                },
+                ["#owner"] = "ownerId",
+                ["#task"] = "ownerTaskArn",
+                ["#epoch"] = "epoch",
+                ["#protocol"] = "writerProtocol",
+                ["#until"] = "validUntil",
+                ["#mode"] = "leaseMode",
             },
-        });
+            ExpressionAttributeValues = new Dictionary<string, AttributeValue>(StringComparer.Ordinal)
+            {
+                [":owner"] = StringValue(lease.OwnerId),
+                [":task"] = StringValue(lease.OwnerTaskArn),
+                [":epoch"] = NumberValue(lease.Epoch),
+                [":protocol"] = NumberValue(lease.WriterProtocol),
+                [":now"] = NumberValue(ConservativeLatest(DateTimeOffset.MinValue).ToUnixTimeMilliseconds()),
+            },
+        };
+        if (access == LeaseAccess.ActiveOrRecovery)
+        {
+            check.ConditionExpression += " AND (#mode = :active OR #mode = :recovery)";
+            check.ExpressionAttributeValues[":active"] = StringValue(LeaseModeValue(ControllerLeaseMode.Active));
+            check.ExpressionAttributeValues[":recovery"] = StringValue(LeaseModeValue(ControllerLeaseMode.RecoveryOnly));
+        }
+        else
+        {
+            check.ConditionExpression += " AND #mode = :mode";
+            var mode = access == LeaseAccess.Active ? ControllerLeaseMode.Active : ControllerLeaseMode.RecoveryOnly;
+            check.ExpressionAttributeValues[":mode"] = StringValue(LeaseModeValue(mode));
+        }
+        return new TransactionAction(key, new TransactWriteItem { ConditionCheck = check });
     }
 
     private TransactionAction CompareAndPut(
@@ -271,7 +292,8 @@ public sealed partial class DynamoDbLifecycleStore
             {
                 return LifecycleWriteOutcome.Indeterminate;
             }
-            if (actions[0].Key.Kind == LifecycleItemKind.Lease && reasons[0].Code == "ConditionalCheckFailed")
+            if (actions[0].Write.ConditionCheck is not null && actions[0].Key.Kind == LifecycleItemKind.Lease &&
+                reasons[0].Code == "ConditionalCheckFailed")
             {
                 return LifecycleWriteOutcome.LeaseRejected;
             }
@@ -379,4 +401,11 @@ public sealed partial class DynamoDbLifecycleStore
     private sealed record TransactionAction(LifecycleKey Key, TransactWriteItem Write);
 
     private sealed record BasePage(List<Dictionary<string, AttributeValue>> Items, string? Continuation);
+
+    private enum LeaseAccess
+    {
+        Active = 0,
+        Recovery = 1,
+        ActiveOrRecovery = 2,
+    }
 }

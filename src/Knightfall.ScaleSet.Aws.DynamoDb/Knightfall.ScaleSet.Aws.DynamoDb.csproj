@@ -3,6 +3,7 @@
     <TargetFramework>net10.0</TargetFramework>
   </PropertyGroup>
   <ItemGroup>
+    <InternalsVisibleTo Include="Knightfall.ScaleSet.Aws.Lifecycle.Tests" />
     <ProjectReference Include="../Knightfall.ScaleSet.Aws.Core/Knightfall.ScaleSet.Aws.Core.csproj" />
     <PackageReference Include="AWSSDK.Core" />
     <PackageReference Include="AWSSDK.DynamoDBv2" />

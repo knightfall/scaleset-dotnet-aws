@@ -5,6 +5,53 @@ namespace Knightfall.ScaleSet.Aws.DynamoDb;
 
 public sealed partial class DynamoDbLifecycleStore
 {
+    internal async Task<EffectRebuildPass> TryReuseEffectIndexAsync(
+        LifecycleProfile profile, ControllerLease expected, CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(expected);
+        RequireProfileLease(profile, expected.Fence);
+        if (expected.Mode != ControllerLeaseMode.RecoveryOnly ||
+            await ReadLeaseAsync(expected.Deployment, cancellationToken).ConfigureAwait(false) != expected)
+        {
+            return new EffectRebuildPass(null, LifecycleWriteOutcome.LeaseRejected, 0);
+        }
+
+        var head = await ReadEffectIndexAsync(profile, cancellationToken).ConfigureAwait(false);
+        if (head is not { State: EffectIndexState.Ready })
+        {
+            return new EffectRebuildPass(head, LifecycleWriteOutcome.RebuildRequired, 0);
+        }
+        if (MatchesLease(head, expected.Fence))
+        {
+            return new EffectRebuildPass(head, LifecycleWriteOutcome.Committed, 0);
+        }
+
+        if (expected.WriterProtocol != ControllerLease.CurrentWriterProtocol ||
+            expected.PreviousOwner is not { WriterProtocol: ControllerLease.CurrentWriterProtocol } previous ||
+            head.WriterProtocol != previous.WriterProtocol || head.OwnerEpoch != previous.Epoch)
+        {
+            return new EffectRebuildPass(head, LifecycleWriteOutcome.RebuildRequired, 0);
+        }
+
+        var checkpoint = await ReadRebuildAsync(profile, cancellationToken).ConfigureAwait(false);
+        if (checkpoint is not { Completed: true } || checkpoint.Generation != head.Generation ||
+            checkpoint.OwnerEpoch != previous.Epoch)
+        {
+            return new EffectRebuildPass(head, LifecycleWriteOutcome.RebuildRequired, 0);
+        }
+
+        var transition = Guid.NewGuid();
+        var nextHead = head with { Revision = NextRevision(head.Revision), OwnerEpoch = expected.Epoch };
+        var nextCheckpoint = checkpoint with { Revision = NextRevision(checkpoint.Revision), OwnerEpoch = expected.Epoch };
+        var outcome = await WriteAsync(
+        [
+            LeaseCondition(expected.Fence, LeaseAccess.Recovery),
+            WriteIndex(profile, nextHead, head.Revision, transition),
+            WriteRebuild(profile, nextCheckpoint, checkpoint.Revision, transition),
+        ], transition, cancellationToken).ConfigureAwait(false);
+        return new EffectRebuildPass(outcome == LifecycleWriteOutcome.Committed ? nextHead : head, outcome, 0);
+    }
+
     public async Task<EffectRebuildPass> AdvanceEffectRebuildAsync(
         LifecycleProfile profile, DeploymentLeaseFence lease, CancellationToken cancellationToken)
     {
@@ -25,7 +72,7 @@ public sealed partial class DynamoDbLifecycleStore
             var transition = Guid.NewGuid();
             var outcome = await WriteAsync(
             [
-                LeaseCondition(lease),
+                LeaseCondition(lease, LeaseAccess.ActiveOrRecovery),
                 WriteIndex(profile, replacement, head?.Revision, transition),
                 WriteRebuild(profile, start, checkpoint?.Revision, transition),
             ], transition, cancellationToken).ConfigureAwait(false);
@@ -70,9 +117,9 @@ public sealed partial class DynamoDbLifecycleStore
         RebuildCheckpoint checkpoint,
         CancellationToken cancellationToken)
     {
-        var page = await ReadBasePageAsync(profile, OperationPrefix, checkpoint.After, cancellationToken).ConfigureAwait(false);
+        var page = await ReadBasePageAsync(profile.PartitionKey, OperationPrefix, checkpoint.After, cancellationToken).ConfigureAwait(false);
         var transition = Guid.NewGuid();
-        var actions = new List<TransactionAction>(page.Items.Count + 3) { LeaseCondition(lease) };
+        var actions = new List<TransactionAction>(page.Items.Count + 3) { LeaseCondition(lease, LeaseAccess.ActiveOrRecovery) };
         long count = checkpoint.PartialCount;
         foreach (var item in page.Items)
         {
