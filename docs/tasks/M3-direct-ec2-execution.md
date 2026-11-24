@@ -63,7 +63,7 @@ Implement idempotent count-1 Direct EC2 instance provisioning (`RunInstances`), 
 
 ### Deliverable
 
-Implement Direct EC2 mode in `Knightfall.ScaleSet.Aws.RunnerBootstrap` and document the AMI/OS bootstrap contract separating the supervisor identity from the one-job runner execution boundary.
+Implement Direct EC2 mode in `Knightfall.ScaleSet.Aws.RunnerBootstrap` and document the AMI/OS bootstrap contract separating the supervisor identity from the one-job runner execution boundary. See the [Direct EC2 runner bootstrap contract](../ec2-runner-bootstrap.md).
 
 ### Requirements
 

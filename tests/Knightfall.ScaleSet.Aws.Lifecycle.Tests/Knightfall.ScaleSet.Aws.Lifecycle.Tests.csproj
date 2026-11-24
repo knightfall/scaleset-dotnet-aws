@@ -10,6 +10,7 @@
     <ProjectReference Include="../../src/Knightfall.ScaleSet.Aws.Controller/Knightfall.ScaleSet.Aws.Controller.csproj" />
     <ProjectReference Include="../../src/Knightfall.ScaleSet.Aws.DynamoDb/Knightfall.ScaleSet.Aws.DynamoDb.csproj" />
     <ProjectReference Include="../../src/Knightfall.ScaleSet.Aws.GitHub/Knightfall.ScaleSet.Aws.GitHub.csproj" />
+    <ProjectReference Include="../../src/Knightfall.ScaleSet.Aws.RunnerBootstrap/Knightfall.ScaleSet.Aws.RunnerBootstrap.csproj" />
     <Compile Include="../Knightfall.ScaleSet.Aws.SdkContract.Tests/Aws/AwsWireTransport.cs" Link="AwsWireTransport.cs" />
     <Compile Include="../Knightfall.ScaleSet.Aws.SdkContract.Tests/GitHub/GitHubWire.cs" Link="GitHubWire.cs" />
     <PackageReference Include="xunit.v3" />
