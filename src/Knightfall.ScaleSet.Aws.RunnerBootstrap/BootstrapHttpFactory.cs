@@ -1,6 +1,6 @@
 using Amazon.Runtime;
 
-namespace Knightfall.ScaleSet.Aws.RunnerBootstrap.Ec2;
+namespace Knightfall.ScaleSet.Aws.RunnerBootstrap;
 
 internal sealed class BootstrapHttpFactory : HttpClientFactory
 {
