@@ -50,7 +50,6 @@ jobs:
       - name: Set up the Docker containerd image store
         uses: docker/setup-docker-action@3f1ab1ab0e29231562e4db4ca600c1a49653bac6 # v5.7.0
         with:
-          version: v29.10.1
           set-host: true
           daemon-config: '{"features":{"containerd-snapshotter":true}}'
       - name: Build, inspect and smoke-test the OCI archive
