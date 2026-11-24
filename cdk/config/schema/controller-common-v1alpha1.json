@@ -8,8 +8,9 @@
       "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]*(?![\\s\\S])"
     },
     "nonBlank": {
+      "$comment": "Whitespace code points are explicit for consistent JavaScript and .NET validation.",
       "type": "string",
-      "pattern": "^[^\\s\\u0000-\\u001f\\u007f-\\u009f](?:[^\\u0000-\\u001f\\u007f-\\u009f]*[^\\s\\u0000-\\u001f\\u007f-\\u009f])?(?![\\s\\S])"
+      "pattern": "^[^\\u0000-\\u0020\\u007f-\\u00a0\\u1680\\u2000-\\u200a\\u2028-\\u2029\\u202f\\u205f\\u3000\\ufeff](?:[^\\u0000-\\u001f\\u007f-\\u009f]*[^\\u0000-\\u0020\\u007f-\\u00a0\\u1680\\u2000-\\u200a\\u2028-\\u2029\\u202f\\u205f\\u3000\\ufeff])?(?![\\s\\S])"
     },
     "positiveInteger": {
       "type": "integer",
@@ -31,7 +32,7 @@
     "architecture": { "enum": ["x64", "arm64"] },
     "roleArn": {
       "type": "string",
-      "pattern": "^arn:aws(?:-[a-z0-9-]+)?:iam::[0-9]{12}:role/[^\\s*?]+(?![\\s\\S])"
+      "pattern": "^arn:aws(?:-[a-z0-9-]+)?:iam::[0-9]{12}:role/[^\\u0009-\\u000d\\u0020\\u00a0\\u1680\\u2000-\\u200a\\u2028-\\u2029\\u202f\\u205f\\u3000\\ufeff*?]+(?![\\s\\S])"
     },
     "metadata": {
       "type": "object",
@@ -127,7 +128,7 @@
             "type": { "const": "snapshot" },
             "s3Uri": {
               "type": "string",
-              "pattern": "^s3://[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]/[^\\s?#]+(?![\\s\\S])"
+              "pattern": "^s3://[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]/[^\\u0009-\\u000d\\u0020\\u00a0\\u1680\\u2000-\\u200a\\u2028-\\u2029\\u202f\\u205f\\u3000\\ufeff?#]+(?![\\s\\S])"
             },
             "versionId": {
               "$ref": "#/$defs/nonBlank",
@@ -417,7 +418,7 @@
         },
         "instanceProfileArn": {
           "type": "string",
-          "pattern": "^arn:aws(?:-[a-z0-9-]+)?:iam::[0-9]{12}:instance-profile/[^\\s*?]+(?![\\s\\S])"
+          "pattern": "^arn:aws(?:-[a-z0-9-]+)?:iam::[0-9]{12}:instance-profile/[^\\u0009-\\u000d\\u0020\\u00a0\\u1680\\u2000-\\u200a\\u2028-\\u2029\\u202f\\u205f\\u3000\\ufeff*?]+(?![\\s\\S])"
         },
         "bootstrapRoleArn": { "$ref": "#/$defs/roleArn" },
         "bootstrapProtocol": { "const": "v1" },
