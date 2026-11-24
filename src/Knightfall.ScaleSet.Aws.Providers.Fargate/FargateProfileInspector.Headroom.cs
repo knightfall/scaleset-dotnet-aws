@@ -22,9 +22,10 @@ public sealed partial class FargateProfileInspector
         }
 
         var requested = new HashSet<Guid>();
-        var attached = new Dictionary<Guid, (FargateTaskObservation Task, DateTimeOffset InventoryAt)>();
+        var attached = new Dictionary<(FargateProfileScope Scope, Guid Allocation), (FargateTaskObservation Task, DateTimeOffset InventoryAt)>();
         var snapshots = otherProfiles.Where(sample => sample.IsProfileComplete && !sample.Tasks.IsDefault &&
-            sample.Scope.Account == task.Scope.Account && sample.Scope.Region == task.Scope.Region && sample.Scope.ProfileId != task.Scope.ProfileId &&
+            sample.Scope.Account == task.Scope.Account && sample.Scope.Region == task.Scope.Region &&
+            sample.Scope.Deployment == task.Scope.Deployment && sample.Scope.ProfileId != task.Scope.ProfileId &&
             Fresh(sample.ObservedAt, now)).Prepend(inventory);
         foreach (var sample in snapshots)
         {
@@ -34,7 +35,8 @@ public sealed partial class FargateProfileInspector
                 {
                     continue;
                 }
-                if (observation.AllocationId is not { } allocation || !attached.TryAdd(allocation, (observation, sample.ObservedAt)))
+                if (observation.AllocationId is not { } allocation ||
+                    !attached.TryAdd((sample.Scope, allocation), (observation, sample.ObservedAt)))
                 {
                     return new FargateHeadroom(null, null, null);
                 }
@@ -51,7 +53,9 @@ public sealed partial class FargateProfileInspector
                 return new FargateHeadroom(null, null, null);
             }
 
-            bool observedAttached = attached.TryGetValue(launch.AllocationId, out var resource) &&
+            var launchScope = launch.Scope ?? inventory.Scope;
+            bool observedAttached = attached.TryGetValue((launchScope, launch.AllocationId), out var resource) &&
+                resource.Task.TaskDefinitionArn == launchScope.TaskDefinitionArn &&
                 (launch.TaskArn is null || launch.TaskArn == resource.Task.ResourceArn) &&
                 resource.Task.AttachedSubnetIds.All(launch.EligibleSubnetIds.Contains);
             DateTimeOffset? attachment = observedAttached && resource.Task.AttachmentObservedAt is { } observed &&

@@ -201,7 +201,11 @@ internal sealed class FargateRunnerBackend(
                 return null;
             }
             all.AddRange(tracked.Reservations.Select(reservation => new FargateLaunchReservation(reservation.AllocationId,
-                reservation.CpuUnits, reservation.EligibleSubnetIds, reservation.TaskArn)));
+                reservation.CpuUnits, reservation.EligibleSubnetIds, reservation.TaskArn)
+            {
+                Scope = new FargateProfileScope(configuration.Aws.Account, configuration.Aws.Region, reservation.Profile.Deployment,
+                    reservation.Profile.ProfileId, reservation.ClusterArn, reservation.TaskDefinitionArn),
+            }));
         }
         return all;
     }

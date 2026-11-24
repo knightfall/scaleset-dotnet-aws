@@ -115,6 +115,10 @@ public sealed record FargateQuotaEvidence(
     long RemainingCpuUnits, long ReservedCpuUnits);
 
 public sealed record FargateLaunchReservation(
-    Guid AllocationId, int CpuUnits, ImmutableArray<string> EligibleSubnetIds, string? TaskArn = null);
+    Guid AllocationId, int CpuUnits, ImmutableArray<string> EligibleSubnetIds, string? TaskArn = null)
+{
+    /// <summary>Exact durable launch scope. Without it, only the profile being planned can corroborate the reservation.</summary>
+    public FargateProfileScope? Scope { get; init; }
+}
 
 public sealed record FargateHeadroom(int? IpSlots, int? QuotaSlots, int? LaunchSlots);

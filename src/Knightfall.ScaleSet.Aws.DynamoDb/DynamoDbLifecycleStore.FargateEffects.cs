@@ -6,7 +6,8 @@ using Knightfall.ScaleSet.Aws.Core.Lifecycle;
 namespace Knightfall.ScaleSet.Aws.DynamoDb;
 
 public sealed record TrackedFargateLaunchReservation(
-    Guid AllocationId, int CpuUnits, ImmutableArray<string> EligibleSubnetIds, string? TaskArn);
+    Guid AllocationId, int CpuUnits, ImmutableArray<string> EligibleSubnetIds, string? TaskArn,
+    LifecycleProfile Profile, string ClusterArn, string TaskDefinitionArn);
 
 public sealed record TrackedFargateLaunchReservations(
     ImmutableArray<TrackedFargateLaunchReservation> Reservations, long EffectIndexRevision, long ExecutorInventoryRevision);
@@ -142,7 +143,8 @@ public sealed partial class DynamoDbLifecycleStore
                 { Envelope.Request: FargateLaunchEffectRequest { CpuUnits: { } units } request,
                     Resolution: { Kind: EffectResolutionKind.Applied, ExecutorBinding: { } binding } } ||
                 binding != executor.Binding || request.AllocationId != allocation ||
-                !reservations.TryAdd(allocation, new TrackedFargateLaunchReservation(allocation, units, request.SubnetIds, binding.ResourceArn)))
+                !reservations.TryAdd(allocation, new TrackedFargateLaunchReservation(allocation, units, request.SubnetIds, binding.ResourceArn,
+                    profile, request.ClusterArn, request.TaskDefinitionArn)))
             {
                 return null;
             }
@@ -176,7 +178,8 @@ public sealed partial class DynamoDbLifecycleStore
                 }
                 if (EffectJournalEntry.Read(profile, raw).Envelope.Request is FargateLaunchEffectRequest launch &&
                     (launch.CpuUnits is not { } units || !reservations.TryAdd(launch.AllocationId,
-                        new TrackedFargateLaunchReservation(launch.AllocationId, units, launch.SubnetIds, null))))
+                        new TrackedFargateLaunchReservation(launch.AllocationId, units, launch.SubnetIds, null,
+                            profile, launch.ClusterArn, launch.TaskDefinitionArn))))
                 {
                     return false;
                 }
