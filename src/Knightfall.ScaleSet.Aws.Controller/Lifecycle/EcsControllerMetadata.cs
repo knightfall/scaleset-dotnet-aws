@@ -76,11 +76,14 @@ public sealed class EcsControllerMetadata : IDisposable
 
     public async Task<ControllerClockEvidence?> ReadClockAsync(string expectedTaskArn, CancellationToken cancellationToken)
     {
-        var observation = await ReadAsync(cancellationToken).ConfigureAwait(false);
+        var observation = await ReadAsync(reportTimeout: true, cancellationToken).ConfigureAwait(false);
         return observation is not null && observation.TaskArn == expectedTaskArn ? observation.Clock : null;
     }
 
-    public async Task<ControllerTaskAuthority?> ReadAsync(CancellationToken cancellationToken)
+    public Task<ControllerTaskAuthority?> ReadAsync(CancellationToken cancellationToken) =>
+        ReadAsync(reportTimeout: false, cancellationToken);
+
+    private async Task<ControllerTaskAuthority?> ReadAsync(bool reportTimeout, CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
         if (_taskEndpoint is null)
@@ -118,6 +121,11 @@ public sealed class EcsControllerMetadata : IDisposable
             }
 
             return ParseAuthority(document.RootElement, now, elapsed);
+        }
+        catch (OperationCanceledException) when (reportTimeout && timeout.IsCancellationRequested)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            throw new TimeoutException("The ECS clock metadata read timed out.");
         }
         catch (Exception error) when (error is HttpRequestException or IOException or JsonException or OperationCanceledException or InvalidOperationException)
         {

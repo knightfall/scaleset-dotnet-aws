@@ -73,6 +73,46 @@ public sealed class EcsControllerMetadataTests
     }
 
     [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task OnlyHeartbeatReportsTheMetadataReadDeadlineAsATimeout(bool heartbeat)
+    {
+        using var budget = CancellationTokenSource.CreateLinkedTokenSource(TestContext.Current.CancellationToken);
+        budget.CancelAfter(TimeSpan.FromSeconds(10));
+        var token = budget.Token;
+        using var server = new TcpListener(IPAddress.Loopback, 0);
+        server.Start();
+        int port = ((IPEndPoint)server.LocalEndpoint).Port;
+        var received = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var exchange = ServeAsync(server, "200 OK", ValidDocument, token, async cancellation =>
+        {
+            received.SetResult();
+            await Task.Delay(Timeout.InfiniteTimeSpan, cancellation);
+        });
+        string path = Path.Combine(AppContext.BaseDirectory, "ConfigFixtures", "runtime", "fargate-only.json");
+        var configuration = RuntimeConfigurationLoader.Load(await File.ReadAllBytesAsync(path, token));
+        var clock = new FixtureClock { HoldReadDeadline = true };
+        using var metadata = new EcsControllerMetadata(configuration, clock, $"http://127.0.0.1:{port}/v4/context", allowLoopback: true);
+
+        Task read = heartbeat ? Assert.ThrowsAsync<TimeoutException>(() => metadata.ReadClockAsync(TaskArn, token))
+            : ObserveNoAcquisitionEvidenceAsync();
+        try
+        {
+            await received.Task.WaitAsync(token);
+            Assert.False(read.IsCompleted);
+            Assert.IsType<Action>(clock.ExpireReadDeadline)();
+            await read.WaitAsync(token);
+        }
+        finally
+        {
+            await budget.CancelAsync();
+            _ = await Assert.ThrowsAnyAsync<OperationCanceledException>(() => exchange);
+        }
+
+        async Task ObserveNoAcquisitionEvidenceAsync() => Assert.Null(await metadata.ReadAsync(token));
+    }
+
+    [Theory]
     [InlineData(null)]
     [InlineData("http://127.0.0.1:9000/v4/test")]
     [InlineData("http://localhost/v4/test")]
@@ -113,7 +153,8 @@ public sealed class EcsControllerMetadataTests
         return result;
     }
 
-    private static async Task ServeAsync(TcpListener listener, string status, string body, CancellationToken cancellationToken)
+    private static async Task ServeAsync(TcpListener listener, string status, string body, CancellationToken cancellationToken,
+        Func<CancellationToken, Task>? beforeResponse = null)
     {
         using var client = await listener.AcceptTcpClientAsync(cancellationToken);
         await using var stream = client.GetStream();
@@ -122,6 +163,10 @@ public sealed class EcsControllerMetadataTests
         while (await reader.ReadLineAsync(cancellationToken) is { Length: > 0 })
         {
         }
+        if (beforeResponse is not null)
+        {
+            await beforeResponse(cancellationToken);
+        }
 
         string reply = $"HTTP/1.1 {status}\r\nContent-Length: {Encoding.UTF8.GetByteCount(body)}\r\nConnection: close\r\n\r\n{body}";
         await stream.WriteAsync(Encoding.UTF8.GetBytes(reply), cancellationToken);
@@ -129,8 +174,21 @@ public sealed class EcsControllerMetadataTests
 
     private sealed class FixtureClock : TimeProvider
     {
+        internal bool HoldReadDeadline { get; init; }
+        internal Action? ExpireReadDeadline { get; private set; }
+
         public override DateTimeOffset GetUtcNow() => Now;
 
         public override long GetTimestamp() => 0;
+
+        public override ITimer CreateTimer(TimerCallback callback, object? state, TimeSpan dueTime, TimeSpan period)
+        {
+            if (!HoldReadDeadline)
+            {
+                return System.CreateTimer(callback, state, dueTime, period);
+            }
+            ExpireReadDeadline = () => callback(state);
+            return System.CreateTimer(callback, state, Timeout.InfiniteTimeSpan, Timeout.InfiniteTimeSpan);
+        }
     }
 }
