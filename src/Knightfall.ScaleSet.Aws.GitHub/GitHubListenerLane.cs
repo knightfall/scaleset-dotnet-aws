@@ -420,7 +420,7 @@ public sealed partial class GitHubListenerLane : IDisposable
         var handler = new GitHubListenerDeliveryHandler(_store, fence, session, ReadCapacityAsync, _clock,
             releaseOnAssignment: false, runnerConnection: _connection);
         var execution = new GitHubListenerExecutionPolicy(_store, fence, _checkpoint.SessionKey, _cooldown, _connection.SecretArn,
-            ReadOwnershipAsync, handler.ReadPollCapacityAsync, _clock, _timing.WriteReserve, _definition.OwnershipLost);
+            ReadOwnershipAsync, token => ReadPollCapacityAsync(handler, token), _clock, _timing.WriteReserve, _definition.OwnershipLost);
         var options = new ScaleSetListenerPumpOptions(_checkpoint.SessionKey, _definition.OwnershipLost);
         _pump = new ScaleSetListenerPump(new ObservedMessageSession(session, _clock), options, _checkpoint, handler, execution, _clock);
     }

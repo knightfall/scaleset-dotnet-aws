@@ -36,14 +36,16 @@ public sealed class GitHubScaleSetClientFactory(
     public GitHubScaleSetConnection Create(GitHubSecretVersion version)
     {
         ArgumentNullException.ThrowIfNull(version);
+        var transport = new GitHubDemandReadTransport(httpClient);
         try
         {
             string identity = GitHubRoutingIdentity.Scope(version.Target.SourceUri.AbsoluteUri);
-            return new GitHubScaleSetConnection(version.CreateClient(options, httpClient, timeProvider),
-                identity, version, timeProvider ?? TimeProvider.System, httpClient);
+            return new GitHubScaleSetConnection(version.CreateClient(options, transport.Client, timeProvider),
+                identity, version, timeProvider ?? TimeProvider.System, httpClient, transport);
         }
         catch (Exception error)
         {
+            transport.Dispose();
             throw GitHubOperationException.From(error);
         }
     }
@@ -54,12 +56,14 @@ public sealed partial class GitHubScaleSetConnection : IGitHubScaleSetRemote, ID
     private readonly ScaleSetClient _client;
     private readonly TimeProvider _clock;
     private readonly GitHubRunnerAvailability _availability;
+    private readonly GitHubDemandReadTransport _demandTransport;
 
     internal GitHubScaleSetConnection(ScaleSetClient client, string scopeIdentity, GitHubSecretVersion version,
-        TimeProvider clock, HttpClient? httpClient)
+        TimeProvider clock, HttpClient? httpClient, GitHubDemandReadTransport demandTransport)
     {
         _client = client;
         _clock = clock;
+        _demandTransport = demandTransport;
         _availability = version.CreateRunnerAvailability(httpClient, clock, client.UserAgent);
         ScopeIdentity = scopeIdentity;
         int separator = scopeIdentity.IndexOf('/');
@@ -143,7 +147,31 @@ public sealed partial class GitHubScaleSetConnection : IGitHubScaleSetRemote, ID
         return CheckBinding(set, request.RunnerGroupName, request.RunnerGroupId, request.ScaleSetName, request.Labels, null);
     }
 
-    public void Dispose() => _client.Dispose();
+    public void Dispose()
+    {
+        _client.Dispose();
+        _demandTransport.Dispose();
+    }
+
+    internal async Task<GitHubDemandReadTransport.DemandStatistics?> ReadDemandAsync(
+        GitHubScaleSetBinding binding, CancellationToken cancellationToken)
+    {
+        if (!MatchesScope(binding.ScopeUrl) || binding.ScaleSetId <= 0)
+        {
+            throw BindingMismatch();
+        }
+
+        using var retries = ScaleSetRequestRetry.Configure(static options => options with { MaxRetries = 0 });
+        var (set, statistics) = await InvokeAsync(
+            () => _demandTransport.ReadAsync(_client, binding.ScaleSetId, cancellationToken), cancellationToken).ConfigureAwait(false);
+        if (set is null || statistics is null || set.Statistics?.TotalAssignedJobs != statistics.TotalAssignedJobs)
+        {
+            return null;
+        }
+
+        _ = CheckBinding(set, binding.RunnerGroup, binding.RunnerGroupId, binding.ScaleSet, binding.Labels, binding.ScaleSetId);
+        return statistics;
+    }
 
     private async Task<RunnerGroup> ReadGroupAsync(string name, long? expectedId, CancellationToken cancellationToken)
     {

@@ -81,6 +81,19 @@ internal sealed class ListenerDeliveryLedger(DynamoDbLifecycleStore store, Owned
             await WriteAsync([write], cancellationToken).ConfigureAwait(false) == LifecycleWriteOutcome.Committed;
     }
 
+    internal Task<LifecycleWriteOutcome> RefreshDemandAsync(Entry<SessionDemandObservation> expected,
+        DateTimeOffset observedAt, int assigned, CancellationToken cancellationToken)
+    {
+        if (expected.Value.SessionId != fence.Identity.SessionId || observedAt <= expected.Value.ObservedAt ||
+            observedAt > clock.GetUtcNow() || assigned < 0)
+        {
+            return Task.FromResult(LifecycleWriteOutcome.Conflict);
+        }
+
+        var observation = expected.Value with { ObservedAt = observedAt, TotalAssignedJobs = assigned };
+        return WriteAsync([Replace(expected, observation)], cancellationToken);
+    }
+
     internal async Task<LifecycleWriteOutcome> PersistJobObservationsAsync(
         Entry<MessageReceipt> receipt, long messageId, IReadOnlyList<JobObservation> jobs,
         bool releaseOnAssignment, CancellationToken cancellationToken)
