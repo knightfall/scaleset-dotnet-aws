@@ -311,6 +311,7 @@
       "knightfall.scaleset.aws.controller": {
         "type": "Project",
         "dependencies": {
+          "AWSSDK.CloudWatchLogs": "[4.1.0.2, 4.1.0.2]",
           "AWSSDK.Core": "[4.1.1.2, 4.1.1.2]",
           "AWSSDK.DynamoDBv2": "[4.1.0.3, 4.1.0.3]",
           "AWSSDK.EC2": "[4.1.5, 4.1.5]",
@@ -388,6 +389,15 @@
           "AWSSDK.IdentityManagement": "[4.1.3, 4.1.3]",
           "AWSSDK.SQS": "[4.1.0.2, 4.1.0.2]",
           "Knightfall.ScaleSet.Aws.Core": "[1.0.0, )"
+        }
+      },
+      "AWSSDK.CloudWatchLogs": {
+        "type": "CentralTransitive",
+        "requested": "[4.1.0.2, 4.1.0.2]",
+        "resolved": "4.1.0.2",
+        "contentHash": "6moUgVXCK02HQ5PDg4qCnGAC3+PR2AhWzGdbTYdt/FEAjI+3v1RoSCyrqroynbdoonwormMMFLEW0Yv6SrpkLw==",
+        "dependencies": {
+          "AWSSDK.Core": "[4.1.1.1, 5.0.0)"
         }
       },
       "AWSSDK.Core": {

@@ -6,6 +6,7 @@ import { test } from "node:test";
 import { isDeepStrictEqual } from "node:util";
 import { Match, Template } from "aws-cdk-lib/assertions";
 import { compileConfig } from "../lib/config/compiler.ts";
+import { ConfigValidationError } from "../lib/config/errors.ts";
 import type { RunnerControllerRuntime } from "../lib/config/types.ts";
 import { synthesizeController } from "../lib/infrastructure/controller-stack.ts";
 
@@ -70,6 +71,64 @@ function rolePolicy(
     ([, policy]) => policy.Properties.PolicyDocument.Statement as Statement[],
   );
 }
+
+test("qualifying predecessor capture grants only an exact active log-group read", () => {
+  const baseline = fixture("ec2-only-pinned");
+  const { spec } = baseline.runtime;
+  const { account, region } = spec.aws;
+  const capture = {
+    logGroupArn: `arn:aws:logs:${region}:${account}:log-group:/aws/events/controller-fence`,
+    eventRuleArn: `arn:aws:events:${region}:${account}:rule/controller-fence`,
+    qualifiedFrom: "2026-11-25T00:00:00Z",
+    qualifiedUntil: "2026-12-02T00:00:00Z",
+  };
+  const controller = { ...spec.controller, predecessorCapture: capture };
+  const active = rewrite(baseline, { ...spec, mode: "active", controller });
+  assert.deepEqual(active.runtime.spec.controller.predecessorCapture, capture);
+  const captured = synthesize(active);
+  assert.deepEqual(
+    rolePolicy(captured).filter(({ Action }) =>
+      [Action].flat().some((action) => action.startsWith("logs:")),
+    ),
+    [
+      {
+        Action: "logs:FilterLogEvents",
+        Effect: "Allow",
+        Resource: capture.logGroupArn,
+      },
+    ],
+  );
+  captured.resourceCountIs("AWS::Logs::LogGroup", 1);
+  for (const config of [
+    rewrite(baseline, { ...spec, mode: "dry-run", controller }),
+    rewrite(baseline, { ...spec, mode: "active" }),
+  ]) {
+    assert.ok(!actions(synthesize(config)).has("logs:FilterLogEvents"));
+  }
+  for (const invalid of [
+    { logGroupArn: capture.logGroupArn + ":*" },
+    {
+      logGroupArn: `arn:aws:logs:${region}:${account}:log-group:/ecs/${baseline.runtime.metadata.name}-runner-controller`,
+    },
+    { eventRuleArn: capture.eventRuleArn.replace(account, "000000000000") },
+    { qualifiedFrom: "2026-11-31T00:00:00Z" },
+    { qualifiedUntil: capture.qualifiedFrom },
+  ]) {
+    assert.throws(
+      () =>
+        rewrite(baseline, {
+          ...spec,
+          controller: {
+            ...controller,
+            predecessorCapture: { ...capture, ...invalid },
+          },
+        }),
+      (error: unknown) =>
+        error instanceof ConfigValidationError &&
+        error.path.startsWith("/spec/controller/predecessorCapture"),
+    );
+  }
+});
 
 function actions(template: Template) {
   return new Set(rolePolicy(template).flatMap(({ Action }) => Action));

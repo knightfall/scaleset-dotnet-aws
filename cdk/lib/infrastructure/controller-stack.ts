@@ -207,6 +207,14 @@ export class ControllerInfrastructure extends Stack {
     ];
     if (active) {
       grantHostFence(this.controllerRole, this.hostingCluster);
+      if (spec.controller.predecessorCapture) {
+        this.controllerRole.addToPolicy(
+          new iam.PolicyStatement({
+            actions: ["logs:FilterLogEvents"],
+            resources: [spec.controller.predecessorCapture.logGroupArn],
+          }),
+        );
+      }
       grantGitHubCredentials(this.controllerRole, runtime, enabled);
       const statusRoles = new Set(
         ec2

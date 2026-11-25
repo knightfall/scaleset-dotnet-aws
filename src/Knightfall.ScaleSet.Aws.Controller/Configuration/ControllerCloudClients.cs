@@ -1,3 +1,4 @@
+using Amazon.CloudWatchLogs;
 using Amazon.DynamoDBv2;
 using Amazon.EC2;
 using Amazon.ECS;
@@ -37,6 +38,9 @@ internal sealed class ControllerCloudClients(string region, AWSCredentials crede
     internal AmazonDynamoDBClient DynamoDb() => Own(new AmazonDynamoDBClient(credentials, Configure<AmazonDynamoDBConfig>()));
 
     internal AmazonECSClient Ecs() => Own(new AmazonECSClient(credentials, Configure<AmazonECSConfig>()));
+
+    internal AmazonCloudWatchLogsClient ControllerCapture() =>
+        Own(new AmazonCloudWatchLogsClient(credentials, Configure<AmazonCloudWatchLogsConfig>()));
 
     internal AmazonEC2Client Ec2Network() => Own(new AmazonEC2Client(credentials, Configure<AmazonEC2Config>()));
 

@@ -56,6 +56,7 @@ internal static class TelemetryNames
         "capacity_requested", "headroom_unavailable", "target_met", "invalid_evidence", "template_verified", "template_unavailable",
         "template_version_changed", "template_incompatible", "aws_unavailable", "identity_mismatch", "role_mismatch",
         "external_reclamation_required", "status_qualification_mismatch", "ebs_key_unqualified",
+        "predecessor_capture_verified",
         "network_incompatible", "inventory_complete", "inventory_incomplete", "insufficient_instance_capacity",
         "insufficient_subnet_addresses", "provider_rejected", "exact_observation", "task_definition_verified", "cluster_mismatch",
         "long_arns_unverified", "container_unapproved", "task_definition_incompatible", "no_exact_task", "no_exact_terminal_state",

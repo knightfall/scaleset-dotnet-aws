@@ -74,6 +74,13 @@ public sealed class YamlRolloutIntegrationTests
             ("changed-ami", spec => Ec2(spec)["statusQualification"]!["imageId"] = "ami-1234567890abcdef1", "RetirementRequired"),
             ("changed-role", spec => Ec2(spec)["statusQualification"]!["roleId"] = "AROAFIXTUREBOOTSTRAP02", "RetirementRequired"),
             ("changed-evidence", spec => Ec2(spec)["statusQualification"]!["evidenceSha256"] = new string('c', 64), "RetirementRequired"),
+            ("capture-enabled-while-active", spec => spec["controller"]!["predecessorCapture"] = new JsonObject
+            {
+                ["logGroupArn"] = $"arn:aws:logs:{Region}:{Account}:log-group:/aws/events/controller-fence",
+                ["eventRuleArn"] = $"arn:aws:events:{Region}:{Account}:rule/controller-fence",
+                ["qualifiedFrom"] = "2026-11-25T00:00:00Z",
+                ["qualifiedUntil"] = "2026-11-26T00:00:00Z",
+            }, "PredecessorCaptureBindingChanged"),
         ];
         foreach (var (name, change, refusal) in variants)
         {

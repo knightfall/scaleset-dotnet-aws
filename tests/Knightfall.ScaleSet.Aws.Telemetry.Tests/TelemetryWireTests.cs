@@ -1,8 +1,10 @@
+using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Diagnostics.Metrics;
 using System.Globalization;
 using System.Text;
 using Knightfall.ScaleSet.Aws.Controller.Commands;
+using Knightfall.ScaleSet.Aws.Controller.Lifecycle;
 using Knightfall.ScaleSet.Aws.Controller.Telemetry;
 using Knightfall.ScaleSet.Aws.Core.Configuration;
 using Knightfall.ScaleSet.Aws.Core.Telemetry;
@@ -479,6 +481,41 @@ public sealed partial class TelemetryWireTests
         Assert.Same(stopping, pipeline.StopAsync());
         await diagnostics.Written.Task.WaitAsync(cancellationToken);
         Assert.Equal("OTLP shutdown did not complete successfully." + Environment.NewLine, diagnostics.ToString());
+    }
+
+    [Fact]
+    public async Task CaptureDecisionExportsOnlyTheBoundedReferenceFromTheTrustedObserver()
+    {
+        var cancellation = TestContext.Current.CancellationToken;
+        const string reference = "dc0fed00920ba342";
+        var console = new CapturingConsole();
+        await using var diagnostics = new StringWriter(CultureInfo.InvariantCulture);
+        await using var pipeline = TelemetryPipeline.Start(TelemetrySettings.Load(readEnvironment: _ => null), diagnostics, console);
+        var observer = pipeline.Logging.CreateLogger<CapturedEcsControllerTaskFenceObserver>();
+        Emit(observer, reference);
+        Emit(observer, Secret);
+        Emit(pipeline.Logging.CreateLogger(Controller), reference);
+        Assert.True(await pipeline.StopAsync().WaitAsync(cancellation));
+        Assert.Equal(3, console.Events.Count);
+        var safe = Assert.Single(console.Events, entry => entry.Properties.ContainsKey("evidence_reference"));
+        Assert.Equal(reference, Assert.IsType<ScalarValue>(safe.Properties["evidence_reference"]).Value);
+        Assert.All(console.Events, entry => Assert.DoesNotContain(Secret, entry.RenderMessage(CultureInfo.InvariantCulture), StringComparison.Ordinal));
+
+        static void Emit(ILogger logger, string value)
+        {
+            using var scope = logger.BeginScope(new Dictionary<string, object>(StringComparer.Ordinal)
+            {
+                ["reason"] = "predecessor_capture_verified", ["evidence_reference"] = value,
+            });
+            WriteEvent(logger, "reconcile", "success");
+        }
+    }
+
+    private sealed class CapturingConsole : ILogEventSink
+    {
+        internal ConcurrentQueue<LogEvent> Events { get; } = new();
+
+        public void Emit(LogEvent logEvent) => Events.Enqueue(logEvent);
     }
 
     private sealed class SignalledDiagnostics : StringWriter

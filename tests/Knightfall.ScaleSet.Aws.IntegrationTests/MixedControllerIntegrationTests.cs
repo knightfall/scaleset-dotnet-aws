@@ -15,7 +15,7 @@ using Xunit;
 namespace Knightfall.ScaleSet.Aws.IntegrationTests;
 
 [Collection(nameof(GitHubLifecycleIntegrationTests))]
-public sealed class MixedControllerIntegrationTests(ITestOutputHelper output)
+public sealed partial class MixedControllerIntegrationTests(ITestOutputHelper output)
 {
     [Fact]
     public async Task UnexpectedHeartbeatLossExitsUnsuccessfullyAndRetainsTheUncertainPredecessorFence()

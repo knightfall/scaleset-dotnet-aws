@@ -42,7 +42,12 @@ internal static class ActiveControllerRuntime
         using var clients = await ConnectAsync(configuration.Aws, context.AwsLoopbackEndpoint, clock, context.Stopping).ConfigureAwait(false);
         var store = new DynamoDbLifecycleStore(clients.DynamoDb(), configuration.TrackingTable.Name, clock);
         var ecs = clients.Ecs();
-        var tasks = new EcsControllerTaskFenceObserver(ecs, metadata.ClusterArn);
+        IControllerTaskFenceObserver tasks = new EcsControllerTaskFenceObserver(ecs, metadata.ClusterArn);
+        if (configuration.Controller.PredecessorCapture is { } capture)
+        {
+            tasks = new CapturedEcsControllerTaskFenceObserver(tasks, clients.ControllerCapture(), configuration.Aws,
+                metadata.ClusterArn, capture, clock, context.Telemetry.Logging.CreateLogger<CapturedEcsControllerTaskFenceObserver>());
+        }
         var adapter = new ControllerAuthorityAdapter(configuration, store, tasks, clock, LeaseDuration, EffectTiming.WriteReserve);
         var journal = new DynamoDbEffectJournal(store, clock);
         var dispatcher = new DynamoDbEffectDispatcher(store, clock, EffectTiming);

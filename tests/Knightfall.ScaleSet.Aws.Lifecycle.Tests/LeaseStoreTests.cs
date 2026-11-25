@@ -1,3 +1,4 @@
+using Amazon.DynamoDBv2.Model;
 using Knightfall.ScaleSet.Aws.Core.Lifecycle;
 using Knightfall.ScaleSet.Aws.DynamoDb;
 using Xunit;
@@ -8,6 +9,47 @@ public sealed class LeaseStoreTests
 {
     private const string TaskTwo = "arn:aws:ecs:us-east-1:000000000000:task/controller/00000000000000000000000000000002";
     private const string TaskThree = "arn:aws:ecs:us-east-1:000000000000:task/controller/00000000000000000000000000000003";
+
+    [Fact]
+    public async Task LegacyLeaseWithAStaleAdditiveAttributeHasNoArchiveAuthority()
+    {
+        var cancellation = TestContext.Current.CancellationToken;
+        using var table = await MiniStackTable.CreateAsync(cancellation);
+        var store = table.CreateStore();
+        var now = MiniStackTable.Now;
+        await store.TryAcquireLeaseAsync("different-lease", "different-owner", TaskTwo, ControllerLease.CurrentWriterProtocol,
+            now, now.AddMinutes(1), cancellation);
+        var obsolete = await table.ReadAsync(LifecycleKey.Lease("different-lease"), cancellation);
+
+        // An alpha.1 UpdateItem can leave the additive attributes from a previous writer untouched.
+        var legacy = Assert.IsType<ControllerLease>(await store.ReadLeaseAsync(table.Lease.Deployment, cancellation));
+        var key = LifecycleKey.Lease(legacy.Deployment);
+        await table.Client.UpdateItemAsync(new UpdateItemRequest
+        {
+            TableName = table.Name,
+            Key = new Dictionary<string, AttributeValue>(StringComparer.Ordinal)
+            {
+                ["PK"] = new() { S = key.PartitionKey }, ["SK"] = new() { S = key.SortKey },
+            },
+            UpdateExpression = "SET acquisitionBounds = :obsolete",
+            ExpressionAttributeValues = new Dictionary<string, AttributeValue>(StringComparer.Ordinal)
+            {
+                [":obsolete"] = obsolete["acquisitionBounds"],
+            },
+        }, cancellation);
+        Assert.Null(legacy.AcquiredAt);
+        Assert.Equal(legacy, await store.ReadLeaseAsync(legacy.Deployment, cancellation));
+
+        var restarted = table.CreateStore(legacy.ValidUntil.AddSeconds(5));
+        var acquisition = await restarted.TryAcquireLeaseAsync(legacy.Deployment, "successor", TaskThree,
+            ControllerLease.CurrentWriterProtocol, legacy.ValidUntil.AddSeconds(2), legacy.ValidUntil.AddMinutes(1), cancellation);
+        var current = Assert.IsType<ControllerLease>(acquisition.Lease);
+        Assert.NotNull(current.AcquiredAt);
+        Assert.Equal(legacy.OwnerTaskArn, current.RequiredFencingTaskArn);
+        Assert.Null(current.PreviousOwner?.AcquiredAt);
+        Assert.Null(current.RequiredFencingTaskAcquiredAt);
+        Assert.Equal(current, await restarted.ReadLeaseAsync(current.Deployment, cancellation));
+    }
 
     [Fact]
     public async Task ConcurrentInitialAcquisitionsCreateOneOwnerAndGateOrdinaryWritesDuringRecovery()

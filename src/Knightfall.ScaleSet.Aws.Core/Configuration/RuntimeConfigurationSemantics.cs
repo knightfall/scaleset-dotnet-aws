@@ -50,13 +50,30 @@ internal static partial class RuntimeConfigurationSemantics
     internal static void Validate(JsonElement config)
     {
         JsonElement spec = config.GetProperty("spec");
-        JsonElement hosting = spec.GetProperty("controller").GetProperty("hosting");
+        JsonElement controller = spec.GetProperty("controller");
+        JsonElement hosting = controller.GetProperty("hosting");
         JsonElement networks = spec.GetProperty("networks");
         JsonElement clusters = spec.GetProperty("ecsClusters");
         RequireReference(networks, Text(hosting, "network"), "/spec/controller/hosting/network");
         RequireReference(clusters, Text(hosting, "cluster"), "/spec/controller/hosting/cluster");
         var aws = new AwsScope(Text(spec.GetProperty("aws"), "account"), Text(spec.GetProperty("aws"), "region"));
         ValidateAwsResources(spec, aws);
+        if (controller.TryGetProperty("predecessorCapture", out var capture))
+        {
+            const string path = "/spec/controller/predecessorCapture";
+            RequireArn(Text(capture, "logGroupArn"), "logs", aws, path + "/logGroupArn");
+            RequireArn(Text(capture, "eventRuleArn"), "events", aws, path + "/eventRuleArn");
+            string deploymentName = Text(config.GetProperty("metadata"), "name");
+            if (Text(capture, "logGroupArn").EndsWith($":log-group:/ecs/{deploymentName}-runner-controller", StringComparison.Ordinal))
+            {
+                throw Invalid(path, "Use a dedicated capture group outside controller logging.");
+            }
+            if (!capture.GetProperty("qualifiedFrom").TryGetDateTimeOffset(out var from) ||
+                !capture.GetProperty("qualifiedUntil").TryGetDateTimeOffset(out var until) || from < DateTimeOffset.UnixEpoch || from >= until)
+            {
+                throw Invalid(path, "The capture requires an ordered qualification window in UTC.");
+            }
+        }
 
         var scopes = new Dictionary<string, string>(StringComparer.Ordinal);
         foreach (JsonProperty property in spec.GetProperty("github").EnumerateObject())

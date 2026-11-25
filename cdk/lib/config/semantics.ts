@@ -60,6 +60,44 @@ export function validateSemantics(config: RunnerControllerRuntime): void {
     "/spec/controller/hosting/cluster",
   );
   validateAwsResources(spec);
+  const capture = spec.controller.predecessorCapture;
+  if (capture !== undefined) {
+    const { account, region } = spec.aws;
+    const partition = awsPartition(region);
+    const path = "/spec/controller/predecessorCapture";
+    if (
+      !capture.logGroupArn.startsWith(
+        `arn:${partition}:logs:${region}:${account}:log-group:`,
+      ) ||
+      !capture.eventRuleArn.startsWith(
+        `arn:${partition}:events:${region}:${account}:rule/`,
+      )
+    ) {
+      fail(
+        path,
+        "The capture must belong to the deployment account and Region.",
+      );
+    }
+    if (
+      capture.logGroupArn.endsWith(
+        `:log-group:/ecs/${config.metadata.name}-runner-controller`,
+      )
+    ) {
+      fail(path, "Use a dedicated capture group outside controller logging.");
+    }
+    const from = Date.parse(capture.qualifiedFrom);
+    const until = Date.parse(capture.qualifiedUntil);
+    if (
+      !validUtcSecond(capture.qualifiedFrom, from) ||
+      !validUtcSecond(capture.qualifiedUntil, until) ||
+      from >= until
+    ) {
+      fail(
+        path,
+        "The capture requires an ordered qualification window in UTC.",
+      );
+    }
+  }
 
   const scopes = new Map<string, string>();
   for (const [name, connection] of Object.entries(spec.github)) {
@@ -172,6 +210,13 @@ export function validateSemantics(config: RunnerControllerRuntime): void {
       }
     }
   }
+}
+
+function validUtcSecond(raw: string, parsed: number): boolean {
+  return (
+    parsed >= 0 &&
+    new Date(parsed).toISOString() === raw.replace(/Z$/u, ".000Z")
+  );
 }
 
 function validateProfile(

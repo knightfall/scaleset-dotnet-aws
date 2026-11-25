@@ -206,26 +206,26 @@ public sealed class ControllerLeaseRecoveryCoordinator
         IReadOnlyCollection<VerifiedControllerIsolation> isolation,
         CancellationToken cancellationToken)
     {
-        var priorTasks = new List<string>(2);
+        var priorTasks = new List<(string Arn, DateTimeOffset? AcquiredAt)>(2);
         if (lease.PreviousOwner is { CleanRelease: false } previous)
         {
-            priorTasks.Add(previous.OwnerTaskArn);
+            priorTasks.Add((previous.OwnerTaskArn, previous.AcquiredAt));
         }
-        if (lease.RequiredFencingTaskArn is { } required && !priorTasks.Contains(required))
+        if (lease.RequiredFencingTaskArn is { } required && !priorTasks.Any(task => task.Arn == required))
         {
-            priorTasks.Add(required);
+            priorTasks.Add((required, lease.RequiredFencingTaskAcquiredAt));
         }
 
         var observations = new List<TaskObservation>(priorTasks.Count);
-        foreach (string taskArn in priorTasks)
+        foreach (var (taskArn, acquiredAt) in priorTasks)
         {
-            var status = await _tasks.ReadAsync(taskArn, cancellationToken).ConfigureAwait(false);
+            var result = await _tasks.ObserveAsync(taskArn, acquiredAt, cancellationToken).ConfigureAwait(false);
             var now = _clock.GetUtcNow();
             if (!TryAuthorizeClock(lease, clockEvidence, now, out var latestNow))
             {
                 return (LeaseActivationStatus.ClockUnverified, observations);
             }
-            var observation = new TaskObservation(taskArn, status);
+            var observation = new TaskObservation(taskArn, result);
             if (!IsIsolated(observation, isolation, now, latestNow))
             {
                 return (LeaseActivationStatus.PriorTaskUnisolated, observations);
@@ -299,14 +299,14 @@ public sealed class ControllerLeaseRecoveryCoordinator
         DateTimeOffset now,
         DateTimeOffset latestNow)
     {
-        if (task.Status == ControllerTaskFenceStatus.Stopped)
+        if (task.Evidence.Status == ControllerTaskFenceStatus.Stopped)
         {
-            return true;
+            return task.Evidence.ValidUntil is null || task.Evidence.ValidUntil > latestNow;
         }
-        return task.Status is ControllerTaskFenceStatus.Missing or ControllerTaskFenceStatus.Unknown &&
+        return task.Evidence.Status is ControllerTaskFenceStatus.Missing or ControllerTaskFenceStatus.Unknown &&
             isolation.Any(proof => proof.TaskArn == task.TaskArn && proof.ObservedAt <= now && proof.ValidUntil > latestNow &&
                 !string.IsNullOrWhiteSpace(proof.AwsEvidenceId) && !string.IsNullOrWhiteSpace(proof.GitHubEvidenceId));
     }
 
-    private sealed record TaskObservation(string TaskArn, ControllerTaskFenceStatus Status);
+    private sealed record TaskObservation(string TaskArn, ControllerTaskFenceObservation Evidence);
 }

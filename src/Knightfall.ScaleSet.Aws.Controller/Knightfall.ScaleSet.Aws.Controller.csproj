@@ -26,6 +26,7 @@
     <ProjectReference Include="../Knightfall.ScaleSet.Aws.Providers.Ec2/Knightfall.ScaleSet.Aws.Providers.Ec2.csproj" />
     <ProjectReference Include="../Knightfall.ScaleSet.Aws.Providers.Fargate/Knightfall.ScaleSet.Aws.Providers.Fargate.csproj" />
     <PackageReference Include="AWSSDK.Core" />
+    <PackageReference Include="AWSSDK.CloudWatchLogs" />
     <PackageReference Include="AWSSDK.DynamoDBv2" />
     <PackageReference Include="AWSSDK.EC2" />
     <PackageReference Include="AWSSDK.ECS" />

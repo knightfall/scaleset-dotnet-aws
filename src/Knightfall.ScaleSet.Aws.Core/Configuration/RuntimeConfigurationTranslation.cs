@@ -58,7 +58,13 @@ internal static class RuntimeConfigurationTranslation
             Text(hosting, "cluster"),
             Architecture(Text(hosting, "cpuArchitecture")),
             Integer(hosting, "cpu", path),
-            Integer(hosting, "memoryMiB", path));
+            Integer(hosting, "memoryMiB", path))
+        {
+            PredecessorCapture = value.TryGetProperty("predecessorCapture", out var capture)
+                ? new ControllerPredecessorCapture(Text(capture, "logGroupArn"), Text(capture, "eventRuleArn"),
+                    capture.GetProperty("qualifiedFrom").GetDateTimeOffset(), capture.GetProperty("qualifiedUntil").GetDateTimeOffset())
+                : null,
+        };
     }
 
     private static TrackingTableConfiguration TrackingTable(JsonElement table, string environmentName) =>

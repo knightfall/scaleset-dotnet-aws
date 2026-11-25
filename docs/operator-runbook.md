@@ -257,14 +257,14 @@ separately reviewed transition that preserves the predecessor lookup.
    shared identities affected. A changed secret value alone leaves previously
    issued credentials unresolved. [ECS event capture](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/task-lifecycle-events.html) · [IAM role session revocation](https://docs.aws.amazon.com/IAM/latest/UserGuide/id_roles_use_revoke-sessions.html) · [GitHub App installation endpoints](https://docs.github.com/en/rest/apps/installations)
 4. Keep the decision and evidence IDs in the recovery record for each exact task
-   and lease, with an evidence validity window and independent approval. Submit
-   the record for a separately qualified cutover if the published controller
-   still cannot obtain `STOPPED`. The current runtime consumes direct ECS task
-   observations. Unavailable, wrong-cluster or stale observations keep the lease
-   in recovery-only mode across restart. Keep possibly sent operations and
-   sessions held until authoritative readback and the exact-session retirement
-   path settle their outcomes. Preserve the lease and journal throughout the
-   incident.
+   and lease, with an evidence validity window and independent approval. A
+   deployment with [qualified predecessor capture](controller-predecessor-capture.md)
+   can use an exact terminal event after a matching `MISSING` result. If both
+   sources lack accepted evidence, submit the record for a separately qualified
+   cutover and keep the lease in recovery-only mode across restart. Keep possibly
+   sent operations and sessions held until authoritative readback and the
+   exact-session retirement path settle their outcomes. Preserve the lease and
+   journal throughout the incident.
 
 ### Recover from a DynamoDB backup
 

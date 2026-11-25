@@ -1,6 +1,7 @@
 using Amazon;
 using Knightfall.ScaleSet.Aws.Core.Catalog;
 using Knightfall.ScaleSet.Aws.Core.Configuration;
+using Knightfall.ScaleSet.Aws.Core.Lifecycle;
 
 namespace Knightfall.ScaleSet.Aws.DynamoDb;
 
@@ -11,6 +12,7 @@ public enum RetirementPreflightStatus
     RetirementRequired = 2,
     Verified = 3,
     HostingFenceBindingChanged = 4,
+    PredecessorCaptureBindingChanged = 5,
 }
 
 public sealed record RetirementPreflightResult(
@@ -52,6 +54,12 @@ public sealed partial class DynamoDbLifecycleStore
         if (ClusterScope(current, current.Controller.Cluster) != ClusterScope(candidate, candidate.Controller.Cluster))
         {
             return new RetirementPreflightResult(RetirementPreflightStatus.HostingFenceBindingChanged, []);
+        }
+        if (current.Controller.PredecessorCapture != candidate.Controller.PredecessorCapture &&
+            (current.Mode == ControllerMode.Active ||
+                await ReadLeaseAsync(deployment, cancellationToken).ConfigureAwait(false) is { Mode: not ControllerLeaseMode.Released }))
+        {
+            return new RetirementPreflightResult(RetirementPreflightStatus.PredecessorCaptureBindingChanged, []);
         }
 
         var previouslyGranted = GrantedProfiles(current).ToDictionary(profile => profile.Id, StringComparer.Ordinal);

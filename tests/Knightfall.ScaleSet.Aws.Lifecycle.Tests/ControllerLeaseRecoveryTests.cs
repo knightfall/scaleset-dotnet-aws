@@ -76,13 +76,23 @@ public sealed class ControllerLeaseRecoveryTests
         Assert.Equal(EffectState.Executing, (await journal.ReadAsync(profile, envelope.IntentId, cancellation))?.Entry.State);
 
         clock.Now = clock.Now.AddSeconds(1);
+        var qualificationEnds = clock.Now.AddSeconds(2);
+        observer.QualificationEnds = qualificationEnds;
+        Task<EffectEvidence?> ObserveAfterExpiry(EffectJournalSnapshot requested, CancellationToken token)
+        {
+            clock.Now = qualificationEnds;
+            return Observe(requested, token);
+        }
+        Assert.Equal(LifecycleWriteOutcome.LeaseRejected, await recovery.ResolveFencedEffectAsync(successor, executing,
+            Guid.NewGuid(), ClockProof(clock), [], ObserveAfterExpiry, cancellation));
+        observer.QualificationEnds = null;
         Assert.Equal(LifecycleWriteOutcome.Indeterminate, await recovery.ResolveFencedEffectAsync(successor, executing,
             Guid.NewGuid(), ClockProof(clock), [], Observe, cancellation));
-        Assert.Equal(1, evidenceCalls);
+        Assert.Equal(2, evidenceCalls);
         absence = absence with { ObservedAt = clock.Now };
         Assert.Equal(LifecycleWriteOutcome.Committed, await recovery.ResolveFencedEffectAsync(successor, executing,
             Guid.NewGuid(), ClockProof(clock), [], Observe, cancellation));
-        Assert.Equal(2, evidenceCalls);
+        Assert.Equal(3, evidenceCalls);
         Assert.Equal(absence with { EarliestObservedAt = clock.Now.AddSeconds(-1) },
             (await journal.ReadAsync(profile, envelope.IntentId, cancellation))?.Entry.Resolution);
 
@@ -124,6 +134,8 @@ public sealed class ControllerLeaseRecoveryTests
         var third = await AcquireAsync(store, configuration, clock, "third", TaskThree, cancellation);
         Assert.Equal(TaskTwo, third.PreviousOwner?.OwnerTaskArn);
         Assert.Equal(first.OwnerTaskArn, third.RequiredFencingTaskArn);
+        Assert.Equal(second.AcquiredAt, third.PreviousOwner?.AcquiredAt);
+        Assert.Equal(first.AcquiredAt, third.RequiredFencingTaskAcquiredAt);
 
         observer.Statuses[TaskTwo] = ControllerTaskFenceStatus.Missing;
         observer.Statuses[first.OwnerTaskArn] = ControllerTaskFenceStatus.Unknown;
@@ -271,6 +283,7 @@ public sealed class ControllerLeaseRecoveryTests
         internal readonly Dictionary<string, ControllerTaskFenceStatus> Statuses = new(StringComparer.Ordinal);
         internal readonly List<string> Reads = [];
         internal Action? OnRead { get; set; }
+        internal DateTimeOffset? QualificationEnds { get; set; }
 
         public Task<ControllerTaskFenceStatus> ReadAsync(string taskArn, CancellationToken cancellationToken)
         {
@@ -279,5 +292,8 @@ public sealed class ControllerLeaseRecoveryTests
             OnRead?.Invoke();
             return Task.FromResult(Statuses.GetValueOrDefault(taskArn));
         }
+
+        public async Task<ControllerTaskFenceObservation> ObserveAsync(string taskArn, DateTimeOffset? acquiredAt, CancellationToken cancellationToken) =>
+            new(await ReadAsync(taskArn, cancellationToken), QualificationEnds);
     }
 }
