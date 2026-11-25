@@ -3,6 +3,7 @@ import { mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
+import { isDeepStrictEqual } from "node:util";
 import { Match, Template } from "aws-cdk-lib/assertions";
 import { compileConfig } from "../lib/config/compiler.ts";
 import type { RunnerControllerRuntime } from "../lib/config/types.ts";
@@ -616,6 +617,156 @@ test("offline synth rejects unsupported Fargate task sizes and awsvpc limits", (
     },
   });
   assert.throws(() => synthesize(badNetwork), /ECS awsvpc limits/u);
+});
+
+test("mixed launch policies bind each EC2 template to its network and each Fargate definition to its cluster", () => {
+  const config = fixture("mixed-ec2-fargate");
+  const { spec } = config.runtime;
+  const [firstEc2, secondEc2, firstFargate, secondFargate] = spec.profiles;
+  assert.equal(firstEc2.provisioner.type, "ec2");
+  assert.equal(secondEc2.provisioner.type, "ec2");
+  assert.equal(firstFargate.provisioner.type, "fargate");
+  assert.equal(secondFargate.provisioner.type, "fargate");
+  const firstNetwork = spec.networks[firstEc2.provisioner.network];
+  const secondNetwork = {
+    ...firstNetwork,
+    subnets: [
+      { id: "subnet-0123456789abcdef4", az: "ap-southeast-2a" },
+      { id: "subnet-0123456789abcdef5", az: "ap-southeast-2b" },
+    ],
+    securityGroupIds: ["sg-0123456789abcdef2"],
+  };
+  const template = synthesize(
+    rewrite(config, {
+      ...spec,
+      networks: { ...spec.networks, "runner-alt": secondNetwork },
+      profiles: [
+        firstEc2,
+        {
+          ...secondEc2,
+          provisioner: { ...secondEc2.provisioner, network: "runner-alt" },
+        },
+        firstFargate,
+        secondFargate,
+      ],
+    }),
+  );
+  const statements = rolePolicy(template);
+  const ec2Arn = (resource: string, region = spec.aws.region) => ({
+    "Fn::Join": [
+      "",
+      [
+        "arn:",
+        { Ref: "AWS::Partition" },
+        `:ec2:${region}:111122223333:${resource}`,
+      ],
+    ],
+  });
+  const ec2Grants = statements.filter(({ Action }) =>
+    [Action].flat().includes("ec2:RunInstances"),
+  );
+  const networkGrants = ec2Grants.filter(({ Resource }) =>
+    JSON.stringify(Resource).match(/:(?:subnet|security-group)\//u),
+  );
+  assert.equal(networkGrants.length, 2);
+  for (const [provisioner, network] of [
+    [firstEc2.provisioner, firstNetwork],
+    [secondEc2.provisioner, secondNetwork],
+  ] as const) {
+    const launchTemplate = ec2Arn(
+      `launch-template/${provisioner.launchTemplateId}`,
+    );
+    const resources = [
+      ...network.subnets.map(({ id }) => ec2Arn(`subnet/${id}`)),
+      ...network.securityGroupIds.map((id) => ec2Arn(`security-group/${id}`)),
+    ];
+    const grant = networkGrants.find(({ Condition }) =>
+      isDeepStrictEqual(Condition, {
+        ArnEquals: { "ec2:LaunchTemplate": launchTemplate },
+      }),
+    );
+    assert.ok(grant);
+    assert.deepEqual(grant.Resource, resources);
+    assert.ok(
+      ec2Grants.some(
+        ({ Resource, Condition }) =>
+          isDeepStrictEqual(Resource, launchTemplate) && !Condition,
+      ),
+    );
+    const instance = ec2Grants.find(
+      ({ Resource, Condition }) =>
+        isDeepStrictEqual(Resource, ec2Arn("instance/*")) &&
+        isDeepStrictEqual(
+          (Condition?.ArnEquals as Record<string, unknown>)?.[
+            "ec2:LaunchTemplate"
+          ],
+          launchTemplate,
+        ),
+    );
+    assert.deepEqual(instance?.Condition?.ArnEquals, {
+      "ec2:LaunchTemplate": launchTemplate,
+      "ec2:InstanceProfile": provisioner.instanceProfileArn,
+    });
+  }
+  const runTask = statements.filter(({ Action }) =>
+    [Action].flat().includes("ecs:RunTask"),
+  );
+  assert.equal(runTask.length, 2);
+  for (const { id, provisioner } of [firstFargate, secondFargate]) {
+    assert.equal(provisioner.type, "fargate");
+    const cluster = spec.ecsClusters[provisioner.cluster];
+    assert.equal(cluster.type, "import");
+    const grant = runTask.find(
+      ({ Resource }) => Resource === provisioner.taskDefinitionArn,
+    );
+    assert.deepEqual(grant?.Condition, {
+      ArnEquals: { "ecs:cluster": cluster.arn },
+      StringEquals: {
+        "aws:RequestTag/scaleset-aws:controller": "scaleset-dotnet-aws",
+        "aws:RequestTag/scaleset-aws:deployment":
+          "111122223333:ap-southeast-2:engineering-dev",
+        "aws:RequestTag/scaleset-aws:profile": id,
+        "aws:RequestTag/scaleset-aws:bootstrap-protocol": "v1",
+      },
+      Bool: { "ecs:enable-execute-command": "false" },
+      Null: { "aws:RequestTag/scaleset-aws:allocation": "false" },
+    });
+  }
+  const passRole = statements.filter(({ Action }) =>
+    [Action].flat().includes("iam:PassRole"),
+  );
+  assert.deepEqual(
+    new Set(passRole),
+    new Set([
+      {
+        Action: "iam:PassRole",
+        Resource: [
+          firstEc2.provisioner.bootstrapRoleArn,
+          secondEc2.provisioner.bootstrapRoleArn,
+        ].sort(),
+        Effect: "Allow",
+        Condition: {
+          StringEquals: { "iam:PassedToService": "ec2.amazonaws.com" },
+          ArnLike: {
+            "iam:AssociatedResourceArn": ec2Arn("instance/*", "*"),
+          },
+        },
+      },
+      {
+        Action: "iam:PassRole",
+        Resource: [
+          firstFargate.provisioner.bootstrapRoleArn,
+          firstFargate.provisioner.executionRoleArn,
+          secondFargate.provisioner.bootstrapRoleArn,
+          secondFargate.provisioner.executionRoleArn,
+        ].sort(),
+        Effect: "Allow",
+        Condition: {
+          StringEquals: { "iam:PassedToService": "ecs-tasks.amazonaws.com" },
+        },
+      },
+    ]),
+  );
 });
 
 test("active profiles alone supply provider permissions, event rules and role-scoped bootstrap actions", () => {

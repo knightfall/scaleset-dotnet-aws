@@ -818,5 +818,35 @@
       }
     ],
     "errorPath": "/spec/profiles/1/github/scaleSetId"
+  },
+  {
+    "name": "Fargate execution role cannot also be its bootstrap role",
+    "fault": "configuration",
+    "code": "semantic",
+    "base": "mixed-ec2-fargate",
+    "edits": [
+      {
+        "path": "/spec/profiles/2/provisioner/executionRoleArn",
+        "value": "arn:aws:iam::111122223333:role/fargate-shell-bootstrap"
+      }
+    ],
+    "errorPath": "/spec/profiles/2/provisioner/executionRoleArn"
+  },
+  {
+    "name": "Fargate execution role cannot alias a draining EC2 bootstrap role by path or case",
+    "fault": "configuration",
+    "code": "semantic",
+    "base": "mixed-ec2-fargate",
+    "edits": [
+      {
+        "path": "/spec/profiles/0/state",
+        "value": "draining"
+      },
+      {
+        "path": "/spec/profiles/2/provisioner/executionRoleArn",
+        "value": "arn:aws:iam::111122223333:role/imported/RUNNER-LINUX-BOOTSTRAP"
+      }
+    ],
+    "errorPath": "/spec/profiles/2/provisioner/executionRoleArn"
   }
 ]

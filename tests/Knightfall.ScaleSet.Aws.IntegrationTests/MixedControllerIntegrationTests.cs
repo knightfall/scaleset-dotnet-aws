@@ -251,6 +251,8 @@ public sealed class MixedControllerIntegrationTests(ITestOutputHelper output)
             Assert.Equal(2, ec2.Select(profile => ((Ec2ProvisionerConfiguration)profile.Provisioner).LaunchTemplateId).Distinct().Count());
             Assert.Equal(2, fargate.Select(profile => (FargateProvisionerConfiguration)profile.Provisioner)
                 .Select(provisioner => (provisioner.TaskDefinitionArn, provisioner.Cluster)).Distinct().Count());
+                Assert.Equal(4, fargate.Select(profile => (FargateProvisionerConfiguration)profile.Provisioner)
+                    .SelectMany(provisioner => new[] { provisioner.BootstrapRoleArn, provisioner.ExecutionRoleArn }).Distinct().Count());
             fixture.Cloud.DegradeEc2(true);
         }
         string? effectProfile = mixed ? ec2[1].Id : null;
@@ -292,7 +294,23 @@ public sealed class MixedControllerIntegrationTests(ITestOutputHelper output)
             }
             await WaitAsync(async () => await first.ReadyAsync(token) == HttpStatusCode.OK, "first worker ready", token);
             Assert.Equal(mixed ? 1 : ec2.Length, fixture.Cloud.Calls.Count(call => call is { Service: "ec2", Operation: "RunInstances" }));
-            Assert.Equal(fargate.Length, fixture.Cloud.Calls.Count(call => call is { Service: "ecs", Operation: "RunTask" }));
+            var launches = fixture.Cloud.Calls.Where(call => call is { Service: "ecs", Operation: "RunTask" }).ToArray();
+            Assert.Equal(fargate.Length, launches.Length);
+            var requestedBindings = new List<(string? Cluster, string? Definition)>();
+            foreach (var launch in launches)
+            {
+                using var request = JsonDocument.Parse(launch.Request);
+                var body = request.RootElement;
+                Assert.False(body.TryGetProperty("overrides", out _));
+                Assert.False(body.GetProperty("enableExecuteCommand").GetBoolean());
+                requestedBindings.Add((body.GetProperty("cluster").GetString(), body.GetProperty("taskDefinition").GetString()));
+            }
+            foreach (var profile in fargate)
+            {
+                var provisioner = (FargateProvisionerConfiguration)profile.Provisioner;
+                var cluster = Assert.IsType<ImportEcsClusterConfiguration>(fixture.Configuration.EcsClusters[provisioner.Cluster]);
+                Assert.Contains((cluster.Arn, provisioner.TaskDefinitionArn), requestedBindings);
+            }
             if (fargate.Length == 0)
             {
                 Assert.DoesNotContain(fixture.Cloud.Calls, call => call.Service == "ecs");

@@ -327,6 +327,41 @@ test("a draining profile can use the Default alias and the maximum idle reserve"
   );
 });
 
+test("role validation preserves same-purpose sharing and checks a disabled binding when enabled", () => {
+  const source = parseYaml(fixture("mixed-ec2-fargate.yaml"));
+  const roleEdits = [
+    {
+      path: "/spec/profiles/1/provisioner/bootstrapRoleArn",
+      value: "arn:aws:iam::111122223333:role/runner-linux-bootstrap",
+    },
+    {
+      path: "/spec/profiles/3/provisioner/executionRoleArn",
+      value: "arn:aws:iam::111122223333:role/fargate-shell-execution",
+    },
+  ];
+  const shared = compileConfig(JSON.stringify(edited(source, roleEdits)));
+  assert.equal(shared.runtime.spec.profiles.length, 4);
+  const isolatedEdit = {
+    path: "/spec/profiles/3/provisioner/executionRoleArn",
+    value: "arn:aws:iam::111122223333:role/fargate-shell-bootstrap",
+  };
+  const disabled = edited(source, [
+    isolatedEdit,
+    { path: "/spec/profiles/2/state", value: "disabled" },
+  ]);
+  assert.equal(
+    compileConfig(JSON.stringify(disabled)).runtime.spec.profiles[2].state,
+    "disabled",
+  );
+  assert.throws(
+    () => compileConfig(JSON.stringify(edited(source, [isolatedEdit]))),
+    {
+      code: "semantic",
+      path: isolatedEdit.path,
+    },
+  );
+});
+
 test("enterprise PATs and labels reused across separate GitHub scopes remain valid", () => {
   const source = edited(parseYaml(fixture("mixed-ec2-fargate.yaml")), [
     {

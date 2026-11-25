@@ -195,7 +195,16 @@ internal static partial class RuntimeConfigurationSemantics
         {
             RequireReference(clusters, Text(provisioner, "cluster"), prefix + "/cluster");
             RequireArn(Text(provisioner, "taskDefinitionArn"), "ecs", aws, prefix + "/taskDefinitionArn");
-            RequireArn(Text(provisioner, "executionRoleArn"), "iam", aws, prefix + "/executionRoleArn");
+            string executionRole = Text(provisioner, "executionRoleArn");
+            RequireArn(executionRole, "iam", aws, prefix + "/executionRoleArn");
+            string executionName = RoleName(executionRole);
+            if (Text(profile, "state") != "disabled" &&
+                profiles.EnumerateArray().Any(other => Text(other, "state") != "disabled" &&
+                    RoleName(Text(other.GetProperty("provisioner"), "bootstrapRoleArn")) == executionName))
+            {
+                throw Invalid(prefix + "/executionRoleArn",
+                    "Use an execution-only role in the Fargate profile and task definition. An active or draining bootstrap role cannot also be an execution role.");
+            }
         }
         else
         {
@@ -209,16 +218,19 @@ internal static partial class RuntimeConfigurationSemantics
                     throw Invalid(prefix + "/statusQualification",
                         "Supervisor STATUS requires a Linux profile and a numeric pinned Launch Template version.");
                 }
-                string role = Text(provisioner, "bootstrapRoleArn");
+                string role = RoleName(Text(provisioner, "bootstrapRoleArn"));
                 if (profiles.EnumerateArray().Select(other => other.GetProperty("provisioner"))
-                    .Count(other => Text(other, "bootstrapRoleArn") == role ||
-                        (other.TryGetProperty("executionRoleArn", out var executionRole) && executionRole.GetString() == role)) != 1)
+                    .Count(other => RoleName(Text(other, "bootstrapRoleArn")) == role ||
+                        (other.TryGetProperty("executionRoleArn", out _) && RoleName(Text(other, "executionRoleArn")) == role)) != 1)
                 {
                     throw Invalid(prefix + "/bootstrapRoleArn", "Supervisor STATUS requires a dedicated EC2 bootstrap role.");
                 }
             }
         }
     }
+
+    /// <summary>Returns the account-unique IAM role name for comparisons across paths and case.</summary>
+    private static string RoleName(string arn) => arn[(arn.LastIndexOf('/') + 1)..].ToLowerInvariant();
 
     private static void ValidateAwsResources(JsonElement spec, AwsScope aws)
     {

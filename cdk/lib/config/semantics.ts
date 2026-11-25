@@ -231,15 +231,15 @@ function validateProfile(
           "Supervisor STATUS requires a Linux profile and a numeric pinned Launch Template version.",
         );
       }
+      const bootstrapName = roleName(provisioner.bootstrapRoleArn);
       if (
         spec.profiles.some(
           (other) =>
             other !== profile &&
-            (other.provisioner.bootstrapRoleArn ===
-              provisioner.bootstrapRoleArn ||
+            (roleName(other.provisioner.bootstrapRoleArn) === bootstrapName ||
               (other.provisioner.type === "fargate" &&
-                other.provisioner.executionRoleArn ===
-                  provisioner.bootstrapRoleArn)),
+                roleName(other.provisioner.executionRoleArn) ===
+                  bootstrapName)),
         )
       ) {
         fail(
@@ -266,7 +266,26 @@ function validateProfile(
       spec.aws,
       `${prefix}/executionRoleArn`,
     );
+    const executionName = roleName(provisioner.executionRoleArn);
+    if (
+      profile.state !== "disabled" &&
+      spec.profiles.some(
+        (other) =>
+          other.state !== "disabled" &&
+          roleName(other.provisioner.bootstrapRoleArn) === executionName,
+      )
+    ) {
+      fail(
+        `${prefix}/executionRoleArn`,
+        "Use an execution-only role in the Fargate profile and task definition. An active or draining bootstrap role cannot also be an execution role.",
+      );
+    }
   }
+}
+
+function roleName(arn: string): string {
+  // Within the deployment account, IAM role names are unique across paths and case.
+  return arn.slice(arn.lastIndexOf("/") + 1).toLowerCase();
 }
 
 function validateAwsResources(spec: RunnerControllerRuntime["spec"]): void {

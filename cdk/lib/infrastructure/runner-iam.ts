@@ -146,7 +146,10 @@ export function grantEc2(
     const owned = ownership(runtime, profile, "ResourceTag");
     const launchTemplate = { "ec2:LaunchTemplate": template };
 
-    allow(role, ["ec2:RunInstances"], [template, ...subnets, ...groups]);
+    allow(role, ["ec2:RunInstances"], [template]);
+    allow(role, ["ec2:RunInstances"], [...subnets, ...groups], {
+      ArnEquals: launchTemplate,
+    });
     allow(
       role,
       ["ec2:RunInstances"],
@@ -197,6 +200,15 @@ export function grantEc2(
     unique(profiles.map(({ provisioner }) => provisioner.bootstrapRoleArn)),
     {
       StringEquals: { "iam:PassedToService": "ec2.amazonaws.com" },
+      ArnLike: {
+        "iam:AssociatedResourceArn": Stack.of(role).formatArn({
+          service: "ec2",
+          region: "*",
+          resource: "instance",
+          resourceName: "*",
+          arnFormat: ArnFormat.SLASH_RESOURCE_NAME,
+        }),
+      },
     },
   );
 }
