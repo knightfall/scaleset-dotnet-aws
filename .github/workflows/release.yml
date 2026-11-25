@@ -72,6 +72,8 @@ jobs:
             printf -- '- Candidate run `%s`, attempt `%s`, artifact `%s`\n' \
               "$CANDIDATE_RUN_ID" "$CANDIDATE_ATTEMPT" "$ARTIFACT_ID"
             printf -- '- Manifest SHA-256 `%s`\n' "$CANDIDATE_MANIFEST_SHA256"
+            jq -r '.images[] | "- `\(.platform)` OCI manifest `\(.manifestDigest)`, SPDX subject `\(.sbomSubject)`, Grype database built `\(.scan.databaseBuiltAt)`"' \
+              "$RUNNER_TEMP/candidate/release.json"
           } >> "$GITHUB_STEP_SUMMARY"
 
   publish:
@@ -87,11 +89,11 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Verify production protections
+      - name: Recheck tag, candidate freshness and reviewed artifact identity
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_SETTINGS_READ_TOKEN: ${{ secrets.RELEASE_SETTINGS_READ_TOKEN }}
-        run: bash .github/release/production.sh
+          REVIEWED_ARTIFACT_ID: ${{ needs.inspect.outputs.artifact_id }}
+        run: bash .github/release/preflight.sh
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           artifact-ids: ${{ needs.inspect.outputs.artifact_id }}
@@ -103,6 +105,11 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: bash .github/release/verify-bundle.sh "$RUNNER_TEMP/candidate"
+      - name: Verify current production protections
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_SETTINGS_READ_TOKEN: ${{ secrets.RELEASE_SETTINGS_READ_TOKEN }}
+        run: bash .github/release/production.sh
       - name: Publish verified assets to the existing tag
         env:
           GH_TOKEN: ${{ github.token }}

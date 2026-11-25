@@ -69,6 +69,7 @@ jobs:
         env:
           GRYPE: ${{ steps.grype.outputs.cmd }}
           GRYPE_DB_VALIDATE_AGE: 'true'
+          GRYPE_DB_MAX_ALLOWED_BUILT_AGE: '72h'
           GRYPE_DB_REQUIRE_UPDATE_CHECK: 'true'
         run: |
           archive="$RUNNER_TEMP/controller/scaleset-aws-controller-$RID.tar.gz"
@@ -80,15 +81,20 @@ jobs:
           path: ${{ runner.temp }}/controller/scaleset-aws-controller-${{ matrix.rid }}.grype.json
           if-no-files-found: ignore
           retention-days: 14
-      - name: Inventory the tested image
-        uses: anchore/sbom-action@dfcb83b97731532d72be422cbc51ee64adb6fd56 # v0.24.4
+      - uses: anchore/sbom-action/download-syft@dfcb83b97731532d72be422cbc51ee64adb6fd56 # v0.24.4
+        id: syft
         with:
-          image: docker:scaleset-aws-controller:git-${{ env.BUILD_SHA }}-${{ matrix.rid }}
           syft-version: v1.57.2
-          format: spdx-json
-          output-file: ${{ runner.temp }}/controller/scaleset-aws-controller-${{ matrix.rid }}.spdx.json
-          upload-artifact: false
-          upload-release-assets: false
+      - name: Inventory the tested OCI archive
+        env:
+          SYFT: ${{ steps.syft.outputs.cmd }}
+          SYFT_CHECK_FOR_APP_UPDATE: 'false'
+        run: |
+          archive="$RUNNER_TEMP/controller/scaleset-aws-controller-$RID.tar.gz"
+          "$SYFT" scan "oci-archive:$archive" --source-name "${archive##*/}" \
+            --output "spdx-json=${archive%.tar.gz}.spdx.json"
+      - name: Verify the inventory and scan bind to the tested archived image
+        run: python3 .github/release/candidate.py check-image "$RUNNER_TEMP/controller" --rid "$RID"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: controller-${{ matrix.rid }}-${{ github.run_attempt }}
