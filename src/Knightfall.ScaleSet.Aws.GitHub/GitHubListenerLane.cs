@@ -59,6 +59,8 @@ public sealed partial class GitHubListenerLane : IDisposable
 
     public bool PollCredentialRejected => _observedSession?.PollCredentialRejected == true;
 
+    public bool PollCompleted => _observedSession?.PollCompleted == true;
+
     public DateTimeOffset? ReadCredentialCooldown() =>
         Volatile.Read(ref _stopping) == 0 && !_definition.OwnershipLost.IsCancellationRequested
             ? _cooldown.Read(_connection.SecretArn) : null;
@@ -77,6 +79,7 @@ public sealed partial class GitHubListenerLane : IDisposable
             if (_observedSession is { } observed)
             {
                 observed.PollCredentialRejected = false;
+                observed.PollCompleted = false;
             }
             using var administration = CancellationTokenSource.CreateLinkedTokenSource(stoppingToken, _definition.OwnershipLost);
             if (await EnsureSessionAsync(administration.Token).ConfigureAwait(false) is { } waiting)

@@ -407,11 +407,11 @@ internal sealed class ControllerProfileSession : IAsyncDisposable
                     PublishListenerResult(stepped with { Status = GitHubListenerLaneStatus.RecoveryRequired });
                     return;
                 }
-                if (stepped.Status == GitHubListenerLaneStatus.StorageRejected || (recovering && stepped is not
-                    { Status: GitHubListenerLaneStatus.Stepped, Step.Status: ScaleSetListenerStepStatus.Initialized or
-                        ScaleSetListenerStepStatus.EmptyPoll or ScaleSetListenerStepStatus.MessageAcknowledged }))
+                if (stepped.Status == GitHubListenerLaneStatus.StorageRejected || (recovering &&
+                    (!lane.PollCompleted || stepped is not { Status: GitHubListenerLaneStatus.Stepped,
+                        Step.Status: ScaleSetListenerStepStatus.EmptyPoll or ScaleSetListenerStepStatus.MessageAcknowledged })))
                 {
-                    // A deferred operation did not establish current authority over this session.
+                    // Initialization and recovered checkpoint writes can complete without a fresh poll.
                     if (DescribeListenerFailure(stepped.Status) is not null)
                     {
                         PublishListenerResult(stepped);

@@ -337,6 +337,7 @@ public sealed class ControllerProfileSessionTests
 
     [Theory]
     [InlineData("Replacement")]
+    [InlineData("AcknowledgementSettledBeforeRotation")]
     [InlineData("AcknowledgementUnauthorized")]
     [InlineData("RefreshUnauthorized")]
     [InlineData("BindingMismatch")]
@@ -364,7 +365,9 @@ public sealed class ControllerProfileSessionTests
         var inventory = new ExecutorInventoryObservation(clock.Now, IsComplete: true, BackendCapacityCeiling: 2, BackendLaunchHeadroom: 2);
         Assert.Equal(LifecycleWriteOutcome.Committed, await store.PublishExecutorInventoryAsync(key, current.Lease.Fence, null, inventory, token));
         bool sessionless = outcome.StartsWith("Sessionless", StringComparison.Ordinal);
-        bool replacementOpens = outcome is "Replacement" or "SessionlessReplacement" or "SessionlessRetiredReplacement";
+        bool resumeAcknowledgement = outcome == "AcknowledgementSettledBeforeRotation";
+        bool replacementOpens = outcome is "Replacement" or "AcknowledgementSettledBeforeRotation" or
+            "SessionlessReplacement" or "SessionlessRetiredReplacement";
         Guid? priorSession = sessionless && outcome != "SessionlessRetiredReplacement" ? null : GitHubWire.SessionId;
         if (sessionless)
         {
@@ -421,7 +424,7 @@ public sealed class ControllerProfileSessionTests
                     return Delivery(9);
                 }
                 Assert.Contains("lastMessageId=9", request.Uri.Query, StringComparison.Ordinal);
-                if (poll == 2)
+                if (poll == 2 && !resumeAcknowledgement)
                 {
                     table.Wire.DenyGetItem(checkpointKey);
                     return new HttpResponseMessage(HttpStatusCode.Accepted);
@@ -441,6 +444,11 @@ public sealed class ControllerProfileSessionTests
             }
             if (request.Method == HttpMethod.Delete && path == oldQueue + "/9")
             {
+                if (resumeAcknowledgement)
+                {
+                    table.Wire.FailNextTransactWrite(checkpointKey, "AccessDeniedException");
+                    table.Wire.DenyGetItem(checkpointKey);
+                }
                 return new HttpResponseMessage(HttpStatusCode.NoContent);
             }
             if (request.Method == HttpMethod.Delete && (path == oldQueue + "/10" || path == closePath))
@@ -606,16 +614,22 @@ public sealed class ControllerProfileSessionTests
         var durable = Assert.IsType<SessionRecord>(await store.ReadSessionAsync(key, token));
         Assert.Equal(original.Binding, durable.Binding);
         Assert.Equal(current.Lease.Fence, durable.Owner);
-        Assert.Equal(outcome == "Replacement" ? SecondSession : GitHubWire.SessionId, durable.SessionId);
+        Assert.Equal(replacementOpens ? SecondSession : GitHubWire.SessionId, durable.SessionId);
         Assert.Equal(outcome.StartsWith("Close", StringComparison.Ordinal) ? SessionPhase.Closing : SessionPhase.Active, durable.Phase);
         Assert.DoesNotContain(previousWire.Requests, request => request.Method == HttpMethod.Delete && request.Uri.AbsolutePath == closePath);
-        if (outcome == "Replacement" || outcome.StartsWith("Close", StringComparison.Ordinal))
+        if (replacementOpens || outcome.StartsWith("Close", StringComparison.Ordinal))
         {
             Assert.Single(candidateWire.Requests, request => request.Method == HttpMethod.Delete && request.Uri.AbsolutePath == closePath);
         }
         else
         {
             Assert.DoesNotContain(candidateWire.Requests, request => request.Method == HttpMethod.Delete && request.Uri.AbsolutePath == closePath);
+        }
+        if (resumeAcknowledgement)
+        {
+            Assert.Single(previousWire.Requests, request => request.Method == HttpMethod.Delete && request.Uri.AbsolutePath == oldQueue + "/9");
+            Assert.Contains(previousWire.Requests, request => request.Method == HttpMethod.Get &&
+                request.Uri.AbsolutePath == oldQueue && request.Uri.Query.Contains("lastMessageId=9", StringComparison.Ordinal));
         }
         if (outcome is "AcknowledgementUnauthorized" or "RefreshUnauthorized" or "BindingMismatch")
         {
