@@ -84,7 +84,7 @@ public sealed class Ec2InventoryTests
         cloud.InventoryResponse = static _ => AwsWireTransport.Xml(InventoryPage(Instance(lastLaunch: "2049-12-31T22:00:00Z")));
         var resumed = Assert.Single((await cloud.Inspector.ReadInventoryAsync(config, ProfileId, token)).Instances);
 
-        Assert.Equal(Ec2InstanceState.Unknown, stopped.State);
+        Assert.Equal(Ec2InstanceState.Stopped, stopped.State);
         Assert.Equal(Ec2InstanceState.Running, resumed.State);
         Assert.Equal(DateTimeOffset.Parse(OriginalLaunch, CultureInfo.InvariantCulture), stopped.OriginalLaunchTime);
         Assert.Equal(stopped.OriginalLaunchTime, resumed.OriginalLaunchTime);

@@ -1,7 +1,12 @@
+using System.Collections.Concurrent;
+using System.Collections.Frozen;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using Amazon.SQS.Model;
+using Knightfall.ScaleSet.Aws.Controller.Configuration;
 using Knightfall.ScaleSet.Aws.Controller.Lifecycle;
+using Knightfall.ScaleSet.Aws.Controller.Runtime;
+using Knightfall.ScaleSet.Aws.Core.Catalog;
 using Knightfall.ScaleSet.Aws.Core.Configuration;
 using Knightfall.ScaleSet.Aws.Core.Lifecycle;
 using Knightfall.ScaleSet.Aws.DynamoDb;
@@ -11,6 +16,7 @@ using Knightfall.ScaleSet.Aws.Providers.Fargate;
 using Knightfall.ScaleSet.Aws.RunnerBootstrap;
 using Knightfall.ScaleSet.Aws.RunnerBootstrap.Fargate;
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 using ScaleSet.Listener;
 using Knightfall.ScaleSet.Aws.Lifecycle.Tests;
 using Xunit;
@@ -25,6 +31,79 @@ public sealed class FargateNativeHandoffTests
         FargateNativeFixture.Reserve, TimeSpan.FromSeconds(12), TimeSpan.FromMinutes(5), TimeSpan.FromMinutes(1));
     private const long FirstJob = 511;
     private const long SecondJob = 512;
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task FargateDrainOrStartupTimeoutRevokesTheExactUnconsumedOfferAndStopsOnce(bool drain)
+    {
+        var token = TestContext.Current.CancellationToken;
+        using var aws = await FargateNativeFixture.CreateAsync(token);
+        using var secrets = aws.CreateSecretsClient();
+        var owner = await aws.StartOwnerAsync(token);
+        var simulator = new GitHubSimulator(FargateNativeFixture.Group);
+        await using var protocol = await GitHubProtocolHost.StartAsync(simulator, token);
+        using var http = protocol.CreateClient();
+        var factory = new GitHubScaleSetClientFactory(http, timeProvider: aws.Clock);
+        var credential = Assert.IsType<GitHubSecretVersion>(
+            await new GitHubSecretLoader(secrets).LoadAsync(aws.Configuration, FargateNativeFixture.Connection, token));
+        using var github = factory.Create(credential);
+        var registration = await new GitHubScaleSetRegistration(aws.Store, aws.Clock, FargateNativeFixture.Reserve,
+            TimeSpan.FromSeconds(12)).ResolveAsync(aws.Configuration, FargateNativeFixture.ProfileId, github,
+            RegistrationLease(aws, owner), null, token);
+        var binding = Assert.IsType<GitHubScaleSetBinding>(registration.Binding);
+        await aws.BindScaleSetAsync(owner, binding.RunnerGroupId, binding.ScaleSetId, token);
+        using var ownership = new ControllerLeaseOwnership(aws.Store, owner, aws.Clock.Proof(), aws.Clock,
+            TimeSpan.FromHours(2), FargateNativeFixture.Reserve);
+        var task = await LaunchAsync(aws, owner, aws.Provider(), binding.ScaleSetId, token);
+        using var recipient = JitRecipientKey.Create();
+        Assert.Equal(LifecycleWriteOutcome.Committed, await BrokerHelloFixture.RegisterAsync(aws.Table.Client,
+            aws.Table.Name, task.Identity.AwsUserId, recipient.Hello, aws.Clock, token));
+        var coordinator = new ControllerJitCoordinator(aws.Store, new AwsBootstrapPrincipalResolver(aws.Iam),
+            new GitHubJitHandoff(aws.Store, aws.Clock, JitTiming), NullLogger<ControllerJitCoordinator>.Instance);
+        _ = await OfferAsync(aws, ownership, coordinator, task, github, token);
+
+        var runtime = drain ? aws.ConfigurationFor(aws.DefinitionArn, drainingWarmReserve: true) : aws.Configuration;
+        var profile = Assert.Single(runtime.Profiles);
+        if (drain)
+        {
+            var current = Assert.IsType<ControllerLease>(await aws.Store.ReadLeaseAsync(aws.Profile.Deployment, token));
+            Assert.Equal(LifecycleWriteOutcome.Committed, (await aws.Store.ReleaseLeaseAsync(current, aws.Clock.Now, token)).Outcome);
+            owner = await aws.StartOwnerAsync(token, FargateNativeFixture.SecondController, runtime, generation: 2);
+            Assert.Equal(1, profile.Capacity.IdleReserve);
+            Assert.Equal(1, profile.Capacity.MaxRunners);
+        }
+        else
+        {
+            var started = Assert.IsType<DateTimeOffset>(task.Executor.State.StartedAt);
+            aws.Clock.Now = started.AddSeconds(profile.Capacity.StartupTimeoutSeconds);
+        }
+        var catalog = Assert.IsType<CatalogProfile>(await aws.Store.ReadCatalogProfileAsync(aws.Profile, token));
+        var approved = new Dictionary<string, FargateContainerApproval>(StringComparer.Ordinal) { [profile.Id] = FargateNativeFixture.Approval };
+        var evidence = new FargateRuntimeEvidence(approved.ToFrozenDictionary(StringComparer.Ordinal), null);
+        var quota = new FargateQuotaReader(runtime.Aws, evidence, null, aws.Clock);
+        var backend = new FargateRunnerBackend(runtime, profile, aws.Profile, aws.Inspector, evidence, quota,
+            [aws.Profile], new ConcurrentDictionary<string, FargateInventorySnapshot>(StringComparer.Ordinal), aws.Store,
+            aws.Journal, aws.Dispatcher, aws.Clock, FargateNativeFixture.Timing.ObservationFreshness);
+        var inventory = await backend.ReadAsync(owner, token);
+        Assert.True(inventory.IsComplete);
+        var resource = Assert.Single(inventory.Resources);
+        Assert.Equal(task.Executor.Binding, resource.Binding);
+        Assert.Equal(LifecycleWriteOutcome.Committed, await aws.Store.ObserveResourceAsync(owner.Fence, task.Executor.Binding,
+            Assert.IsType<ExecutorResourceObservation>(resource.Observation), token));
+        var durable = await aws.Store.ReadExecutorInventoryAsync(aws.Profile, token);
+        Assert.Equal(LifecycleWriteOutcome.Committed, await aws.Store.PublishExecutorInventoryAsync(aws.Profile, owner.Fence,
+            durable.Revision, new ExecutorInventoryObservation(inventory.ObservedAt, IsComplete: true, BackendCapacityCeiling: 1), token));
+        var authority = new ActiveControllerAuthority(owner, aws.Clock.Proof());
+        await backend.CleanupAsync(authority, catalog, await ReadExecutorAsync(aws, task, token), CancellationToken.None, token);
+        var stopped = await ReadExecutorAsync(aws, task, token);
+        Assert.Equal(ExecutorResourceState.IrreversiblyTerminated, stopped.State.Resource?.State);
+        Assert.Equal(FargateAdmissionClosure.OfferRevoked, stopped.State.AdmissionClosure);
+        Assert.Equal(JitHandoffState.Revoked, (await aws.Store.ReadJitHandoffAsync(aws.Profile, task.Identity.AllocationId, token))?.State);
+        await backend.CleanupAsync(authority, catalog, stopped, CancellationToken.None, token);
+        Assert.Single(aws.Wire.Requests, request => request.Operation == "StopTask");
+        Assert.Equal("STOPPED", (await aws.ReadNativeTaskAsync(task.Identity.ResourceArn, token)).LastStatus);
+    }
 
     [Fact(Timeout = 75_000)]
     public async Task TwoTasksConsumeSeparateOffersAndKeepWorkingAcrossControllerReplacement()

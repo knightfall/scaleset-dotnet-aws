@@ -213,6 +213,45 @@ dotnet run --project "$controller_project" --configuration Release --no-build --
   --generation "$generation"
 ```
 
+### Recover a held Fargate or EC2 allocation
+
+During drain or after a startup timeout, an exact Fargate task with an unconsumed
+offer can be stopped automatically. The controller requires complete recent
+inventory and a clear acquisition balance. It revokes the handoff and deletes
+the exact encrypted offer in the same transaction as admission closure. A
+bootstrap that already deleted its offer wins the race and the controller
+holds that task. An uncertain stop remains in the journal for authoritative
+readback. Keep the draining binding, task definition and grants until the
+exact task is terminal and the handoff and runner registration are settled.
+
+An online, idle GitHub runner may be assigned a job after it was last read.
+The current SDK supplies no atomic scheduling fence for stopping a connected
+Fargate runner. For a consumed offer that stays held, have the GitHub owner
+first isolate scheduling for the exact scope, runner group and scale set
+using a target-qualified procedure. Record the effective isolation and when
+it took effect, then verify that existing assigned and running work has
+finished. Check the exact runner ID, session, local acquisition balance and
+unresolved journal entries. Preserve that isolation until the allocation is
+terminal. If any assignment or request remains uncertain, keep the task held.
+After independently confirming both the scheduling fence and the clear work
+state, the AWS owner may stop the exact task ARN in its original cluster and
+record the native readback. The controller reconciles that terminal observation
+and the exact runner registration before retirement. This route requires
+independent proof from the target. A drained local queue or a runner's idle
+flag alone leaves the task held.
+
+The controller reports an exactly bound stopped EC2 allocation with
+`external_reclamation_required`. Keep its profile, instance ID, allocation,
+Launch Template revision, and GitHub runner identity tied to the current
+readback. Have the AWS owner verify the instance is still stopped and review
+the durable job, handoff, acquisition and effect evidence with the GitHub
+owner. Once outstanding work has an authoritative outcome and the original
+runner cannot accept more jobs, reclaim the exact stopped instance under the
+target's approved EC2 procedure and record the terminal instance observation.
+The controller already settles exact termination readback and runner removal.
+Pending, shutting-down, missing or conflicting observations require further
+evidence before reclaiming the resource.
+
 ## Roll back or recover a controller
 
 Roll back by deploying compatible known-good inputs as a **new, higher generation**. Compare current catalog and profile grants against the candidate before the deploy. Keep intervening profiles and bindings until their own retirement gates clear. Preserve tombstones and choose a new profile identity if the old profile is retired. Verify the writer protocol, data schema, CPU architecture, image digest, and runtime bytes before starting the replacement.

@@ -193,7 +193,7 @@ internal sealed class FargateNativeFixture : IDisposable
         return result.TaskDefinition.TaskDefinitionArn;
     }
 
-    internal RuntimeConfiguration ConfigurationFor(string definition)
+    internal RuntimeConfiguration ConfigurationFor(string definition, bool drainingWarmReserve = false)
     {
         var root = JsonNode.Parse(_template.Replace("111122223333", Account, StringComparison.Ordinal)
             .Replace("ap-southeast-2", Region, StringComparison.Ordinal))!.AsObject();
@@ -203,7 +203,14 @@ internal sealed class FargateNativeFixture : IDisposable
         github["auth"]!["type"] = "enterprise-pat";
         github["auth"]!["secretArn"] = SecretArn;
         spec["tracking"]!["table"] = new JsonObject { ["type"] = "import", ["name"] = Table.Name };
-        var runner = spec["profiles"]![0]!["provisioner"]!;
+        var profile = spec["profiles"]![0]!;
+        if (drainingWarmReserve)
+        {
+            profile["state"] = "draining";
+            profile["capacity"]!["idleReserve"] = 1;
+            profile["capacity"]!["maxRunners"] = 1;
+        }
+        var runner = profile["provisioner"]!;
         string cluster = runner["cluster"]!.GetValue<string>();
         spec["ecsClusters"]![cluster] = new JsonObject { ["type"] = "import", ["arn"] = ClusterArn };
         runner["taskDefinitionArn"] = definition;
@@ -216,7 +223,8 @@ internal sealed class FargateNativeFixture : IDisposable
         return RuntimeConfigurationLoader.Load(JsonSerializer.SerializeToUtf8Bytes(root));
     }
 
-    internal async Task<ControllerLease> StartOwnerAsync(CancellationToken token, string taskArn = FirstController)
+    internal async Task<ControllerLease> StartOwnerAsync(CancellationToken token, string taskArn = FirstController,
+        RuntimeConfiguration? rolloutConfiguration = null, long generation = 1)
     {
         var now = Clock.GetUtcNow();
         var acquired = await Store.TryAcquireLeaseAsync(Profile.Deployment, Guid.NewGuid().ToString("N"), taskArn,
@@ -229,7 +237,7 @@ internal sealed class FargateNativeFixture : IDisposable
         var lease = Assert.IsType<ControllerLease>(result.Lease);
         for (int pass = 0; ; pass++)
         {
-            var rollout = await Store.AdvanceCatalogRolloutAsync(lease.Fence, Configuration, 1, token);
+            var rollout = await Store.AdvanceCatalogRolloutAsync(lease.Fence, rolloutConfiguration ?? Configuration, generation, token);
             if (rollout.Status != CatalogRolloutStatus.Staging || pass == 3)
             {
                 Assert.Equal(CatalogRolloutStatus.Applied, rollout.Status);

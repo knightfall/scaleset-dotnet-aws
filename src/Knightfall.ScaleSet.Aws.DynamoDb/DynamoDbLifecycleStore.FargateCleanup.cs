@@ -76,9 +76,11 @@ public sealed partial class DynamoDbLifecycleStore
             return LifecycleWriteOutcome.Conflict;
         }
         var transition = Guid.NewGuid();
+        var leaseCondition = LeaseCondition(lease.Fence);
+        RequireAppliedCatalog(leaseCondition, catalog);
         var actions = new List<TransactionAction>
         {
-            LeaseCondition(lease.Fence),
+            leaseCondition,
             CatalogProfileCondition(catalog),
             RecordRevisionCondition(zeroAcquisitions),
         };
