@@ -63,13 +63,17 @@ public sealed partial class FargateProfileInspector
                 resource.Task.AttachedSubnetIds.All(launch.EligibleSubnetIds.Contains);
             DateTimeOffset? attachment = observedAttached && resource.Task.AttachmentObservedAt is { } observed &&
                 observed >= resource.InventoryAt && Fresh(observed, now) ? observed : null;
-            // Only an attachment observed before sampling is already represented in that sample.
+            // Subnet capacity uses the latest attachment observation.
             if (launch.EligibleSubnetIds.Any(scopeSubnets.Contains) &&
                 (attachment is not { } attachedForIp || attachedForIp >= task.SubnetSampleStartedAt))
             {
                 reservedIp++;
             }
-            if (attachment is not { } attachedForCpu || quota is null || attachedForCpu >= quota.ObservedAt)
+            // A running task with the same exact attachment across full inventories may already
+            // be included in a quota sample that was taken between those inventories.
+            var cpuAttachment = attachment.HasValue && resource.Task.State == FargateTaskState.Running
+                ? resource.Task.RunningAttachmentObservedSince ?? attachment : null;
+            if (cpuAttachment is not { } attachedForCpu || quota is null || attachedForCpu >= quota.ObservedAt)
             {
                 reservedCpu += launch.CpuUnits;
             }

@@ -27,7 +27,17 @@ internal sealed class FargateRunnerBackend(
     public async Task<RunnerBackendInventory> ReadAsync(ControllerLease lease, CancellationToken cancellationToken)
     {
         _launchTask = null;
-        var inventory = await inspector.ReadInventoryAsync(configuration, profile.Id, cancellationToken).ConfigureAwait(false);
+        deploymentInventory.TryGetValue(profile.Id, out var previous);
+        FargateInventorySnapshot inventory;
+        try
+        {
+            inventory = await inspector.ReadInventoryAsync(configuration, profile.Id, previous, cancellationToken).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            deploymentInventory.TryRemove(profile.Id, out _);
+            throw;
+        }
         deploymentInventory[profile.Id] = inventory;
         var launchHeadroom = (int?)null;
         FargateResolvedTask? verified = null;

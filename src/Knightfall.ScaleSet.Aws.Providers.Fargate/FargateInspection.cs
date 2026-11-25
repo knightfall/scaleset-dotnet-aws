@@ -82,7 +82,13 @@ public sealed record FargateTaskObservation(
     public bool IsForeign { get; init; }
 
     public bool OccupiesProfile => !IsForeign && State != FargateTaskState.Stopped;
+
+    internal FargateNetworkAttachment? Attachment { get; init; }
+
+    internal DateTimeOffset? RunningAttachmentObservedSince { get; init; }
 }
+
+internal sealed record FargateNetworkAttachment(string? AttachmentId, string NetworkInterfaceId, string SubnetId, string PrivateAddress);
 
 public sealed record FargateInventorySnapshot(
     FargateProfileScope Scope,
