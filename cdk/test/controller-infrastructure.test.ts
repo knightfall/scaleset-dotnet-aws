@@ -98,7 +98,13 @@ test("qualifying predecessor capture grants only an exact active log-group read"
       },
     ],
   );
-  captured.resourceCountIs("AWS::Logs::LogGroup", 1);
+  const withoutCapture = synthesize(
+    rewrite(baseline, { ...spec, mode: "active" }),
+  );
+  assert.deepEqual(
+    captured.findResources("AWS::Logs::LogGroup"),
+    withoutCapture.findResources("AWS::Logs::LogGroup"),
+  );
   for (const config of [
     rewrite(baseline, { ...spec, mode: "dry-run", controller }),
     rewrite(baseline, { ...spec, mode: "active" }),
