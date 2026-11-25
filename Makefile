@@ -14,7 +14,7 @@ check-dotnet:
 	dotnet test --solution Knightfall.ScaleSet.Aws.slnx --configuration Release --no-build
 
 check-cdk:
-	npm --prefix cdk ci
+	npm --prefix cdk ci --engine-strict --ignore-scripts
 	npm --prefix cdk run lint
 	npm --prefix cdk run format:check
 	npm --prefix cdk run typecheck

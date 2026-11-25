@@ -1,17 +1,59 @@
-botocore==1.43.124
-defusedxml==0.7.1
-graphql-core==3.2.12
-h11==0.16.0
-h2==4.4.1
-hpack==4.2.0
-hypercorn==0.18.0
-hyperframe==6.1.0
-jmespath==1.1.0
-jsonata-python==0.7.2
-ministack==1.5.44
-priority==2.0.0
-python-dateutil==2.9.0.post0
-pyyaml==6.0.4
-six==1.17.0
-urllib3==2.8.0
-wsproto==1.3.2
+# Official PyPI wheel hashes for CPython 3.11–3.14 on x64 and arm64 Linux and macOS.
+# The MiniStack harness permits binary wheels only and verifies this full dependency set.
+botocore==1.43.124 \
+    --hash=sha256:4651bac68d1aef78d42c8aefb514a6cd86fda07971b8348652a9d24f21b07965
+defusedxml==0.7.1 \
+    --hash=sha256:a352e7e428770286cc899e2542b6cdaedb2b4953ff269a210103ec58f6198a61
+graphql-core==3.2.12 \
+    --hash=sha256:3d8f104532070485e13caa4092c1e71cda2ba6cffd96e98f285111ee10ed1e51
+h11==0.16.0 \
+    --hash=sha256:63cf8bbe7522de3bf65932fda1d9c2772064ffb3dae62d55932da54b31cb6c86
+h2==4.4.1 \
+    --hash=sha256:0e25f1462b23c9cb82d9eb02e28bc706dac2a68cb457c6a0d74d63c8a2a5d0e6
+hpack==4.2.0 \
+    --hash=sha256:858ac0b02280fa582b5080d68db0899c62a80375e0e5413a74970c5e518b6986
+hypercorn==0.18.0 \
+    --hash=sha256:225e268f2c1c2f28f6d8f6db8f40cb8c992963610c5725e13ccfcddccb24b1cd
+hyperframe==6.1.0 \
+    --hash=sha256:b03380493a519fce58ea5af42e4a42317bf9bd425596f7a0835ffce80f1a42e5
+jmespath==1.1.0 \
+    --hash=sha256:a5663118de4908c91729bea0acadca56526eb2698e83de10cd116ae0f4e97c64
+jsonata-python==0.7.2 \
+    --hash=sha256:70c3ae7c9fce7c23497eca463deb3dec58544325739075dc30e428e63b76a710
+ministack==1.5.44 \
+    --hash=sha256:5d8903d06825ebb45ccff97e7f5b61b54de6775226e149f00135a9bb0e92106f
+priority==2.0.0 \
+    --hash=sha256:6f8eefce5f3ad59baf2c080a664037bb4725cd0a790d53d59ab4059288faf6aa
+python-dateutil==2.9.0.post0 \
+    --hash=sha256:a8b2bc7bffae282281c8140a97d3aa9c14da0b136dfe83f850eea9a5f7470427
+pyyaml==6.0.4 \
+    --hash=sha256:1088ad740f50c13178dad16fbc2fa1f634c791d42c7009fdb390e38e5b90b788 \
+    --hash=sha256:132c3c7c37a8e6f334921b05cfea5d26e241d792dcbb4db0462129d25ca53b43 \
+    --hash=sha256:180ac792c958c2173f6e4467c55ae5f73ab1a9a624ee29fc7095c56d5e3a4055 \
+    --hash=sha256:41b4669c3a8fd5750e594dff59d3e62d40e321fec467b50449603710ed0a68f3 \
+    --hash=sha256:45e37dd647db9d67b757444c74060c064ace5fdaa08f42bf4fda3812275d423e \
+    --hash=sha256:49e38a95e24738908ea852e61df0abc58d1e4d4f974ccdb2386eaee412bedc67 \
+    --hash=sha256:4a329472db6c8858ebd94f2214a54c8bff8f035a6cc7af1ab39cc1b33a5f0e56 \
+    --hash=sha256:4d1e8d6e345b4b4424a05a11e699e999e65a88f422f73636f8a0b354bf219ffa \
+    --hash=sha256:4d30c2f186612bd2f9f07c08a4c96721af59cfc8da3ec7cb27dfa2834e8bb019 \
+    --hash=sha256:4d3bbc5e8a84a5a6775adecac786f489510a7159b1c343d6f31426d888cfdd6e \
+    --hash=sha256:50588147ab2c6a59b5f990a4905db80899a6c2bd197e046a6201f1e67587e794 \
+    --hash=sha256:61eef2f08e977b725f37a8d1663f5a222c6f09207ac0794030d5fca062e7c96e \
+    --hash=sha256:622aa875fa6533f25fedcffe23079357d65a690d462200afed5d8e9d0e01ebee \
+    --hash=sha256:71bb5b87465d88d1dfc577115af6d435bff9b26f2512936f610c26aa55966028 \
+    --hash=sha256:730788375056c43d3ac15bd894c9cd2fb7a931a38b302f408620c64b3ef176ed \
+    --hash=sha256:7335809813ec838d9cd334b1744cda33deb141c9ef23a9c0df371c37980d3851 \
+    --hash=sha256:84e97378010f3da8daf673b82d39ed638098d236a1b760d61c0c1348a642bd70 \
+    --hash=sha256:93bfb2459195406a518e2f487a9bbf01df240175f31e06f5a252ac6734c7bbf0 \
+    --hash=sha256:9d4211f080920629a90c9e31c51e326fb70cfae38f18d4128b9913c23642bace \
+    --hash=sha256:a56491babf0d976625807953bd192dd9de973fccb3270e77b1a795b152a26175 \
+    --hash=sha256:c604dc2613c417130479cdd6e55c2faa691b6365aa82b3dafddfcecc2eaf1ac7 \
+    --hash=sha256:ed9b957abb12f6ffcd92d5db32fa3ffd4e4a8423d80ddd51b4efa63b42f6a76b \
+    --hash=sha256:f1a4a85b419f5cb6470dd4be5f766bc59532f11b9c22c076b58a0348f05dca5f \
+    --hash=sha256:f5c410f9e2ffc9286279a46f2e8c107edaf3b1123510af59c828a9c15b23c9db
+six==1.17.0 \
+    --hash=sha256:4721f391ed90541fddacab5acf947aa0d3dc7d27b2e1e8eda2be8970586c3274
+urllib3==2.8.0 \
+    --hash=sha256:0cf3cae568d36aa9576b28dfb35f11328f1cb974ca7647d9475ebb86c75ac6e3
+wsproto==1.3.2 \
+    --hash=sha256:61eea322cdf56e8cc904bd3ad7573359a242ba65688716b0710a5eb12beab584

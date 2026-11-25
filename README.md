@@ -55,15 +55,18 @@ make check
 CI uses the same command to restore locked dependencies, build and test the .NET
 solution in Release, check CDK linting, formatting, and types, run the CDK tests,
 and synthesize the CDK baseline and matrix offline. The lifecycle and integration
-tests start pinned MiniStack processes on loopback and require Python 3.11 or newer. To select a local
-interpreter, run `make check MINISTACK_PYTHON=python3.11`.
+tests start pinned MiniStack processes on loopback. Use standard CPython 3.11–3.14
+on x64 or arm64 macOS or Linux with compatible wheels. The lock covers macOS and
+Linux with glibc 2.17+ or musl 1.2+. Each run installs only hash-verified wheels
+from the complete lock in a temporary virtual environment. CI runs on Ubuntu x64.
+To select an interpreter, run `make check MINISTACK_PYTHON=python3.11`.
 
 The standalone `make check-integration` target also exercises the YAML emitter.
-Run `npm --prefix cdk ci` first to install its pinned dependencies.
+Run `npm --prefix cdk ci --engine-strict --ignore-scripts` first to install its pinned dependencies.
 
 ## Compile a configuration
 
-Run `npm --prefix cdk ci` to install the pinned compiler dependencies. Use
+Run `npm --prefix cdk ci --engine-strict --ignore-scripts` to install the pinned compiler dependencies. Use
 the EC2 reference configuration to emit a runtime artifact.
 
 ```sh

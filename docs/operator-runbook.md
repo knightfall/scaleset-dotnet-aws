@@ -19,7 +19,7 @@ archives, image SBOMs and provenance are generated.
 
 ```sh
 make check
-npm --prefix cdk ci
+npm --prefix cdk ci --engine-strict --ignore-scripts
 mkdir -p "$PWD/operator-staging"
 
 controller_project="$PWD/src/Knightfall.ScaleSet.Aws.Controller/Knightfall.ScaleSet.Aws.Controller.csproj"

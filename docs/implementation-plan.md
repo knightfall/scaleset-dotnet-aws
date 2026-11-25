@@ -401,7 +401,7 @@ and the [telemetry guide](operator-telemetry.md) for receiver probes.
 ```sh
 make check
 # Standalone integration path
-npm --prefix cdk ci
+npm --prefix cdk ci --engine-strict --ignore-scripts
 make check-integration
 ```
 

@@ -133,7 +133,7 @@ reads the new value. Keep values out of source, synthesized templates,
 commands and command history, logs, and runner environments. [ECS Secrets Manager injection](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/secrets-envvar-secrets-manager.html)
 
 Supply the same telemetry JSON to synth, diff, and the guarded deploy. For
-example, from the repository root after `npm --prefix cdk ci`:
+example, from the repository root after `npm --prefix cdk ci --engine-strict --ignore-scripts`:
 
 ```sh
 (
