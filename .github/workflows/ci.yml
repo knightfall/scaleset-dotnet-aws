@@ -10,7 +10,38 @@ permissions:
   contents: read
 
 jobs:
-  check:
+  dotnet:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-dotnet@0f4a354dd5547a28c70b7853dbd95d5b67886e73 # v6.1.0
+        with:
+          global-json-file: global.json
+      - run: make check-dotnet
+      - run: make check-lifecycle MINISTACK_TEST_OPTIONS='--output Detailed --show-stdout Failed --show-stderr Failed'
+
+  cdk:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version-file: .node-version
+          cache: npm
+          cache-dependency-path: cdk/package-lock.json
+      - name: Check documentation links and release verification
+        run: |
+          python3 scripts/check-doc-links.py
+          python3 -m unittest discover -s .github/release
+      - run: make check-cdk
+
+  integration:
     runs-on: ubuntu-24.04
     timeout-minutes: 25
     steps:
@@ -25,8 +56,20 @@ jobs:
           node-version-file: .node-version
           cache: npm
           cache-dependency-path: cdk/package-lock.json
-      - name: Check documentation links and release verification
+      - name: Install the locked YAML emitter dependencies
+        run: make restore-cdk
+      - run: make check-integration MINISTACK_TEST_OPTIONS='--output Detailed --show-stdout Failed --show-stderr Failed'
+
+  check:
+    needs: [dotnet, cdk, integration]
+    if: ${{ always() }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: Require successful verification in every stage
+        env:
+          STAGES: ${{ toJSON(needs) }}
         run: |
-          python3 scripts/check-doc-links.py
-          python3 -m unittest discover -s .github/release
-      - run: make check
+          jq -r 'to_entries[] | "\(.key): \(.value.result)"' <<< "$STAGES"
+          jq -e 'keys == ["cdk", "dotnet", "integration"] and all(.[]; .result == "success")' <<< "$STAGES" > /dev/null

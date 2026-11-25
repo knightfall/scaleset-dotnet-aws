@@ -52,17 +52,18 @@ the build checks from the repository root.
 make check
 ```
 
-CI uses the same command to restore locked dependencies, build and test the .NET
-solution in Release, check CDK linting, formatting, and types, run the CDK tests,
-and synthesize the CDK baseline and matrix offline. The lifecycle and integration
-tests start pinned MiniStack processes on loopback. Use standard CPython 3.11–3.14
-on x64 or arm64 macOS or Linux with compatible wheels. The lock covers macOS and
+Hosted CI runs the same Make targets in three parallel stages for .NET and lifecycle,
+CDK and release-helper verification, and integration. The required `check` status
+requires success from all three. Lifecycle and integration report per-case
+timings and start their own pinned MiniStack processes on loopback.
+Use standard CPython 3.11–3.14 on x64 or arm64 macOS or Linux with compatible
+wheels. The lock covers macOS and
 Linux with glibc 2.17+ or musl 1.2+. Each run installs only hash-verified wheels
 from the complete lock in a temporary virtual environment. CI runs on Ubuntu x64.
 To select an interpreter, run `make check MINISTACK_PYTHON=python3.11`.
 
 The standalone `make check-integration` target also exercises the YAML emitter.
-Run `npm --prefix cdk ci --engine-strict --ignore-scripts` first to install its pinned dependencies.
+Run `make restore-cdk` first to install its pinned dependencies.
 
 ## Compile a configuration
 
