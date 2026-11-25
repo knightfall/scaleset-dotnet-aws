@@ -56,7 +56,9 @@ flowchart LR
     ECS --> Tasks["Standalone Fargate runner tasks"]
     Instances --> Bootstrap["Knightfall.ScaleSet.Aws.RunnerBootstrap"]
     Tasks --> Bootstrap
-    Bootstrap <-->|"Item-scoped hello and consume"| Table
+    Bootstrap -->|"Authenticated HELLO"| Broker["HELLO broker"]
+    Broker --> Table
+    Bootstrap <-->|"Item-scoped offer consumption"| Table
     Bootstrap -->|"Ephemeral runner, one job"| GitHub
     Instances --> Events["EventBridge and SQS"]
     Tasks --> Events
@@ -77,8 +79,8 @@ The solution enforces compile-time boundaries across `Knightfall.ScaleSet.Aws.sl
 | Profile purpose | Supported execution and routing |
 | --- | --- |
 | `copilot-cloud-agent` | Dedicated runner group and scale set with a unique selector. Start with Ubuntu x64 on Direct EC2, restricted to approved repositories. Any OS/firewall expansion requires its own pinned Launch Template/AMI and operator validation on the target repository/runner group. Use only for Copilot cloud agent. [Cloud agent runner configuration](https://docs.github.com/en/copilot/how-tos/administer-copilot/manage-for-organization/configure-runner-for-coding-agent) |
-| `fargate-compatible` | One standalone Fargate task per Linux x64 or arm64 runner. Workflows must run without a Docker daemon, Docker container actions, job/service containers, or privileged operations; route those via group and label policy. |
-| `ec2-general` | Separate Direct EC2 profiles and Launch Templates for Linux x64, Linux arm64, or Windows x64 workloads (including Docker/service-container workflows on Linux). Keep workload privileges inside the one-job instance boundary. |
+| `fargate-compatible` | One standalone Fargate task per Linux x64 or arm64 runner. Workflows must run without a Docker daemon, Docker container actions, job/service containers, or privileged operations. |
+| `ec2-general` | Separate Direct EC2 profiles and Launch Templates for Linux x64 or arm64 workloads. Docker and service-container workflows require a qualified rootless Docker daemon and approved networking and container modes. Windows x64 can be expressed in the configuration but is outside the shipped bootstrap and qualification boundary. Keep workload privileges inside the one-job instance boundary. |
 
 ## 3. Configuration contract
 
