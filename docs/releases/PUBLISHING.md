@@ -33,11 +33,29 @@ own ECR registry when importing an archive. [GitHub artifact attestations](https
   attestation verification, and publication use the job's `GITHUB_TOKEN`.
 
 Before creating the tag, qualify the **exact token** intended for production.
-Run the read-only check in Bash from the reviewed checkout when provisioning
-the token, before storing it as the environment secret. The check uses the same
-ruleset predicate as the protected job for main, tag immutability and tag
-creation. Save only the pass or fail result. The protected job independently
-checks the current rulesets again before publishing.
+To check the stored token, dispatch **Check production release settings** on the
+selected `main` commit. A production reviewer approves the read-only job. It
+uses the existing environment secret and reports only a sanitized result. It
+requires the same ruleset predicate as publication for `main`, tag immutability
+and tag creation. The workflow rejects a repository or organization secret
+with the same name before requesting approval. [GitHub Actions secrets](https://docs.github.com/en/actions/reference/security/secrets)
+
+```sh
+repo=knightfall/scaleset-dotnet-aws
+gh secret list --repo "$repo" --env production
+gh workflow run release-settings.yml --repo "$repo" --ref main
+```
+
+Record the run and attempt for the selected commit after **Check the stored
+production credential before tagging** succeeds. Immediately before tagging,
+check that `RELEASE_SETTINGS_READ_TOKEN` is still present as a `production`
+environment secret and its update time predates that job's start. Repeat the
+check if the secret or the selected commit changes. The protected publish job
+independently checks the current rulesets again after its own approval.
+
+When provisioning a token, you can also run the same check in Bash from the
+reviewed checkout before storing that exact token as the environment secret.
+Save only the pass or fail result.
 
 ```bash
 read -r -s -p 'Release settings token: ' release_settings_token
