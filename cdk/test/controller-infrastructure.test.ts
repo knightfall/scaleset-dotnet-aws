@@ -144,6 +144,69 @@ test("active service waits for its HELLO brokers and runner invocation policies"
   }
 });
 
+test("HELLO reservations add enabled capacity by role, cap it, and stay disabled in dry-run", () => {
+  const config = fixture("mixed-ec2-fargate");
+  const spec = config.runtime.spec;
+  const profiles = spec.profiles.map((profile) =>
+    profile.provisioner.type === "fargate"
+      ? {
+          ...profile,
+          state:
+            profile.id === "linux-ci-arm"
+              ? ("draining" as const)
+              : profile.state,
+          capacity: { ...profile.capacity, maxRunners: 6 },
+          provisioner: {
+            ...profile.provisioner,
+            bootstrapRoleArn:
+              "arn:aws:iam::111122223333:role/fargate-shell-bootstrap",
+          },
+        }
+      : profile,
+  );
+
+  function brokers(mode: "active" | "dry-run") {
+    const resources = synthesize(
+      rewrite(config, { ...spec, profiles, mode }),
+    ).findResources("AWS::Lambda::Function");
+    return Object.entries(resources).filter(([id]) =>
+      id.includes("HelloBroker"),
+    );
+  }
+  const active = brokers("active");
+  const dryRun = brokers("dry-run");
+  assert.deepEqual(
+    active.map(([id]) => id),
+    dryRun.map(([id]) => id),
+  );
+  assert.deepEqual(
+    Object.fromEntries(
+      active.map(([, { Properties }]) => [
+        Properties.Environment.Variables.BOOTSTRAP_ROLE_NAME,
+        Properties.ReservedConcurrentExecutions,
+      ]),
+    ),
+    {
+      "runner-linux-bootstrap": 12,
+      "runner-arm64-bootstrap": 16,
+      "fargate-shell-bootstrap": 12,
+    },
+  );
+  for (const [, { Properties }] of dryRun) {
+    assert.equal(Properties.ReservedConcurrentExecutions, 0);
+    assert.equal(Properties.Environment.Variables.HELLO_ENABLED, "false");
+  }
+  synthesize(config).hasResourceProperties("AWS::Lambda::Function", {
+    ReservedConcurrentExecutions: 16,
+    Environment: {
+      Variables: Match.objectLike({
+        BOOTSTRAP_ROLE_NAME: "fargate-shell-bootstrap",
+        HELLO_ENABLED: "true",
+      }),
+    },
+  });
+});
+
 test("explicit Fargate preflight changes only the controller task definition environment", () => {
   const config = fixture("mixed-ec2-fargate");
   const raw = JSON.stringify(

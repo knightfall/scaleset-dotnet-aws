@@ -51,6 +51,8 @@ import {
 import type { RunnerCluster } from "./runner-iam.ts";
 import { RuntimeArtifact } from "./runtime-artifact.ts";
 
+const maximumHelloConcurrencyPerRole = 16;
+
 export interface ControllerInfrastructureProps extends ControllerDeploymentEnvironment {
   readonly compiled: ReturnType<typeof compileConfig>;
   readonly generation: string;
@@ -315,15 +317,26 @@ export class ControllerInfrastructure extends Stack {
     active: boolean,
   ) {
     const dependencies: Construct[] = [];
-    const roleArns = [
-      ...new Set(
-        profiles.map(({ provisioner }) => provisioner.bootstrapRoleArn),
-      ),
-    ].sort();
-    for (const arn of roleArns) {
+    const concurrencyByRole = new Map<string, number>();
+    for (const { capacity, provisioner } of profiles) {
+      const arn = provisioner.bootstrapRoleArn;
+      const configured =
+        (concurrencyByRole.get(arn) ?? 0) + capacity.maxRunners;
+      concurrencyByRole.set(
+        arn,
+        active ? Math.min(configured, maximumHelloConcurrencyPerRole) : 0,
+      );
+    }
+    for (const arn of [...concurrencyByRole.keys()].sort()) {
       const id = stableId("Bootstrap", arn);
       const role = iam.Role.fromRoleArn(this, id, arn);
-      const ingress = helloIngress(this, id, this.trackingTable, role, active);
+      const ingress = helloIngress(
+        this,
+        id,
+        this.trackingTable,
+        role,
+        concurrencyByRole.get(arn)!,
+      );
       if (active) {
         const policy = new iam.Policy(this, `${id}Policy`, {
           roles: [role],

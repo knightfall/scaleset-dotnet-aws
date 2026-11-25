@@ -10,9 +10,10 @@ export function helloIngress(
   id: string,
   table: ITable,
   bootstrapRole: iam.IRole,
-  active: boolean,
+  reservedConcurrency: number,
 ) {
   const stack = Stack.of(scope);
+  const active = reservedConcurrency > 0;
   const broker = new lambda.Function(scope, `${id}HelloBroker`, {
     runtime: lambda.Runtime.NODEJS_24_X,
     architecture: lambda.Architecture.ARM_64,
@@ -21,7 +22,7 @@ export function helloIngress(
       readFileSync(new URL("hello-ingress.cjs", import.meta.url), "utf8"),
     ),
     timeout: Duration.seconds(5),
-    reservedConcurrentExecutions: active ? 4 : 0,
+    reservedConcurrentExecutions: reservedConcurrency,
     environment: {
       BOOTSTRAP_ACCOUNT: stack.account,
       BOOTSTRAP_PARTITION: stack.partition,

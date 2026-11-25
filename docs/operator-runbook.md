@@ -150,12 +150,24 @@ The controller stack reports a `Bootstrap…HelloUrl` output for each enabled
 bootstrap role. The output description identifies the matching role ARN. A
 dry-run deployment provides stable URLs with the brokers disabled. The active
 stack grants each role its own AWS IAM Function URL invocation and
-principal-scoped OFFER consumption. Each role has four concurrent broker
-invocations. Profiles sharing a role also share its invocation budget.
+principal-scoped OFFER consumption. Each broker reserves the sum of `maxRunners`
+across its role's active and draining profiles in the stack, capped at 16 concurrent invocations.
+Profiles sharing a role also share that reservation. Disabled profiles contribute
+zero and dry-run brokers reserve zero.
 Active runner deployment requires a commercial AWS Region with Function URLs.
 GovCloud and China configurations remain available for dry-run without the broker.
 Runner subnets need an approved outbound Internet route for HTTPS to the role's exact endpoint.
 [Function URL regional availability and networking](https://docs.aws.amazon.com/lambda/latest/dg/urls-configuration.html) · [GovCloud service differences](https://docs.aws.amazon.com/govcloud-us/latest/UserGuide/govcloud-lambda.html) · [China service differences](https://docs.amazonaws.cn/en_us/aws/latest/userguide/lambda.html)
+
+Before applying an active generation, compare the sum of its broker reservations
+and existing reserved concurrency with the account's Lambda concurrency quota
+in that Region. Lambda keeps at least 100 units unreserved. A rejected reservation
+blocks the stack update. Reservations cap simultaneous invocations and AWS also
+enforces synchronous request-rate quotas. Use Lambda `ConcurrentExecutions`,
+`Throttles`, `Invocations`, and `Duration` to qualify the expected startup
+burst and check its downstream DynamoDB load. Local fixtures exercise throttling,
+lost responses, and conditional writes. Target throughput, cold starts, and
+account-specific quotas require live qualification. [Lambda reserved concurrency](https://docs.aws.amazon.com/lambda/latest/dg/configuration-concurrency.html) · [Lambda invocation limits](https://docs.aws.amazon.com/lambda/latest/dg/lambda-concurrency.html)
 
 The broker takes the principal from AWS authentication, validates up to 1 KiB
 of HELLO input, and conditionally creates one canonical `HELLO#BROKER#` item
@@ -165,6 +177,15 @@ The broker sets a one-hour TTL. Exact retries keep the same item and expiry.
 The controller rejects expired registrations immediately, and DynamoDB removes
 the physical record asynchronously. The active bootstrap role denies direct
 HELLO changes on the lifecycle table. [Lambda Function URL authentication](https://docs.aws.amazon.com/lambda/latest/dg/urls-auth.html) · [DynamoDB TTL](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/TTL.html)
+
+On throttling, transient HTTP failures, or a lost reply, bootstrap re-signs the
+request with the original HELLO body. Delay starts at 125–250 ms and grows to a jittered 2–4 s.
+The client allows up to seven sends in a single 25-second registration budget.
+Permanent rejections stop immediately. An exhausted budget leaves the registration
+unconfirmed and the runner stops before reading an OFFER. EC2 retains its spent
+marker through failure and restart. If bursts exceed the qualified budget,
+reduce the simultaneous startup demand and recover failed allocations through
+the existing retirement procedure.
 
 1. For a deployment using direct HELLO writes, use the previous release to [drain and retire every granted profile](#add-drain-and-retire-a-profile). Settle staged or executing JIT operations, issued offers, and running jobs while their original grants remain. Old runners can finish consuming already issued offers during this phase. Keep the old generation through confirmed session retirement and durable catalog tombstones for all prior profiles. This is required because switching to dry-run removes their grants.
 2. Prepare a higher dry-run generation with fresh profile IDs for the new broker-backed bindings. Run `preflight retire` against the exact deployed runtime and confirm it authorizes the grant removal. Fence the old controller and use the protected deployment path for the dry-run generation. Revoke any remaining direct HELLO writers, including out-of-band role grants, and verify denial before continuing. Preserve the table and the lease, catalog, executor, effect and handoff records. The controller ignores any retained HELLO from the old partition namespace, even if it contains the broker's issuer field. Remove obsolete legacy rows with the operator recovery identity after accounting for all pre-cutover handoffs.

@@ -137,6 +137,7 @@ if (File.ReadAllText(onDiskMarker) != "v1\n" || File.GetUnixFileMode(onDiskMarke
 {
     throw new InvalidOperationException("The persistent spent marker was not private and nonsecret.");
 }
+await Ec2HelloLinuxCheck.VerifySpentMarkerAsync(privateState, new LinuxOneJobRunner(boundary), cancel.Token);
 
 using var key = JitRecipientKey.Create();
 var identity = new JitHandoffIdentity("fixture", "test", "github.com/test/test", 12, Guid.NewGuid(), instanceArn, Guid.NewGuid(),
@@ -224,7 +225,7 @@ finally
     }
 }
 
-Console.WriteLine("EC2 Linux launch, namespace teardown, and credential cleanup smoke passed.");
+Console.WriteLine("EC2 Linux launch, namespace teardown, credential cleanup and HELLO spent-marker smoke passed.");
 return 0;
 
 void SetMode(string mode)
