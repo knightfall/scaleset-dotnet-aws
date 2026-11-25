@@ -80,6 +80,27 @@ Structured controller logs report `predecessor_capture_verified` with the first
 16 hexadecimal characters of SHA-256 over the canonical lowercase EventBridge
 event ID. Match that reference against the independently retained event record.
 
+Each lookup reads up to six pages in two seconds. The controller keeps a fixed
+query window for each exact predecessor and resumes after its last validated
+page, including when CloudWatch returns an empty page with a continuation.
+The retrieval range includes the whole lower-bound second. The native ECS
+`stoppedAt` value must still reach the exact acquisition and qualification
+times. A scan must finish pagination and agree on one terminal event. Identical
+delivery duplicates are allowed. Scan state is local to the controller and
+can keep progressing while CloudWatch accepts the continuation and the exact
+predecessor and qualification remain current. An invalid continuation, an
+immediately repeated token, or a detected cycle in a stable token sequence
+holds recovery until a fresh scan completes. Pagination keeps a fixed number
+of cursor references regardless of the number of pages.
+
+When successive recovery steps reuse a completed multi-lookup scan, the
+controller rereads the witness and final pages with current Logs access. It
+starts a fresh scan after five minutes without a successful completion or
+recheck. A late delivery into an earlier page can remain unseen until a new
+full scan.
+Continuous exclusive write isolation remains part of the capture qualification.
+[CloudWatch Logs pagination](https://docs.aws.amazon.com/AmazonCloudWatchLogs/latest/APIReference/API_FilterLogEvents.html)
+
 Alpha.1 rows lack the acquisition-time binding needed for archived evidence;
 they still recover through direct ECS `STOPPED` or clean release. Enable the
 capture before the generations that will rely on it. For a legacy or uncaptured

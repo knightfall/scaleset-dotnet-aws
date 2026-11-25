@@ -58,7 +58,7 @@ internal sealed class MixedControllerCloud : IAsyncDisposable
     private byte[]? _quotaSample;
     private int _degradeEc2;
     private ExpiredTask? _expiredTask;
-    private string? _capturedStop;
+    private CapturedStop? _capturedStop;
 
     private MixedControllerCloud(WebApplication app, Uri nativeEndpoint)
     {
@@ -88,17 +88,19 @@ internal sealed class MixedControllerCloud : IAsyncDisposable
     internal void PublishCapturedStop(DateTimeOffset taskAcquiredAt)
     {
         var task = Volatile.Read(ref _expiredTask) ?? throw new InvalidOperationException("No expired task was selected.");
-        var now = TimeProvider.System.GetUtcNow();
-        Volatile.Write(ref _capturedStop, JsonSerializer.Serialize(new Dictionary<string, object>
+        var stoppedAt = taskAcquiredAt.AddTicks(1);
+        var envelopeTime = DateTimeOffset.FromUnixTimeSeconds(stoppedAt.ToUnixTimeSeconds());
+        string message = JsonSerializer.Serialize(new Dictionary<string, object>
         {
             ["version"] = "0", ["id"] = Guid.NewGuid(), ["source"] = "aws.ecs", ["detail-type"] = "ECS Task State Change",
-            ["account"] = Account, ["region"] = Region, ["resources"] = new[] { task.TaskArn }, ["time"] = now.UtcDateTime,
+            ["account"] = Account, ["region"] = Region, ["resources"] = new[] { task.TaskArn }, ["time"] = envelopeTime.UtcDateTime,
             ["detail"] = new
             {
                 clusterArn = task.ClusterArn, taskArn = task.TaskArn, lastStatus = "STOPPED", desiredStatus = "STOPPED",
-                launchType = "FARGATE", version = 12, createdAt = taskAcquiredAt.UtcDateTime.AddSeconds(-1), stoppedAt = now.UtcDateTime,
+                launchType = "FARGATE", version = 12, createdAt = taskAcquiredAt.UtcDateTime.AddSeconds(-1), stoppedAt = stoppedAt.UtcDateTime,
             },
-        }));
+        });
+        Volatile.Write(ref _capturedStop, new CapturedStop(message, envelopeTime.ToUnixTimeMilliseconds()));
     }
 
     internal static async Task<MixedControllerCloud> StartAsync(CancellationToken token)
@@ -328,12 +330,21 @@ internal sealed class MixedControllerCloud : IAsyncDisposable
             context.Response.StatusCode = StatusCodes.Status403Forbidden;
             return;
         }
-        if (Volatile.Read(ref _capturedStop) is not { } message)
+        if (Volatile.Read(ref _capturedStop) is not { } stop ||
+            stop.Timestamp < request.GetProperty("startTime").GetInt64() || stop.Timestamp > request.GetProperty("endTime").GetInt64())
         {
             await context.Response.WriteAsJsonAsync(new { events = Array.Empty<object>() }, token);
             return;
         }
-        await context.Response.WriteAsJsonAsync(new { events = new[] { new { message } } }, token);
+
+        int page = request.TryGetProperty("nextToken", out var next) ? int.Parse(next.GetString()!, CultureInfo.InvariantCulture) : 0;
+        var events = page >= 7 ? new[] { new { message = stop.Message, timestamp = stop.Timestamp } } : [];
+        if (page < 8)
+        {
+            await context.Response.WriteAsJsonAsync(new { events, nextToken = (page + 1).ToString(CultureInfo.InvariantCulture) }, token);
+            return;
+        }
+        await context.Response.WriteAsJsonAsync(new { events }, token);
     }
 
     private static async Task<HeldEc2Launch> ReadLaunchReceiptAsync(NameValueCollection query, HttpResponseMessage response,
@@ -353,6 +364,7 @@ internal sealed class MixedControllerCloud : IAsyncDisposable
     private static string ShortId(string taskArn) => taskArn[(taskArn.LastIndexOf('/') + 1)..];
 
     private sealed record ExpiredTask(string ClusterArn, string TaskArn);
+    private sealed record CapturedStop(string Message, long Timestamp);
 
     public async ValueTask DisposeAsync()
     {
