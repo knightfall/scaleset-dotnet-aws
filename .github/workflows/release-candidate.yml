@@ -9,8 +9,13 @@ on:
       - '.github/workflows/release.yml'
       - 'Directory.Build.*'
       - 'Directory.Packages.props'
+      - '.editorconfig'
       - 'global.json'
-      - 'src/Knightfall.ScaleSet.Aws.Controller/*.csproj'
+      - 'NuGet.Config'
+      - 'src/**'
+      - 'cdk/config/schema/**'
+      - 'testdata/config/**'
+      - 'tests/Knightfall.ScaleSet.Aws.Core.Tests/**'
       - 'tests/oci/**'
   push:
     branches: [main]
@@ -37,14 +42,28 @@ jobs:
     env:
       RID: ${{ matrix.rid }}
       BUILD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+      BUILD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
       DOCKER_ENGINE_VERSION: '29.10.0'
       DOTNET_CLI_TELEMETRY_OPTOUT: '1'
       TESTINGPLATFORM_TELEMETRY_OPTOUT: '1'
     steps:
+      - name: Require an exact source for pull requests
+        if: github.event_name == 'pull_request'
+        env:
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
+        run: |
+          test -n "$PR_HEAD_SHA"
+          test "$BUILD_SHA" = "$PR_HEAD_SHA"
+          test -n "$PR_HEAD_REPOSITORY"
+          test "$BUILD_REPOSITORY" = "$PR_HEAD_REPOSITORY"
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          repository: ${{ env.BUILD_REPOSITORY }}
           ref: ${{ env.BUILD_SHA }}
           persist-credentials: false
+      - name: Verify the checked-out source commit
+        run: test "$(git rev-parse HEAD)" = "$BUILD_SHA"
       - uses: actions/setup-dotnet@0f4a354dd5547a28c70b7853dbd95d5b67886e73 # v6.1.0
         with:
           global-json-file: global.json

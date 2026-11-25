@@ -1,8 +1,9 @@
 import { readFileSync } from "node:fs";
-import { CfnOutput, Duration, Stack } from "aws-cdk-lib";
+import { CfnOutput, Duration, RemovalPolicy, Stack } from "aws-cdk-lib";
 import type { ITable } from "aws-cdk-lib/aws-dynamodb";
 import * as iam from "aws-cdk-lib/aws-iam";
 import * as lambda from "aws-cdk-lib/aws-lambda";
+import * as logs from "aws-cdk-lib/aws-logs";
 import type { Construct } from "constructs";
 import { trackingTableDecrypt } from "./imported-encryption.ts";
 
@@ -24,6 +25,10 @@ export function helloIngress(
       readFileSync(new URL("hello-ingress.cjs", import.meta.url), "utf8"),
     ),
     timeout: Duration.seconds(5),
+    logGroup: new logs.LogGroup(scope, `${id}HelloLogs`, {
+      retention: logs.RetentionDays.ONE_MONTH,
+      removalPolicy: RemovalPolicy.RETAIN,
+    }),
     reservedConcurrentExecutions: reservedConcurrency,
     environment: {
       BOOTSTRAP_ACCOUNT: stack.account,

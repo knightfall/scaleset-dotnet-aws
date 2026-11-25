@@ -3,7 +3,7 @@ import { mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { Template } from "aws-cdk-lib/assertions";
+import { Match, Template } from "aws-cdk-lib/assertions";
 import { compileConfig } from "../../lib/config/compiler.ts";
 import type {
   Ec2Provisioner,
@@ -949,7 +949,9 @@ function verifyExecutionRole(
       scope([`arn:aws:ecr:${region}:${account}:repository/${repository}`]),
     );
   }
-  const group = template.getResourceId("AWS::Logs::LogGroup");
+  const group = template.getResourceId("AWS::Logs::LogGroup", {
+    Properties: { LogGroupName: Match.stringLikeRegexp("^/ecs/") },
+  });
   for (const action of logging) {
     verifyGrants(statements, action, scope([{ "Fn::GetAtt": [group, "Arn"] }]));
   }

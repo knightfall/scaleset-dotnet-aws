@@ -178,7 +178,7 @@ public sealed class FargateTaskEventConsumerTests
     }
 
     [Fact]
-    public async Task OutOfScopeOrMalformedHintsAreDiscardedWithoutAwsTaskReads()
+    public async Task MalformedEnvelopesRemainForRedriveWhileValidIrrelevantHintsAreAcknowledged()
     {
         var token = TestContext.Current.CancellationToken;
         using var aws = new FargateInspectionFixture
@@ -190,11 +190,17 @@ public sealed class FargateTaskEventConsumerTests
         using var sqs = aws.CreateSqs();
         using var consumer = new FargateTaskEventConsumer(sqs, aws.Inspector, await ConfigurationAsync(token), QueueUrl);
 
-        await consumer.PollAsync(static (_, _, _) => throw new InvalidOperationException("Unscoped hint supplied evidence."), token);
+        int authorizations = 0;
+        await consumer.PollAsync(static (_, _, _) => throw new InvalidOperationException("Unscoped hint supplied evidence."), _ =>
+        {
+            authorizations++;
+            return Task.FromResult(true);
+        }, token);
 
         Assert.DoesNotContain(aws.Requests, request => Operation(request) == "DescribeTasks");
-        string[] receipts = ["foreign-account", "bad-json", "foreign-definition", "foreign-cluster"];
+        string[] receipts = ["foreign-definition", "foreign-cluster"];
         Assert.Equal(receipts, Acknowledgments(aws));
+        Assert.Equal(receipts.Length, authorizations);
     }
 
     private static string Event(int version, string status, string account = Account, string cluster = Cluster,

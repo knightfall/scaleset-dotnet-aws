@@ -110,6 +110,8 @@ Verify the CDK bootstrap resources are approved in the target account and Region
 
 ## Preflight and apply
 
+Start with offline verification and the local emulated matrix. If a separate AWS test deployment is authorized, select `spec.mode: dry-run` for the first apply. Leave `inspectAws` off for the offline planner behavior. Turn AWS inspection on only for an approved target with `dryRun.demand.type: none`. The dry-run task has no GitHub listener, lifecycle table or event consumer grants. Active and draining profiles may still perform lifecycle work when deployed in `spec.mode: active`. Set that mode in the reviewed YAML only after approving the target evidence. The deploy command takes the YAML and a monotonically increasing generation. [Deployment modes and inventory](controller-local.md) · [Target qualification gates](emulator-boundaries.md) · [Role separation](profile-bindings.md#secrets-and-role-separation) · [Imported encryption](profile-bindings.md#qualify-imported-encryption-keys)
+
 Run `preflight table` with the operator's read-only AWS identity against the exact candidate runtime and digest. It validates the account, active table, `PK` and `SK`, the `due` index, encryption, enabled `expiresAt` TTL, and PITR. An imported table must pass before activation. If the stack creates the table or host cluster, provision the initial stack in dry-run mode, wait for these resources to be ready, then run both checks before deploying an active generation.
 
 ```sh
@@ -117,14 +119,13 @@ dotnet run --project "$controller_project" --configuration Release --no-build --
   preflight table --config "$runtime_json" --sha256 "$runtime_sha"
 ```
 
-Run `preflight clock` inside an approved one-off Fargate diagnostic task on the intended controller cluster and platform. Provide the exact JSON as a local read-only file in that task, for example by copying the JSON into a diagnostic image derived from the candidate digest. Preserve the non-root user, private subnet and security groups, and read-only root. Configure the one-off task to run the following command in place of the controller command. The real Fargate metadata endpoint supplies the task, cluster, synchronization status, and error bound. Record the exit code and task ARN and confirm the reference timestamp remains fresh across the qualification window. [Fargate task metadata](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/task-metadata-endpoint-v4-fargate.html) · [Fargate metadata fields](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/task-metadata-endpoint-v4-fargate-response.html)
+Run `preflight clock` inside an approved one-off Fargate diagnostic task on the intended controller cluster and platform. Provide the exact JSON as a local read-only file in that task, for example by copying the JSON into a diagnostic image derived from the candidate digest. Preserve the non-root user, private subnet and security groups, and read-only root. Keep the image entrypoint `dotnet /app/Knightfall.ScaleSet.Aws.Controller.dll` and set only the following ECS `command` array. The Fargate metadata endpoint supplies the task, cluster, synchronization status, and error bound. Record the exit code and task ARN and confirm the reference timestamp remains fresh across the qualification window. [ECS task command and entrypoint](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/task_definition_parameters.html) · [Fargate metadata fields](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/task-metadata-endpoint-v4-fargate-response.html)
 
-```sh
-dotnet /app/Knightfall.ScaleSet.Aws.Controller.dll preflight clock \
-  --config /operator/runtime.json --sha256 "<verified-runtime-sha256>"
+```json
+["preflight", "clock", "--config", "/operator/runtime.json", "--sha256", "<verified-runtime-sha256>"]
 ```
 
-Both preflights should exit zero. A failed or unverified result holds activation. Apply through the protected deployment entry point after reviewing the exact candidate. For an existing stack, it reads the prior version and digest from CloudFormation, verifies the deployment scope, checks retirement before preparing a change set and again before executing it, and waits for CloudFormation to complete. A dry-run first apply and the subsequent active apply use separate increasing generations.
+Both preflights should exit zero. A failed or unverified result holds activation. Native image jobs check that the command reaches the packaged clock preflight and fails closed without ECS metadata. Record the live one-off task result separately. Run `preflight table` and `preflight clock` as operator checks before calling the deploy wrapper. For an existing stack, the wrapper reads the prior version and digest from CloudFormation, verifies deployment scope, checks retirement before preparing a change set and again before executing it, and waits for CloudFormation to complete. An initial dry-run apply and the subsequent active apply use separate increasing generations. [Retirement checks](#add-drain-and-retire-a-profile) · [Predecessor fencing](#roll-back-or-recover-a-controller)
 
 ```sh
 npm --prefix cdk run deploy:controller -- \
@@ -138,9 +139,13 @@ npm --prefix cdk run deploy:controller -- \
 3. Run the receiver smoke check from the intended network, then confirm queryable metrics, traces, and logs for the new `service.instance.id`. Confirm that enabled profiles have fresh readiness and that the resource and profile attributes match the artifact. Investigate zero readiness or absent data with the [telemetry playbook](operator-telemetry.md).
 4. Record activation time, exact owner task ARN and lease epoch, runtime version and generation, task definition ARN, image digest, and the qualification evidence for each profile. Retain the previous compatible YAML, runtime, image digest, and assembly.
 
+The stack does not provision CloudWatch alarms. Configure and qualify operator-owned alerts for controller authority and readiness, queue age and DLQ depth, and broker errors and throttling. The ECS controller log group, runtime-artifact Lambda log group, and role-specific HELLO broker log groups retain entries for 30 days and survive stack removal according to CloudFormation retention. Log groups created implicitly by a prior version can retain their old settings. Review their retention separately. [Operator telemetry alert guidance](operator-telemetry.md)
+
 ### Qualify encrypted observation delivery
 
 For each enabled backend, record the exact EventBridge rules, primary and dead-letter queues, and their shared KMS key. Each queue permits `sqs:SendMessage` from EventBridge only for its controller rules. The provider key permits the EventBridge encryption actions for the deploying account. The controller consumes the primary queue. The same dead-letter queue handles EventBridge delivery failures and SQS redrive after the configured receive limit. [EventBridge queue policy](https://docs.aws.amazon.com/eventbridge/latest/userguide/eb-use-resource-based.html#sqs-permissions) · [EventBridge dead-letter policy](https://docs.aws.amazon.com/eventbridge/latest/userguide/eb-rule-dlq.html) · [SQS key management](https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/sqs-key-management.html)
+
+Both consumers leave malformed envelopes and account or Region mismatches unacknowledged. SQS applies the source queue's receive limit of five and the DLQ retains messages for 14 days. The controller does not make a provider read or a lifecycle decision from a malformed envelope. A well-formed Fargate hint outside the configured cluster or task-definition bindings may be acknowledged as irrelevant, subject to the current lease. For matching resources, incomplete readback or unresolved durable writes leave the delivery for retry. Successful readback and current authority permit deleting the exact receipt. Inspect DLQ metadata while keeping message bodies out of logs and support posts. [SQS redrive and retention](https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/sqs-dead-letter-queues.html)
 
 In an authorized qualification stack, observe a matching EC2 or ECS state change arrive on the encrypted primary queue and reach the controller. Use a controlled target-delivery failure to verify EventBridge can write the encrypted dead-letter queue. Exercise SQS receive-limit redrive separately and confirm the operator can read the retained messages. Record the regional delivery result, including any key or queue access errors. Offline CDK synthesis verifies policy scope and routing. Actual service context and cross-account behavior require target evidence.
 
@@ -170,10 +175,12 @@ lost responses, and conditional writes. Target throughput, cold starts, and
 account-specific quotas require live qualification. [Lambda reserved concurrency](https://docs.aws.amazon.com/lambda/latest/dg/configuration-concurrency.html) · [Lambda invocation limits](https://docs.aws.amazon.com/lambda/latest/dg/lambda-concurrency.html)
 
 The broker takes the principal from AWS authentication, validates up to 1 KiB
-of HELLO input, and conditionally creates one canonical `HELLO#BROKER#` item
-per principal. JIT staging and begin require that exact broker record. Legacy
+of HELLO input, and conditionally creates one item at
+`PK=HELLO#BROKER#<aws:userid>` and `SK=BOOTSTRAP` per principal.
+JIT staging and begin require that exact broker record. Legacy
 runner grants cannot address the broker's partition namespace.
-The broker sets a one-hour TTL. Exact retries keep the same item and expiry.
+The broker sets `expiresAt` one hour after registration. Exact retries keep the
+same item and expiry.
 The controller rejects expired registrations immediately, and DynamoDB removes
 the physical record asynchronously. The active bootstrap role denies direct
 HELLO changes on the lifecycle table. [Lambda Function URL authentication](https://docs.aws.amazon.com/lambda/latest/dg/urls-auth.html) · [DynamoDB TTL](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/TTL.html)

@@ -486,6 +486,41 @@ test("Fargate preflight rejects invalid or oversized JSON without reflecting inp
   }
 });
 
+test("observation queues redrive and controller-stack logs have bounded retention", () => {
+  const config = fixture("mixed-ec2-fargate");
+  const template = synthesize(config);
+  template.resourceCountIs("AWS::CloudWatch::Alarm", 0);
+  const groups = template.findResources("AWS::Logs::LogGroup");
+  const functionResources = template.findResources("AWS::Lambda::Function");
+  const usedByLambda = new Set<string>();
+  for (const resource of Object.values(functionResources)) {
+    const id = resource.Properties.LoggingConfig?.LogGroup?.Ref as
+      string | undefined;
+    assert.ok(
+      id && groups[id],
+      "Each controller-managed Lambda uses a managed log group.",
+    );
+    usedByLambda.add(id);
+    assert.equal(groups[id].Properties.RetentionInDays, 30);
+    assert.equal(groups[id].DeletionPolicy, "Retain");
+  }
+  assert.ok([...usedByLambda].some((id) => id.startsWith("RuntimeConfigLogs")));
+  assert.ok([...usedByLambda].some((id) => /^Bootstrap.*HelloLogs/u.test(id)));
+  const queues = Object.entries(template.findResources("AWS::SQS::Queue"));
+  for (const id of ["Ec2", "Fargate"]) {
+    const source = queues.find(([name]) => name.startsWith(`${id}EventQueue`));
+    const dlq = queues.find(([name]) =>
+      name.startsWith(`${id}EventDeadLetters`),
+    );
+    assert.ok(source && dlq);
+    assert.deepEqual(source[1].Properties.RedrivePolicy, {
+      maxReceiveCount: 5,
+      deadLetterTargetArn: { "Fn::GetAtt": [dlq[0], "Arn"] },
+    });
+    assert.equal(dlq[1].Properties.MessageRetentionPeriod, 14 * 24 * 60 * 60);
+  }
+});
+
 test("the versioned artifact and retained tracking table match the runtime contract", () => {
   const config = fixture("mixed-ec2-fargate");
   const template = synthesize(config);

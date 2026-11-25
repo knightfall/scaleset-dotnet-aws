@@ -98,10 +98,7 @@ public sealed class FargateTaskEventConsumer : IDisposable
             {
                 using var invalid = FargateDiagnostics.Start("sqs_process", null, cancellationToken);
                 invalid?.Complete("rejected", "invalid_event");
-                if (!await AcknowledgeAsync(message, authorizeAcknowledgement, null, cancellationToken).ConfigureAwait(false))
-                {
-                    return;
-                }
+                // Leave malformed envelopes for source-queue redrive, as on the EC2 observation path.
             }
         }
 

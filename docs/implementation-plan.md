@@ -88,7 +88,7 @@ Keep canonical authored YAML under `cdk/config/*.yaml`, validated against versio
 | --- | --- |
 | `apiVersion`, `kind`, `metadata.name` | Require `scaleset-aws/v1alpha1`, `RunnerController`, and a stable environment name (identity includes account, Region, and name). |
 | `spec.aws` | Require account ID and Region. Named network entries in `spec.networks` supply existing `vpcId`, `subnets[]` (`id`, `az`), and `securityGroupIds`. |
-| `spec.mode`, `spec.dryRun` | `mode` defaults to `dry-run`. `active` requires an explicit deploy flag and active IAM grants. `dryRun.demand` defaults to `none`, or selects a local file or versioned S3 snapshot with SHA-256 digest. `dryRun.inspectAws` defaults to `false`. |
+| `spec.mode`, `spec.dryRun` | `mode` defaults to `dry-run`. Set `spec.mode: active` in the reviewed YAML after [operator qualification](operator-runbook.md#preflight-and-apply). It selects active IAM grants through the protected deploy. `dryRun.demand` defaults to `none`, or selects a local file or versioned S3 snapshot with SHA-256 digest. `dryRun.inspectAws` defaults to `false` and permits AWS inventory only when demand is `none`. |
 | `spec.controller` | Require `image` pinned by ECR `@sha256:...` digest and `hosting` (`type: ecs-fargate`, `network`, `cluster`, `cpuArchitecture`, `cpu`, `memoryMiB`). |
 | `spec.tracking.table` | `create` (derives `<metadata.name>-runner-lifecycle`) or `import` (requires `name` and schema/PITR/TTL/encryption preflight). |
 | `spec.ecsClusters` | Required when controller hosting (`ecs-fargate`) or any Fargate runner profile references a cluster. `import` takes `arn`; `create` declares `name`. Deduplicated if host and runners share a cluster. |
@@ -229,7 +229,7 @@ The standalone TypeScript CDK v2 app lives under `cdk/` with offline synthesis (
 
 | Selector | CDK creates or configures | Existing dependencies |
 | --- | --- | --- |
-| All environments | Retained encrypted DynamoDB table with `PK`/`SK`, `due` `KEYS_ONLY` GSI, TTL (`expiresAt`), and PITR when `create`, or reference when `import`. Versioned S3 runtime config asset, log group, baseline alarms, and Secrets Manager references (active only). | ECR controller image digest, GitHub secret ARNs, and imported table settings when `import`. |
+| All environments | Retained encrypted DynamoDB table with `PK`/`SK`, `due` `KEYS_ONLY` GSI, TTL (`expiresAt`), and PITR when `create`, or reference when `import`. Versioned S3 runtime config asset and retained 30-day log groups for the ECS controller, runtime artifact functions, and provisioned HELLO brokers. Secrets Manager references are active-only. | ECR controller image digest, GitHub secret ARNs, imported table settings, and operator-owned alarms. |
 | Controller host (`ecs-fargate`) | Controller ECS task definition, task/execution IAM roles, 1-replica ECS Fargate service (`minHealthyPercent: 0`, `maxHealthyPercent: 100`), circuit breaker, read-only rootfs, ECS Exec disabled, `stopTimeout: 90s`, and `healthcheck` probe. Scoped `ecs:DescribeTasks` on the controller cluster to verify prior controller task termination during takeover. | Selected VPC/subnets/security groups and imported or created controller cluster. |
 | Active or draining `ec2` profiles | Scoped EC2 EventBridge/SQS notifications, exact compute and pass-role permissions, IAM-authenticated HELLO registration, one-time `OFFER#` consumption, and an EC2-only `STATUS#` grant for qualified hosts. | Imported Launch Template, subnets/security groups, and owner-prepared AMI/bootstrap installation. |
 | Active or draining `fargate` profiles | Scoped ECS EventBridge/SQS notifications, exact task and pass-role permissions, IAM-authenticated HELLO registration, and one-time `OFFER#` consumption. | Imported revision-pinned task definition, roles, network, and selected cluster. |
@@ -291,14 +291,14 @@ Persist executor resource observations and authenticated runner-process observat
 
 ## 6. DynamoDB, recovery and orphan policy
 
-Use one on-demand encrypted table with PITR, string `PK`/`SK`, `due` `KEYS_ONLY` GSI (`dueShard` / `dueAtMillis` across 8 deployment shards as a wake-up hint only), and `expiresAt` numeric TTL applied exclusively to settled inbox/job/acquisition history after the replay/incident window.
+Use one on-demand encrypted table with PITR, string `PK`/`SK`, and a `due` `KEYS_ONLY` GSI (`dueShard` / `dueAtMillis` across 8 deployment shards as a wake-up hint only). Numeric `expiresAt` covers bounded bootstrap records and settled inbox/job/acquisition history. Active ownership, unsettled effects, and durable fences remain separate from TTL-based cleanup.
 
 | PK | SK | Durable contents and access |
 | --- | --- | --- |
 | `ENV#<deployment>` | `LEASE`, `PROFILE#<id>` | Renewable lease (`epoch`, `ownerTaskArn`, `writerProtocol`, `previousOwnerTaskArn`, `validUntil`), applied generation, catalog bindings, and retired tombstones. Strong reads. |
 | `CLAIM#<canonical-remote-id>` | `OWNER` | Unique ownership fence for GitHub scope/group/set name, resolved set ID, or allocated EC2/ECS resource ID. |
 | `PROFILE#<deployment>#<profile>` | `SESSION`, `DEMAND`, `ADMISSION`, `EFFECTS`, `EFFECT-REBUILD`, `ACTIVE-OP#<gen>#<intent>`, `CHECKPOINT#<session>`, `MSG#<session>#<id>`, `ACQUIRE#<request>`, `JOB#<attempt>`, `RUNNER#<allocation>`, `RUNNER-ID#<runner-id>`, `OP#<intent>` | Session ownership/closure journal; per-session Listener checkpoint with exact scope/set/session identity, revision, transition ID, original observation, cursor and pending phase; demand freshness, admission reservations, transactional unfinished-effect count, bounded rebuild checkpoint (32 rows/page, 2 pages/pass), active-only index markers, deduplicated messages/jobs, immutable allocation provenance, and nonsecret effect envelopes. |
-| `HELLO#<aws:userid>`, `OFFER#<aws:userid>`, `STATUS#<aws:userid>` | `BOOTSTRAP` | The authenticated HELLO broker owns registration writes. Each runner consumes its exact offer. Qualified EC2 supervisors can publish scoped STATUS. |
+| `HELLO#BROKER#<aws:userid>`, `OFFER#<aws:userid>`, `STATUS#<aws:userid>` | `BOOTSTRAP` | The authenticated broker alone creates the HELLO record and sets a one-hour TTL. Exact retries retain the original expiry. The controller rejects an expired HELLO before asynchronous DynamoDB removal. Each runner consumes its exact offer. Qualified EC2 supervisors can publish scoped STATUS. |
 
 Maintain `ACTIVE-OP#<gen>#<intent>` and `EFFECTS` atomically in the same revision-checked, lease-fenced `TransactWriteItems` call as `OP#<intent>`. On controller takeover after unclean loss, the successor remains in read-only recovery until it confirms via `ecs:DescribeTasks` on the controller cluster that the prior `ownerTaskArn` reached `STOPPED`, validates host clock-skew margin against the lease deadline, advances any `EFFECT-REBUILD`, and settles all ambiguous `executing`/`uncertain` effects.
 
@@ -323,7 +323,7 @@ The [OpenTelemetry integration plan](opentelemetry-integration.md) defines the r
 2. **Emulated verification & pre-cutover check**: Validate the target configuration via offline CDK synthesis (`T21`), local AWS/GitHub emulation (`T22`–`T25`), and an isolated test selector during initial rollout, including App/PAT secret rotation.
 3. **Phased workflow cutover**: Route workflows via updated `runs-on` labels in batches; keep `Knightfall.ScaleSet.Aws` profiles additive with immutable GitHub/LT-ID/bootstrap-role bindings (`launchTemplateVersion: alias` safely isolates per-allocation numeric provenance).
 4. **Drain & handback**: Move retiring profiles to `draining`, pass the two-pass clear and closure hold, run `preflight retire` before removing CDK permissions, and remove/disable only after tombstone verification.
-5. **Rollback & PITR restore**: Roll back only to compatible controller image/config digests paired with a higher deployment generation. For DynamoDB PITR restores, fence all controller tasks, restore to an isolated table, purge all restored `HELLO#` and `OFFER#` rows and untrusted `STATUS#` rows before granting bootstrap roles access, and reconcile uncertain operations before active mode.
+5. **Rollback & PITR restore**: Roll back only to compatible controller image/config digests paired with a higher deployment generation. For DynamoDB PITR restores, fence all controller tasks, restore to an isolated table, purge all restored `HELLO#` (including `HELLO#BROKER#`) and `OFFER#` rows and untrusted `STATUS#` rows before granting bootstrap roles access, and reconcile uncertain operations before active mode. [Operator recovery](operator-runbook.md#roll-back-or-recover-a-controller) · [Imported KMS prerequisites](profile-bindings.md#qualify-imported-encryption-keys)
 
 ## 9. Dry-run strategy
 
