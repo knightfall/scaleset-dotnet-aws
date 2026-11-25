@@ -6,8 +6,24 @@ on:
 permissions: {}
 
 jobs:
+  scope:
+    name: Require the credential to be exclusive to production
+    if: github.repository == 'knightfall/scaleset-dotnet-aws' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Reject a repository or organization credential with the same name
+        env:
+          RELEASE_SETTINGS_OUTSIDE_PRODUCTION: ${{ secrets.RELEASE_SETTINGS_READ_TOKEN != '' }}
+        run: |
+          if [[ "$RELEASE_SETTINGS_OUTSIDE_PRODUCTION" != false ]]; then
+            printf '%s\n' '::error::Configure RELEASE_SETTINGS_READ_TOKEN only in the production environment.'
+            exit 1
+          fi
+
   settings:
     name: Check the stored production credential before tagging
+    needs: scope
     if: github.repository == 'knightfall/scaleset-dotnet-aws' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
     timeout-minutes: 5
