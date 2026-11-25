@@ -157,10 +157,10 @@ public sealed class ControllerAuthorityAdapter
         using var linked = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, deadline.Token);
         var token = linked.Token;
 
-        string? predecessor = lease.PreviousOwner is { CleanRelease: false } previous ? previous.OwnerTaskArn : null;
-        if ((predecessor is not null && !await IsStoppedAsync(predecessor, token).ConfigureAwait(false)) ||
-            (lease.RequiredFencingTaskArn is { } required && required != predecessor &&
-                !await IsStoppedAsync(required, token).ConfigureAwait(false)) ||
+        var predecessor = lease.PreviousOwner is { CleanRelease: false } previous ? previous : null;
+        if ((predecessor is not null && !await IsStoppedAsync(predecessor.OwnerTaskArn, predecessor.AcquiredAt, token).ConfigureAwait(false)) ||
+            (lease.RequiredFencingTaskArn is { } required && required != predecessor?.OwnerTaskArn &&
+                !await IsStoppedAsync(required, lease.RequiredFencingTaskAcquiredAt, token).ConfigureAwait(false)) ||
             !proof.TryGetUpperBound(_clock.GetUtcNow(), lease.ValidUntil, _writeReserve, out _) ||
             !await recover(lease, proof, token).ConfigureAwait(false))
         {
@@ -172,9 +172,9 @@ public sealed class ControllerAuthorityAdapter
             activated.Lease?.Fence == lease.Fence ? activated.Lease : null;
     }
 
-    private async Task<bool> IsStoppedAsync(string taskArn, CancellationToken cancellationToken) =>
+    private async Task<bool> IsStoppedAsync(string taskArn, DateTimeOffset? acquiredAt, CancellationToken cancellationToken) =>
         EcsControllerMetadata.MatchesTask(_clusterArn, taskArn) &&
-        await _tasks.ReadAsync(taskArn, cancellationToken).ConfigureAwait(false) == ControllerTaskFenceStatus.Stopped;
+        (await _tasks.ObserveAsync(taskArn, acquiredAt, cancellationToken).ConfigureAwait(false)).Status == ControllerTaskFenceStatus.Stopped;
 
     private bool IsOwned(ControllerLease? lease, string taskArn) =>
         lease is not null && lease.OwnerId == _ownerId && lease.OwnerTaskArn == taskArn &&

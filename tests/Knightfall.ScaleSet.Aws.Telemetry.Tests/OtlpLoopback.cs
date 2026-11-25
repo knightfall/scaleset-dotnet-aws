@@ -4,6 +4,7 @@ using System.Net;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Http;
+using Microsoft.AspNetCore.Http.Features;
 using Microsoft.AspNetCore.Server.Kestrel.Core;
 using Microsoft.Extensions.Logging;
 
@@ -19,7 +20,7 @@ internal enum ReceiverReply
     GrpcStatusWithoutTrailer = 5,
 }
 
-internal sealed record OtlpCapture(string Path, string MediaType, string Protocol, string Authorization, byte[] Body)
+internal sealed record OtlpCapture(string Path, string RawTarget, string MediaType, string Protocol, string Authorization, byte[] Body)
 {
     internal byte[] Payload()
     {
@@ -74,7 +75,8 @@ internal sealed class OtlpLoopback : IAsyncDisposable
         var cancellationToken = context.RequestAborted;
         await using var body = new MemoryStream();
         await context.Request.Body.CopyToAsync(body, cancellationToken);
-        var request = new OtlpCapture(context.Request.Path.Value!, context.Request.ContentType!, context.Request.Protocol,
+        var request = new OtlpCapture(context.Request.Path.Value!, context.Features.Get<IHttpRequestFeature>()!.RawTarget!,
+            context.Request.ContentType!, context.Request.Protocol,
             context.Request.Headers.Authorization.ToString(), body.ToArray());
         _requests.Enqueue(request);
         _received.TrySetResult();

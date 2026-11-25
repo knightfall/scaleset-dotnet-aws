@@ -85,6 +85,20 @@ public sealed partial class DynamoDbLifecycleStore
         WriteEffectAsync(profile, lease, transitionId, write, LeaseAccess.Active, cancellationToken, guard, attemptDeadline,
             exactPrevious: replayOf);
 
+    internal async Task<bool> MatchesFirstFargateLaunchAsync(
+        LifecycleProfile profile, FargateFirstLaunchEvidence evidence, CancellationToken cancellationToken)
+    {
+        foreach (var condition in evidence.Conditions(profile))
+        {
+            var current = await ReadItemAsync(condition.Key, cancellationToken).ConfigureAwait(false);
+            if (current is null || Revision(current) != condition.ExpectedRevision)
+            {
+                return false;
+            }
+        }
+        return true;
+    }
+
     internal Task<LifecycleWriteOutcome> WriteExactEffectAsync(
         DeploymentLeaseFence lease, Guid transitionId, EffectJournalSnapshot expected, EffectJournalEntry replacement,
         DateTimeOffset? leaseValidThrough, CancellationToken cancellationToken, EffectDispatchGuard? guard = null) =>
@@ -205,6 +219,10 @@ public sealed partial class DynamoDbLifecycleStore
             if (guard.FargateStopAdmission is { } admission)
             {
                 actions.Add(RecordRevisionCondition(admission));
+            }
+            if (guard.FargateFirstLaunch is { } launch)
+            {
+                actions.AddRange(launch.Conditions(profile).Select(RecordRevisionCondition));
             }
         }
         if (requiredCatalog is not null)

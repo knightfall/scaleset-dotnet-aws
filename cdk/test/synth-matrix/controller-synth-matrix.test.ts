@@ -3,7 +3,7 @@ import { mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { Template } from "aws-cdk-lib/assertions";
+import { Match, Template } from "aws-cdk-lib/assertions";
 import { compileConfig } from "../../lib/config/compiler.ts";
 import type {
   Ec2Provisioner,
@@ -323,7 +323,7 @@ function verifyTemplate(
   const { spec } = compiled.runtime;
   const active = spec.mode === "active";
   const selected =
-    active || spec.dryRun.inspectAws
+    active || (spec.dryRun.inspectAws && spec.dryRun.demand.type === "none")
       ? spec.profiles.filter((profile) => profile.state !== "disabled")
       : [];
   const ec2 = ec2Profiles(selected);
@@ -487,6 +487,9 @@ function verifyEventRoutes(
   fgt: ReturnType<typeof fargateProfiles>,
 ) {
   const queues = template.findResources("AWS::SQS::Queue");
+  const queuePolicies = template.findResources("AWS::SQS::QueuePolicy");
+  const keys = template.findResources("AWS::KMS::Key");
+  const rules = template.findResources("AWS::Events::Rule");
   const flags: unknown[] = [];
   const arns: unknown[] = [];
   const expected: unknown[] = [];
@@ -520,12 +523,34 @@ function verifyEventRoutes(
     const dlq = Object.keys(queues).find((queue) =>
       queue.startsWith(`${prefix}EventDeadLetters`),
     );
-    assert.ok(id && dlq);
-    assert.ok(queues[id].Properties.KmsMasterKeyId);
-    assert.deepEqual(
-      queues[id].Properties.KmsMasterKeyId,
-      queues[dlq].Properties.KmsMasterKeyId,
+    const key = Object.keys(keys).find((resource) =>
+      resource.startsWith(`${prefix}EventKey`),
     );
+    assert.ok(id && dlq && key);
+    const keyArn = { "Fn::GetAtt": [key, "Arn"] };
+    assert.deepEqual(queues[id].Properties.KmsMasterKeyId, keyArn);
+    assert.deepEqual(queues[dlq].Properties.KmsMasterKeyId, keyArn);
+    assert.equal(queues[dlq].Properties.MessageRetentionPeriod, 1_209_600);
+    assert.equal(keys[key].Properties.EnableKeyRotation, true);
+    verifyObservationKeyPolicy(keys[key].Properties.KeyPolicy.Statement);
+    const ruleArns = Object.keys(rules)
+      .filter((rule) => rule.startsWith(`${prefix}StateChange`))
+      .map((rule) => ({ "Fn::GetAtt": [rule, "Arn"] }));
+    assert.equal(ruleArns.length, details.length);
+    for (const destination of [id, dlq]) {
+      const policies = Object.values(queuePolicies).filter((policy) =>
+        (policy.Properties.Queues as { Ref: string }[]).some(
+          ({ Ref: queue }) => queue === destination,
+        ),
+      );
+      assert.equal(policies.length, 1);
+      assert.deepEqual(policies[0].Properties.Queues, [{ Ref: destination }]);
+      verifyObservationQueuePolicy(
+        policies[0].Properties.PolicyDocument.Statement,
+        { "Fn::GetAtt": [destination, "Arn"] },
+        ruleArns,
+      );
+    }
     const queueArn = { "Fn::GetAtt": [id, "Arn"] };
     const dlqArn = { "Fn::GetAtt": [dlq, "Arn"] };
     assert.deepEqual(queues[id].Properties.RedrivePolicy, {
@@ -551,12 +576,57 @@ function verifyEventRoutes(
     }
   }
   assert.equal(Object.keys(queues).length, arns.length * 2);
-  const actual = Object.values(template.findResources("AWS::Events::Rule")).map(
-    (rule) => rule.Properties,
-  );
+  assert.equal(Object.keys(queuePolicies).length, arns.length * 2);
+  assert.equal(Object.keys(keys).length, arns.length);
+  const actual = Object.values(rules).map((rule) => rule.Properties);
   assert.equal(actual.length, expected.length);
   assert.deepEqual(sortedJson(actual), sortedJson(expected));
   return { flags, arns };
+}
+
+function verifyObservationKeyPolicy(statements: readonly unknown[]) {
+  const expected = [
+    {
+      Action: "kms:*",
+      Effect: "Allow",
+      Principal: { AWS: `arn:aws:iam::${account}:root` },
+      Resource: "*",
+    },
+    {
+      Action: ["kms:Decrypt", "kms:GenerateDataKey"],
+      Condition: { StringEquals: { "aws:SourceAccount": account } },
+      Effect: "Allow",
+      Principal: { Service: "events.amazonaws.com" },
+      Resource: "*",
+    },
+  ];
+  assert.equal(statements.length, expected.length);
+  assert.deepEqual(sortedJson(statements), sortedJson(expected));
+}
+
+function verifyObservationQueuePolicy(
+  statements: readonly unknown[],
+  queueArn: unknown,
+  ruleArns: readonly unknown[],
+) {
+  const expected = [
+    {
+      Action: "sqs:*",
+      Condition: { Bool: { "aws:SecureTransport": "false" } },
+      Effect: "Deny",
+      Principal: { AWS: "*" },
+      Resource: queueArn,
+    },
+    ...ruleArns.map((ruleArn) => ({
+      Action: "sqs:SendMessage",
+      Condition: { ArnEquals: { "aws:SourceArn": ruleArn } },
+      Effect: "Allow",
+      Principal: { Service: "events.amazonaws.com" },
+      Resource: queueArn,
+    })),
+  ];
+  assert.equal(statements.length, expected.length);
+  assert.deepEqual(sortedJson(statements), sortedJson(expected));
 }
 
 function tableArn(template: Template, spec: Spec) {
@@ -574,11 +644,10 @@ function verifyTaskRole(
   queueArns: unknown[],
 ) {
   const active = spec.mode === "active";
-  const inspect = spec.dryRun.inspectAws;
   const expected = new Set(["s3:GetObjectVersion"]);
   const add = (...actions: string[]) =>
     actions.forEach((action) => expected.add(action));
-  if (active || inspect) add("dynamodb:GetItem", "dynamodb:Query");
+  if (active) add("dynamodb:GetItem", "dynamodb:Query");
   if (ec2.length > 0)
     add(
       "ec2:DescribeInstances",
@@ -673,16 +742,8 @@ function verifyTaskRole(
   );
   const table = tableArn(template, spec);
   const due = { "Fn::Join": ["", [table, "/index/due"]] };
-  verifyGrants(
-    statements,
-    "dynamodb:GetItem",
-    active || inspect ? scope([table]) : [],
-  );
-  verifyGrants(
-    statements,
-    "dynamodb:Query",
-    active || inspect ? scope([table, due]) : [],
-  );
+  verifyGrants(statements, "dynamodb:GetItem", active ? scope([table]) : []);
+  verifyGrants(statements, "dynamodb:Query", active ? scope([table, due]) : []);
   for (const action of expected) {
     if (
       action.startsWith("ec2:Describe") ||
@@ -701,6 +762,9 @@ function verifyTaskRole(
   verifyGrants(statements, "iam:PassRole", [
     ...scope(ec2Roles, {
       StringEquals: { "iam:PassedToService": "ec2.amazonaws.com" },
+      ArnLike: {
+        "iam:AssociatedResourceArn": `arn:aws:ec2:*:${account}:instance/*`,
+      },
     }),
     ...scope(fargateRoles, {
       StringEquals: { "iam:PassedToService": "ecs-tasks.amazonaws.com" },
@@ -764,7 +828,8 @@ function verifyEc2Writes(
     const exact = { "ec2:LaunchTemplate": template };
     const request = profileTags(profile, "RequestTag");
     const exit = profileTags(profile, "ResourceTag");
-    plans.push(...scope([template, ...subnets, ...groups]));
+    plans.push(...scope([template]));
+    plans.push(...scope([...subnets, ...groups], { ArnEquals: exact }));
     plans.push(
       ...scope(
         [
@@ -884,7 +949,9 @@ function verifyExecutionRole(
       scope([`arn:aws:ecr:${region}:${account}:repository/${repository}`]),
     );
   }
-  const group = template.getResourceId("AWS::Logs::LogGroup");
+  const group = template.getResourceId("AWS::Logs::LogGroup", {
+    Properties: { LogGroupName: Match.stringLikeRegexp("^/ecs/") },
+  });
   for (const action of logging) {
     verifyGrants(statements, action, scope([{ "Fn::GetAtt": [group, "Arn"] }]));
   }

@@ -12,7 +12,10 @@ public sealed record ControllerLeasePredecessor(
     string OwnerTaskArn,
     long Epoch,
     int WriterProtocol,
-    bool CleanRelease);
+    bool CleanRelease)
+{
+    public DateTimeOffset? AcquiredAt { get; init; }
+}
 
 public sealed record ControllerLease(
     string Deployment,
@@ -28,6 +31,10 @@ public sealed record ControllerLease(
     string? RequiredFencingTaskArn)
 {
     public const int CurrentWriterProtocol = 1;
+
+    public DateTimeOffset? AcquiredAt { get; init; }
+
+    public DateTimeOffset? RequiredFencingTaskAcquiredAt { get; init; }
 
     public DeploymentLeaseFence Fence => new(Deployment, OwnerId, Epoch, WriterProtocol, OwnerTaskArn);
 }

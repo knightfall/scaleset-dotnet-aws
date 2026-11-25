@@ -1,14 +1,16 @@
+using Knightfall.ScaleSet.Aws.Core.Catalog;
 using Knightfall.ScaleSet.Aws.Core.Lifecycle;
 
 namespace Knightfall.ScaleSet.Aws.DynamoDb;
 
 public sealed partial class DynamoDbLifecycleStore
 {
-    /// <summary>Closes JIT admission for an exact Fargate executor before a verified unused or revoked stop.</summary>
-    public async Task<LifecycleWriteOutcome> CloseFargateAdmissionAsync(ControllerLease lease, ExecutorSnapshot expected,
+    /// <summary>Closes admission for an exact Fargate executor and atomically revokes an unconsumed offer, if present.</summary>
+    public async Task<LifecycleWriteOutcome> CloseFargateAdmissionAsync(ControllerLease lease, CatalogProfile catalog, ExecutorSnapshot expected,
         TimeSpan observationFreshness, CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(lease);
+        ArgumentNullException.ThrowIfNull(catalog);
         ArgumentNullException.ThrowIfNull(expected);
         ArgumentOutOfRangeException.ThrowIfLessThanOrEqual(observationFreshness, TimeSpan.Zero);
         var binding = expected.Binding;
@@ -16,6 +18,10 @@ public sealed partial class DynamoDbLifecycleStore
         if (lease.Mode != ControllerLeaseMode.Active)
         {
             return LifecycleWriteOutcome.LeaseRejected;
+        }
+        if (catalog.Profile != binding.Profile || catalog.State is not (CatalogProfileState.Active or CatalogProfileState.Draining))
+        {
+            return LifecycleWriteOutcome.Conflict;
         }
         var current = await ReadExecutorAsync(binding.Profile, binding.AllocationId, cancellationToken).ConfigureAwait(false);
         if (current?.Binding != binding || binding.Provider is not FargateExecutorIdentity ||
@@ -32,8 +38,8 @@ public sealed partial class DynamoDbLifecycleStore
         {
             closure = FargateAdmissionClosure.Unused;
         }
-        else if (handoff is { State: JitHandoffState.Revoked, OfferSha256: not null, RunnerId: > 0 } &&
-            handoff.RunnerId == current.State.RunnerId && MatchesJitExecutor(current, handoff.Identity))
+        else if (handoff is { State: JitHandoffState.Offered or JitHandoffState.Revoked, OfferSha256: not null, RunnerId: > 0 } &&
+            handoff.RunnerId == current.State.RunnerId && MatchesJitExecutor(current, handoff.Identity) && MatchesJitCatalog(catalog, handoff.Identity))
         {
             closure = FargateAdmissionClosure.OfferRevoked;
         }
@@ -50,6 +56,10 @@ public sealed partial class DynamoDbLifecycleStore
         }
         if (current.State.AdmissionClosure == closure)
         {
+            if (!SameProfile(catalog, await ReadCatalogProfileAsync(binding.Profile, cancellationToken).ConfigureAwait(false)))
+            {
+                return LifecycleWriteOutcome.Conflict;
+            }
             var owner = await ReadLeaseAsync(lease.Deployment, cancellationToken).ConfigureAwait(false);
             return owner is { Mode: ControllerLeaseMode.Active } && owner.Fence == lease.Fence && owner.ValidUntil > ConservativeLatest(now)
                 ? LifecycleWriteOutcome.Committed : LifecycleWriteOutcome.LeaseRejected;
@@ -59,21 +69,35 @@ public sealed partial class DynamoDbLifecycleStore
             return LifecycleWriteOutcome.Conflict;
         }
 
-        var inventory = await ReadExecutorInventoryHeadAsync(binding.Profile, cancellationToken).ConfigureAwait(false) ?? throw InvalidRecord();
+        var inventory = await ReadExecutorInventoryHeadAsync(binding.Profile, cancellationToken).ConfigureAwait(false);
+        if (inventory?.Payload.Coverage is not { IsComplete: true } coverage || coverage.ObservedAt < resource.ObservedAt ||
+            coverage.ObservedAt > now || now - coverage.ObservedAt > observationFreshness)
+        {
+            return LifecycleWriteOutcome.Conflict;
+        }
         var transition = Guid.NewGuid();
+        var leaseCondition = LeaseCondition(lease.Fence);
+        RequireAppliedCatalog(leaseCondition, catalog);
         var actions = new List<TransactionAction>
         {
-            LeaseCondition(lease.Fence),
+            leaseCondition,
+            CatalogProfileCondition(catalog),
             RecordRevisionCondition(zeroAcquisitions),
         };
         if (handoff is null)
         {
             actions.Add(RecordRevisionCondition(new LifecycleRecordCondition(LifecycleKey.Handoff(binding.Profile, allocation), null)));
         }
-        else
+        else if (handoff.State == JitHandoffState.Revoked)
         {
             actions.Add(ExactJitHandoffCondition(handoff));
             actions.Add(OfferAbsentCondition(handoff));
+        }
+        else
+        {
+            // The bootstrap can receive ciphertext only by deleting this same exact item. Absence or an ambiguous delete keeps the task held.
+            actions.Add(WriteExactJitHandoff(binding.Profile, handoff, RevokedJitHandoff(handoff, transition)));
+            actions.Add(DeleteExactOffer(handoff));
         }
         int change = AddExecutorActions(actions, current, current.State with { AdmissionClosure = closure }, transition);
         actions.Add(WriteExecutorInventoryHead(binding.Profile, inventory, change, transition));

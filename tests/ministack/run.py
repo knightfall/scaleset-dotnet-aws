@@ -4,10 +4,12 @@ from contextlib import ExitStack, closing, contextmanager
 from http.client import HTTPConnection, HTTPException
 import os
 from pathlib import Path
+import platform
 import signal
 import socket
 import subprocess
 import sys
+import sysconfig
 import tempfile
 import time
 
@@ -150,12 +152,15 @@ def run(command, interruption, with_iam=False):
             environment, interruption, check=True,
         )
         executable = venv / "bin" / "python"
-        run_command(
+        status = run_command(
             [executable, "-I", "-m", "pip", "--isolated", "install",
              "--disable-pip-version-check", "--index-url", "https://pypi.org/simple",
+             "--only-binary=:all:", "--require-hashes",
              "--requirement", requirements],
-            dict(environment, PIP_CONFIG_FILE=os.devnull), interruption, check=True,
+            dict(environment, PIP_CONFIG_FILE=os.devnull), interruption,
         )
+        if status != 0:
+            sys.exit(f"MiniStack dependency installation failed using the verified wheel lock (pip exit {status}).")
 
         with ExitStack() as stack:
             endpoint = stack.enter_context(start_emulator(
@@ -173,8 +178,14 @@ def run(command, interruption, with_iam=False):
 
 
 if __name__ == "__main__":
-    if sys.version_info < (3, 11):
-        sys.exit("Use Python 3.11 or newer for the pinned MiniStack test environment.")
+    if (
+        platform.python_implementation() != "CPython"
+        or not (3, 11) <= sys.version_info[:2] <= (3, 14)
+        or sysconfig.get_config_var("Py_GIL_DISABLED")
+        or sys.platform not in {"darwin", "linux"}
+        or platform.machine() not in {"x86_64", "arm64", "aarch64"}
+    ):
+        sys.exit("Use standard CPython 3.11–3.14 on x64 or arm64 Linux or macOS for pinned MiniStack.")
     arguments = sys.argv[1:]
     with_iam = arguments[:1] == ["--with-iam"]
     if with_iam:

@@ -13,7 +13,7 @@ public sealed record EffectBeginOutcome(LifecycleWriteOutcome Outcome, EffectSen
 internal sealed record EffectDispatchGuard(
     CatalogProfile Catalog, EffectIndexHead Index, string AllocationId, long? AllocationRevision,
     JitHandoffSnapshot? Handoff = null, JitHandoffSnapshot? Removal = null, Ec2LaunchLineageSnapshot? Ec2Lineage = null,
-    LifecycleRecordCondition? FargateStopAdmission = null);
+    LifecycleRecordCondition? FargateStopAdmission = null, FargateFirstLaunchEvidence? FargateFirstLaunch = null);
 
 /// <summary>Evidence that an attempt was durably begun under its recorded lease epoch.</summary>
 /// <remarks>A caller must retain current ownership and respect the attempt deadline when sending.</remarks>

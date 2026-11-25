@@ -344,6 +344,44 @@ test("typed telemetry rejects unknown fields, plaintext headers and malformed ho
   );
 });
 
+test("CDK uses the same literal endpoint paths as the runtime", () => {
+  const cases = JSON.parse(
+    readFileSync(
+      new URL(
+        "../../../testdata/telemetry/otlp-endpoints.json",
+        import.meta.url,
+      ),
+      "utf8",
+    ),
+  ) as { endpoint: string; path: string | null }[];
+  for (const { endpoint, path } of cases) {
+    const input = {
+      exporters: {
+        traces: {
+          endpoint,
+          protocol: "http/protobuf",
+          headersSecret: { secretArn: commonSecret },
+        },
+      },
+    };
+    if (path === null) {
+      assert.throws(() => resolveControllerTelemetry(input, aws), {
+        message:
+          "Invalid controller telemetry setting exporters.traces.endpoint.",
+      });
+      continue;
+    }
+
+    const resolved = resolveControllerTelemetry(input, aws);
+    assert.equal(
+      resolved.environment.OTEL_EXPORTER_OTLP_TRACES_ENDPOINT,
+      endpoint,
+    );
+    assert.equal(new URL(endpoint).pathname, path);
+    assert.equal(resolved.headers[0]?.secretArn, commonSecret);
+  }
+});
+
 test("credentialed remote OTLP requires TLS for each resolved signal", () => {
   const secure = "https://collector.example.invalid";
   const unsecured = "http://collector.example.invalid";
@@ -500,8 +538,10 @@ test("the synth CLI consumes an explicit telemetry document and ignores ambient 
   }
 });
 
-test("the protected deploy prepares a candidate with the same validated telemetry and runtime bytes", () => {
+test("the protected deploy prepares a candidate with the same validated telemetry and runtime bytes", (context) => {
   const invocations: string[] = [];
+  const recovery = mkdtempSync(join(tmpdir(), "scaleset-telemetry-state-"));
+  context.after(() => rmSync(recovery, { recursive: true, force: true }));
   assert.throws(
     () =>
       deployController(
@@ -538,7 +578,7 @@ test("the protected deploy prepares a candidate with the same validated telemetr
           if (args.includes("describe-stacks")) {
             invocations.push("stack");
             return {
-              status: 255,
+              status: 254,
               stdout: "",
               stderr: `An error occurred (ValidationError) when calling the DescribeStacks operation: Stack with id ${controllerStackName(compiled.runtime)} does not exist`,
             };
@@ -546,14 +586,15 @@ test("the protected deploy prepares a candidate with the same validated telemetr
           assert.ok(args.includes("describe-table"));
           invocations.push("table");
           return {
-            status: 255,
+            status: 254,
             stdout: "",
             stderr:
               "An error occurred (ResourceNotFoundException) when calling the DescribeTable operation: Not found",
           };
         },
+        recovery,
       ),
-    { message: "CDK change set preparation failed." },
+    /CDK change set preparation failed/u,
   );
   assert.deepEqual(invocations, ["identity", "stack", "table", "prepare"]);
 });

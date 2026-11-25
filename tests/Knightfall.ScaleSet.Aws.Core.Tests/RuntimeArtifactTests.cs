@@ -162,11 +162,11 @@ public sealed class RuntimeArtifactTests
         Assert.Throws<ArgumentException>(() => RuntimeArtifact.FromS3(uri, version, new string('a', 64)));
 }
 
-internal sealed class VersionedS3Wire(byte[] body, string? version) : HttpMessageHandler
+internal sealed class VersionedS3Wire(byte[] body, string? version, string? bucketOwner = null) : HttpMessageHandler
 {
-    private readonly ConcurrentQueue<(HttpMethod Method, Uri Uri)> _requests = new();
+    private readonly ConcurrentQueue<(HttpMethod Method, Uri Uri, string? ExpectedBucketOwner)> _requests = new();
 
-    internal IReadOnlyCollection<(HttpMethod Method, Uri Uri)> Requests => _requests;
+    internal IReadOnlyCollection<(HttpMethod Method, Uri Uri, string? ExpectedBucketOwner)> Requests => _requests;
 
     internal IAmazonS3 CreateClient() => new AmazonS3Client(
         new BasicAWSCredentials("fixture-key", "fixture-secret"), new AmazonS3Config
@@ -183,7 +183,17 @@ internal sealed class VersionedS3Wire(byte[] body, string? version) : HttpMessag
 
     protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
     {
-        _requests.Enqueue((request.Method, request.RequestUri!));
+        string? requestedOwner = request.Headers.TryGetValues("x-amz-expected-bucket-owner", out var values)
+            ? values.Single()
+            : null;
+        _requests.Enqueue((request.Method, request.RequestUri!, requestedOwner));
+        if (bucketOwner is not null && requestedOwner != bucketOwner)
+        {
+            return Task.FromResult(new HttpResponseMessage(HttpStatusCode.Forbidden)
+            {
+                Content = new StringContent("<Error><Code>AccessDenied</Code><Message>Access Denied</Message></Error>"),
+            });
+        }
         var response = new HttpResponseMessage(HttpStatusCode.OK) { Content = new ByteArrayContent(body) };
         if (version is not null)
         {

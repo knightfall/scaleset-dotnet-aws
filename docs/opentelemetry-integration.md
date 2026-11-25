@@ -104,6 +104,8 @@ Resolve all settings once before starting AWS/GitHub clients. Disable secondary 
 
 For HTTP/protobuf, append `v1/traces`, `v1/metrics`, and `v1/logs` to a common base URL; use per-signal URLs exactly as supplied. Normalize once, then adapt to each pinned exporter/sink API without adding the suffix twice. Follow the [OTLP endpoint rules](https://opentelemetry.io/docs/specs/otel/protocol/exporter/). Validate absolute HTTP(S) URLs, reject user info/query/fragment and credential-bearing endpoints, and test trailing slashes and path prefixes. Permit HTTP for explicit loopback/private receivers; use HTTPS for remote examples with normal certificate verification, never a validation bypass.
 
+Use literal unreserved ASCII characters in endpoint paths and avoid `.` and `..` path segments. Encode square brackets in the path as `%5B` and `%5D`. Unicode path characters may be supplied directly or as percent-encoded UTF-8 with uppercase hexadecimal digits. IPv6 host literals still use brackets in the URL authority.
+
 ECS header secrets are explicit secret references injected by the **execution role**, never plaintext CDK context, task environment values, runtime JSON, synthesized outputs, or log messages. Any extra secret/KMS grants belong to the narrowly scoped execution role; the dry-run task role still has no Secrets Manager reads. Secret rotation takes effect on task replacement. V1 requires no custom collector trust/mTLS feature; do not conflate this standard OTLP transport with deferred GitHub transport changes.
 
 Example target environment, to become executable with T19/T20 (not a command available in the current scaffold):
@@ -128,7 +130,7 @@ Batch export asynchronously with bounded queues (initial limits: 2,048 pending s
 
 Export must not run synchronously within an acknowledgement, DynamoDB transaction, lease renewal, or lifecycle critical section. Metrics callbacks never query AWS or DynamoDB. Export failures must not recursively generate exported failures. Test queue saturation, rejected requests, connection refusal, stalled response bodies, and recovery; record memory bounds and continued lifecycle progress, not merely completion of an exporter mock.
 
-Flush and dispose all three pipelines under **one shared maximum of five seconds**, within T20's total 60-second SIGTERM budget and 90-second ECS stop timeout. Do not give each sink a fresh five-second budget or let implicit host disposal wait indefinitely after a timeout wrapper returns. Stop application work safely first, then use the remaining telemetry budget. Dropped final telemetry is acceptable; delayed ownership shutdown is not.
+Flush and dispose all three pipelines under **one shared maximum of five seconds**, within T20's total 60-second SIGTERM budget and 90-second ECS stop timeout. Stop application work safely first, then use the remaining telemetry budget. A successful telemetry shutdown means the local cleanup completed within budget. A collector rejection or timeout can still drop a batch, with a separate rate-limited diagnostic. `telemetry-smoke` requires an accepted response for each probe signal in addition to successful cleanup. Lifecycle shutdown and lease release retain their own outcome.
 
 ## Delivery slices and acceptance evidence
 

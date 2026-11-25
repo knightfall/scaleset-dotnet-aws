@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Globalization;
 using System.Runtime.Versioning;
 using Knightfall.ScaleSet.Aws.RunnerBootstrap.Linux;
 using static Knightfall.ScaleSet.Aws.RunnerBootstrap.Fargate.FargateMountLayout;
@@ -30,14 +31,16 @@ internal sealed class FargateRunnerBoundary : ILinuxOneJobBoundary, IDisposable
         if (LinuxFiles.IsRoot() || !HasVerifiedMemoryMount(mounts, swapDisabled) ||
             new DriveInfo(MemoryMount).TotalSize is < (8 * MiB) or > (128 * MiB) ||
             !HasWritableWorkMount(settings.WorkScratch, mounts) ||
-            !IsReadOnly(settings.RunnerDistribution, mounts) || !IsReadOnly(settings.RunnerDotnet, mounts) ||
-            !IsReadOnly(settings.RunnerChild, mounts) || !LinuxFiles.IsTrustedFile(settings.RunnerDotnet, ownerOnly: false) ||
+            !IsReadOnlyAsset(settings.RunnerDistribution) || !IsReadOnlyAsset(settings.RunnerDotnet) ||
+            !IsReadOnlyAsset(settings.RunnerChild) || !LinuxFiles.IsTrustedFile(settings.RunnerDotnet, ownerOnly: false) ||
             !LinuxFiles.IsTrustedFile(settings.RunnerChild, ownerOnly: false) ||
             !LinuxFiles.HasTrustedParents(Path.Combine(runnerBin, "not-a-file")) || !Directory.Exists(runnerExternals) ||
             !ManagedEntries.All(name => LinuxFiles.IsTrustedFile(Path.Combine(runnerBin, name), ownerOnly: false)))
         {
             throw new IOException("The Fargate task's runner storage or identity boundary could not be verified.");
         }
+
+        bool IsReadOnlyAsset(string path) => IsReadOnly(path, mounts, LinuxFiles.GetMountId(path));
 
         string instance = "scaleset-" + Guid.NewGuid().ToString("N");
         string root = Path.Combine(MemoryMount, instance);
@@ -124,13 +127,7 @@ internal sealed class FargateRunnerBoundary : ILinuxOneJobBoundary, IDisposable
         return start;
     }
 
-    public void RemoveConfigFiles()
-    {
-        if (Directory.Exists(_root))
-        {
-            Directory.Delete(_root, recursive: true);
-        }
-    }
+    public void RemoveConfigFiles() => FargateRamCleanup.Remove(MemoryMount, Path.GetFileName(_root));
 
     public void Dispose() => RemoveConfigFiles();
 }
@@ -194,27 +191,31 @@ internal static class FargateMountLayout
             !path.StartsWith(MemoryMount + "/", StringComparison.Ordinal) && new DirectoryInfo(path).LinkTarget is null;
     }
 
-    internal static bool IsReadOnly(string path, string[] lines)
+    internal static bool IsReadOnly(string path, string[] lines, ulong? effectiveMountId)
     {
-        if (!Path.IsPathFullyQualified(path) || Path.GetFullPath(path) != path)
+        if (effectiveMountId is null || !Path.IsPathFullyQualified(path) || Path.GetFullPath(path) != path)
         {
             return false;
         }
-        var mount = lines.Select(ParseMount)
+        var candidates = lines.Select(ParseMount)
             .Where(item => item is not null && (item.Location == "/" || path == item.Location ||
-                path.StartsWith(item.Location + "/", StringComparison.Ordinal)))
-            .MaxBy(item => item!.Location.Length);
-        return mount?.Options.Contains("ro", StringComparer.Ordinal) == true;
+                path.StartsWith(item.Location + "/", StringComparison.Ordinal))).ToArray();
+        var mount = candidates.MaxBy(item => item!.Location.Length);
+        // Mountinfo can include hidden mounts. Refuse equal-path stacks and require the kernel's effective mount ID.
+        return mount is not null && mount.Id == effectiveMountId &&
+            mount.Options.Contains("ro", StringComparer.Ordinal) && !mount.Options.Contains("rw", StringComparer.Ordinal) &&
+            candidates.Count(item => item!.Location == mount.Location) == 1;
     }
 
     private static Mount? ParseMount(string line)
     {
         var fields = line.Split(' ', StringSplitOptions.RemoveEmptyEntries);
         int separator = Array.IndexOf(fields, "-");
-        return fields.Length >= 10 && separator >= 6 && separator + 3 < fields.Length
-            ? new Mount(fields[3], fields[4], fields[5].Split(','), fields[separator + 1], fields[separator + 3].Split(','))
+        return fields.Length >= 10 && separator >= 6 && separator + 3 < fields.Length &&
+            ulong.TryParse(fields[0], NumberStyles.None, CultureInfo.InvariantCulture, out ulong id)
+            ? new Mount(id, fields[3], fields[4], fields[5].Split(','), fields[separator + 1], fields[separator + 3].Split(','))
             : null;
     }
 
-    private sealed record Mount(string Root, string Location, string[] Options, string Type, string[] FileSystemOptions);
+    private sealed record Mount(ulong Id, string Root, string Location, string[] Options, string Type, string[] FileSystemOptions);
 }

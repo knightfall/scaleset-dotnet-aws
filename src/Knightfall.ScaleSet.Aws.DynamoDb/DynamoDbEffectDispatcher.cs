@@ -7,6 +7,18 @@ namespace Knightfall.ScaleSet.Aws.DynamoDb;
 public sealed record EffectDispatcherTiming(
     TimeSpan OperationBudget, TimeSpan WriteReserve, TimeSpan ObservationFreshness, TimeSpan LogFlushGrace);
 
+/// <summary>Current exact demand, session and inventory evidence for a provably unsent Fargate launch.</summary>
+public sealed record FargateFirstLaunchEvidence(
+    DateTimeOffset ValidUntil, long DemandRevision, long SessionRevision, long InventoryRevision)
+{
+    internal LifecycleRecordCondition[] Conditions(LifecycleProfile profile) =>
+    [
+        new(LifecycleKey.Demand(profile), DemandRevision),
+        new(LifecycleKey.Session(profile), SessionRevision),
+        new(LifecycleKey.RunnerInventory(profile), InventoryRevision),
+    ];
+}
+
 public enum EffectDispatchStatus
 {
     NotPlanned = 0,
@@ -53,7 +65,7 @@ public sealed partial class DynamoDbEffectDispatcher
         DispatchPlannedAsync(expected, clockEvidence, profile, intentId, provider, firstSendDeadline: null,
             ownershipLost, cancellationToken);
 
-    public async Task<EffectDispatchStatus> DispatchPlannedAsync(
+    public Task<EffectDispatchStatus> DispatchPlannedAsync(
         ControllerLease expected,
         ControllerClockEvidence clockEvidence,
         LifecycleProfile profile,
@@ -61,7 +73,25 @@ public sealed partial class DynamoDbEffectDispatcher
         IReconciliationEffectProvider provider,
         DateTimeOffset? firstSendDeadline,
         CancellationToken ownershipLost,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken) =>
+        DispatchPlannedCoreAsync(expected, clockEvidence, profile, intentId, provider, firstSendDeadline,
+            readFirstLaunch: null, ownershipLost, cancellationToken);
+
+    public Task<EffectDispatchStatus> DispatchFirstFargateLaunchAsync(
+        ControllerLease expected, ControllerClockEvidence clockEvidence, LifecycleProfile profile, string intentId,
+        IReconciliationEffectProvider provider, Func<CancellationToken, Task<FargateFirstLaunchEvidence?>> readAdmission,
+        CancellationToken ownershipLost, CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(readAdmission);
+        return DispatchPlannedCoreAsync(expected, clockEvidence, profile, intentId, provider, firstSendDeadline: null,
+            readAdmission, ownershipLost, cancellationToken);
+    }
+
+    private async Task<EffectDispatchStatus> DispatchPlannedCoreAsync(
+        ControllerLease expected, ControllerClockEvidence clockEvidence, LifecycleProfile profile, string intentId,
+        IReconciliationEffectProvider provider, DateTimeOffset? firstSendDeadline,
+        Func<CancellationToken, Task<FargateFirstLaunchEvidence?>>? readFirstLaunch,
+        CancellationToken ownershipLost, CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(expected);
         ArgumentNullException.ThrowIfNull(clockEvidence);
@@ -81,8 +111,8 @@ public sealed partial class DynamoDbEffectDispatcher
             return EffectDispatchStatus.OwnershipUnavailable;
         }
         var effect = await _journal.ReadAsync(profile, intentId, token).ConfigureAwait(false);
-        bool rearm = effect is { Entry.State: EffectState.Settled, Entry.Resolution.Kind: EffectResolutionKind.AbandonedBeforeSend,
-            Entry.Envelope.Request: FargateStopEffectRequest { Incarnation: not null } };
+        bool unsentStop = effect?.Entry.IsUnsentFargateStop() == true;
+        bool rearm = unsentStop && effect?.Entry.State == EffectState.Settled;
         if (effect is null || (effect.Entry.State == EffectState.Settled && !rearm))
         {
             return EffectDispatchStatus.NotPlanned;
@@ -107,16 +137,27 @@ public sealed partial class DynamoDbEffectDispatcher
         {
             return EffectDispatchStatus.StalePlan;
         }
+        bool rebind = unsentStop && catalog?.AppliedGeneration > envelope.Generation;
         if (envelope.IntentId != EffectIntentIdentity.ForAllocation(envelope.Request) ||
-            catalog is null || catalog.AppliedGeneration != envelope.Generation ||
+            catalog is null || (catalog.AppliedGeneration != envelope.Generation && !rebind) ||
             catalog.Binding.ScaleSetId is not > 0 ||
             catalog.State is not (CatalogProfileState.Active or CatalogProfileState.Draining) ||
             RequestAllocation(envelope.Request, catalog.Binding) is not { } allocationId)
         {
             return EffectDispatchStatus.Ineligible;
         }
+        if (rebind)
+        {
+            envelope = EffectEnvelope.Create(profile, intentId, catalog.AppliedGeneration, envelope.Request,
+                envelope.EarliestPossibleFirstSend, envelope.ProviderReplayDeadline);
+        }
         if (envelope.Request is FargateLaunchEffectRequest { OwnershipTags: not null } fargateLaunch &&
-            (firstSendDeadline is null || !DynamoDbLifecycleStore.MatchesFargateLaunchCatalog(catalog, envelope, fargateLaunch)))
+            ((firstSendDeadline is null && readFirstLaunch is null) ||
+                !DynamoDbLifecycleStore.MatchesFargateLaunchCatalog(catalog, envelope, fargateLaunch)))
+        {
+            return EffectDispatchStatus.Ineligible;
+        }
+        if (readFirstLaunch is not null && envelope.Request is not FargateLaunchEffectRequest { OwnershipTags: not null })
         {
             return EffectDispatchStatus.Ineligible;
         }
@@ -168,6 +209,17 @@ public sealed partial class DynamoDbEffectDispatcher
             return EffectDispatchStatus.Ineligible;
         }
 
+        FargateFirstLaunchEvidence? fargateAdmission = null;
+        if (readFirstLaunch is not null)
+        {
+            fargateAdmission = await CallBoundedAsync(readFirstLaunch, sendWindow.Duration, token).ConfigureAwait(false);
+            if (fargateAdmission is null)
+            {
+                return EffectDispatchStatus.Ineligible;
+            }
+            firstSendDeadline = fargateAdmission.ValidUntil;
+        }
+
         var oldestEvidence = observation.ObservedAt;
         if (knownTerminalStop)
         {
@@ -213,18 +265,21 @@ public sealed partial class DynamoDbEffectDispatcher
             }
         }
         var guard = new EffectDispatchGuard(catalog, index!, allocationId, allocation?.Revision, Ec2Lineage: lineage,
-            FargateStopAdmission: stopAdmission);
-        if (rearm)
+            FargateStopAdmission: stopAdmission, FargateFirstLaunch: fargateAdmission);
+        if (rearm || rebind)
         {
-            var restored = await _journal.RearmAbandonedFargateStopAsync(lease, effect, guard, token).ConfigureAwait(false);
-            if (restored != LifecycleWriteOutcome.Committed)
+            Guid transition = Guid.NewGuid();
+            var restored = await _journal.ReplanUnsentFargateStopAsync(lease, effect, envelope, guard, transition,
+                sendWindow.UpperUtcNow, token).ConfigureAwait(false);
+            if (restored is not (LifecycleWriteOutcome.Committed or LifecycleWriteOutcome.Conflict or LifecycleWriteOutcome.Indeterminate))
             {
                 return DispatchOutcome(restored);
             }
             var planned = await _journal.ReadAsync(profile, intentId, token).ConfigureAwait(false);
-            if (planned is not { Entry.State: EffectState.Planned } || !planned.Entry.Envelope.Matches(envelope))
+            if (planned is not { Entry.State: EffectState.Planned } || planned.Revision != checked(effect.Revision + 1) ||
+                planned.TransitionId != transition || !planned.Entry.Envelope.Matches(envelope))
             {
-                return EffectDispatchStatus.Conflict;
+                return restored == LifecycleWriteOutcome.Committed ? EffectDispatchStatus.Conflict : DispatchOutcome(restored);
             }
             effect = planned;
             index = await _store.ReadEffectIndexAsync(profile, token).ConfigureAwait(false);
@@ -285,6 +340,11 @@ public sealed partial class DynamoDbEffectDispatcher
         var catalog = await _store.ReadCatalogProfileAsync(envelope.Profile, cancellationToken).ConfigureAwait(false);
         if (envelope.Request is FargateStopEffectRequest && alreadyApplied is null &&
             (guard.FargateStopAdmission is null || await _store.ReadZeroFargateAcquisitionsAsync(envelope.Profile, cancellationToken).ConfigureAwait(false) is null))
+        {
+            return await AbandonNoSendAsync(lease, permission).ConfigureAwait(false);
+        }
+        if (guard.FargateFirstLaunch is { } admission &&
+            !await _store.MatchesFirstFargateLaunchAsync(envelope.Profile, admission, cancellationToken).ConfigureAwait(false))
         {
             return await AbandonNoSendAsync(lease, permission).ConfigureAwait(false);
         }

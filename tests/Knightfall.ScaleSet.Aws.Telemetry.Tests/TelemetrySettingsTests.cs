@@ -1,3 +1,4 @@
+using System.Text.Json;
 using Knightfall.ScaleSet.Aws.Controller.Telemetry;
 using Xunit;
 
@@ -5,6 +6,42 @@ namespace Knightfall.ScaleSet.Aws.Telemetry.Tests;
 
 public sealed class TelemetrySettingsTests
 {
+    public static TheoryData<string, string?> EndpointPaths()
+    {
+        using var fixtures = JsonDocument.Parse(File.ReadAllBytes(Path.Combine(AppContext.BaseDirectory, "otlp-endpoints.json")));
+        var cases = new TheoryData<string, string?>();
+        foreach (var fixture in fixtures.RootElement.EnumerateArray())
+        {
+            cases.Add(fixture.GetProperty("endpoint").GetString()!, fixture.GetProperty("path").GetString());
+        }
+        return cases;
+    }
+
+    [Theory]
+    [MemberData(nameof(EndpointPaths))]
+    public void RuntimeUsesTheSameLiteralEndpointPathsAsCdk(string endpoint, string? expectedPath)
+    {
+        const string endpointKey = "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT";
+        TelemetrySettings Load() => TelemetrySettings.Load(readEnvironment: key => key switch
+        {
+            endpointKey => endpoint,
+            "OTEL_EXPORTER_OTLP_TRACES_PROTOCOL" => "http/protobuf",
+            "OTEL_EXPORTER_OTLP_TRACES_HEADERS" => "authorization=fixture",
+            _ => null,
+        });
+        if (expectedPath is null)
+        {
+            var error = Assert.Throws<TelemetrySettingsException>(() => Load());
+            Assert.Equal(endpointKey, error.Setting);
+            Assert.DoesNotContain(endpoint, error.Message, StringComparison.Ordinal);
+            return;
+        }
+
+        var traces = Assert.IsType<TelemetryEndpoint>(Load().Traces);
+        Assert.Equal(expectedPath, traces.Uri.AbsolutePath);
+        Assert.Equal("fixture", traces.Headers["authorization"]);
+    }
+
     [Fact]
     public void ResolvesEachSettingOnceAndKeepsExactPerSignalOverrides()
     {

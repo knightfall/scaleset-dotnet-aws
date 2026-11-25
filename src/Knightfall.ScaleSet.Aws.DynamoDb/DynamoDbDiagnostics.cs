@@ -128,6 +128,8 @@ internal static class DynamoDbDiagnostics
             return result;
         }
 
+        internal void CompleteStatusRead(string outcome) => _outcome = outcome;
+
         public void Dispose()
         {
             string outcome = _outcome ?? (_cancellationToken.IsCancellationRequested ? "cancelled" : "unknown");

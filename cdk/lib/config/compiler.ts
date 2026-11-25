@@ -110,12 +110,26 @@ function formatJson(value: unknown, indent: string): string {
   return json;
 }
 
-export function compileConfig(source: string): {
+export function decodeConfiguration(bytes: Uint8Array): string {
+  try {
+    return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+  } catch {
+    throw new ConfigValidationError(
+      "yaml",
+      "",
+      "Configuration input must be valid UTF-8.",
+    );
+  }
+}
+
+export function compileConfig(source: string | Uint8Array): {
   runtime: RunnerControllerRuntime;
   json: string;
   sha256: string;
 } {
-  const parsed = parseYaml(source);
+  const parsed = parseYaml(
+    typeof source === "string" ? source : decodeConfiguration(source),
+  );
   rejectDeferredGitHubConfig(parsed);
   const config = requireShape(parsed, validateConfigShape);
   const runtime = requireShape(

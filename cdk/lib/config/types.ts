@@ -98,6 +98,12 @@ interface ControllerSpec {
   readonly dryRun?: DryRunConfig;
   readonly controller: {
     readonly image: string;
+    readonly predecessorCapture?: {
+      readonly logGroupArn: string;
+      readonly eventRuleArn: string;
+      readonly qualifiedFrom: string;
+      readonly qualifiedUntil: string;
+    };
     readonly hosting: {
       readonly type: "ecs-fargate";
       readonly network: string;

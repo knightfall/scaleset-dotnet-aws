@@ -78,6 +78,7 @@ public sealed partial class Ec2ProfileInspector : IDisposable
         Ec2PreflightStatus.InstanceProfileMismatch or Ec2PreflightStatus.BootstrapRoleMismatch => "role_mismatch",
         Ec2PreflightStatus.NetworkIncompatible or Ec2PreflightStatus.PlacementIncompatible => "network_incompatible",
         Ec2PreflightStatus.StatusQualificationMismatch => "status_qualification_mismatch",
+        Ec2PreflightStatus.EbsKeyUnqualified => "ebs_key_unqualified",
         _ => "template_incompatible",
     };
 
@@ -145,6 +146,13 @@ public sealed partial class Ec2ProfileInspector : IDisposable
             if (!HasEncryptedRoot(data, image.RootDeviceName))
             {
                 return Failed(Ec2PreflightStatus.RootEncryptionUnverified, observedVersion);
+            }
+            // An explicit KMS key other than the regional AWS-managed alias requires a separately qualified launch path.
+            string awsManagedKey = $"arn:{target.Partition}:kms:{target.Aws.Region}:{target.Aws.Account}:alias/aws/ebs";
+            if (data.BlockDeviceMappings?.Any(mapping => mapping.Ebs?.KmsKeyId is { Length: > 0 } key &&
+                key != "alias/aws/ebs" && key != awsManagedKey) == true)
+            {
+                return Failed(Ec2PreflightStatus.EbsKeyUnqualified, observedVersion);
             }
             string? instanceType = provisioner.InstanceType ?? data.InstanceType?.Value;
             if (string.IsNullOrWhiteSpace(instanceType) || data.InstanceRequirements is not null ||

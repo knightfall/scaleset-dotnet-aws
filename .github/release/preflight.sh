@@ -34,10 +34,16 @@ gh api --method GET "$repo/actions/workflows/ci.yml/runs" \
   ' > /dev/null || fail 'The exact commit needs a successful main CI push run.'
 
 artifact_name="controller-candidate-$GITHUB_SHA-$CANDIDATE_ATTEMPT"
-artifact_id=$(gh api --method GET "$repo/actions/runs/$CANDIDATE_RUN_ID/artifacts" -f name="$artifact_name" |
-  jq -er --arg name "$artifact_name" '
+artifact=$(gh api --method GET "$repo/actions/runs/$CANDIDATE_RUN_ID/artifacts" -f name="$artifact_name" |
+  jq -ec --arg name "$artifact_name" '
     [.artifacts[] | select(.name == $name and .expired == false)] |
-    select(length == 1) | .[0].id | select(type == "number" and . > 0)
+    select(length == 1) | .[0] | select(.id | type == "number" and . > 0)
   ') || fail 'Expected exactly one unexpired sealed candidate artifact for the selected run attempt.'
+artifact_id=$(jq -r .id <<< "$artifact")
+jq -e --argjson now "$(date -u +%s)" '
+  (.created_at | fromdateiso8601) as $created | $created <= $now and $now - $created <= (72 * 3600)
+' <<< "$artifact" > /dev/null || fail 'The sealed artifact is outside the 72-hour promotion window.'
+[[ "${REVIEWED_ARTIFACT_ID+x}" != x || "$artifact_id" == "$REVIEWED_ARTIFACT_ID" ]] ||
+  fail 'Current candidate artifact identity differs from the reviewed artifact.'
 
 printf 'artifact_id=%s\n' "$artifact_id" >> "$GITHUB_OUTPUT"

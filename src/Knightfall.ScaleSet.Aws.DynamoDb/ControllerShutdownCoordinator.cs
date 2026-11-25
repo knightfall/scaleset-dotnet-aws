@@ -1,3 +1,4 @@
+using Amazon.Runtime;
 using Knightfall.ScaleSet.Aws.Core.Lifecycle;
 
 namespace Knightfall.ScaleSet.Aws.DynamoDb;
@@ -19,6 +20,7 @@ public enum ControllerShutdownStatus
     OwnershipUnavailable = 1,
     ReconciliationPending = 2,
     ReleaseUnconfirmed = 3,
+    QuiescenceUnconfirmed = 4,
 }
 
 public sealed class ControllerShutdownCoordinator
@@ -59,9 +61,13 @@ public sealed class ControllerShutdownCoordinator
         IControllerShutdownWork work,
         CancellationToken cleanupToken)
     {
-        await work.StopAdmissionsAsync(cleanupToken).ConfigureAwait(false);
-        await work.CancelPollsAsync(cleanupToken).ConfigureAwait(false);
-        await work.JoinMutatorsAsync(cleanupToken).ConfigureAwait(false);
+        bool admissionsStopped = await TryStepAsync(work.StopAdmissionsAsync, cleanupToken).ConfigureAwait(false);
+        bool pollsStopped = await TryStepAsync(work.CancelPollsAsync, cleanupToken).ConfigureAwait(false);
+        bool joined = await TryStepAsync(work.JoinMutatorsAsync, cleanupToken).ConfigureAwait(false);
+        if (!admissionsStopped || !pollsStopped || !joined)
+        {
+            return ControllerShutdownStatus.QuiescenceUnconfirmed;
+        }
 
         if (ownership.ReadAuthority() is not { } authority)
         {
@@ -72,17 +78,30 @@ public sealed class ControllerShutdownCoordinator
             throw new ArgumentException("Shutdown profiles must belong to the controller deployment.", nameof(configuredProfiles));
         }
 
-        var durableProfiles = await _store.ReadEffectProfilesAsync(authority.Lease.Deployment, cleanupToken).ConfigureAwait(false);
+        IReadOnlyCollection<LifecycleProfile> durableProfiles = [];
+        bool complete = await TryStepAsync(async token => durableProfiles =
+            await _store.ReadEffectProfilesAsync(authority.Lease.Deployment, token).ConfigureAwait(false),
+            cleanupToken).ConfigureAwait(false);
         var profiles = configuredProfiles.Concat(durableProfiles).Distinct().ToArray();
         foreach (var profile in profiles)
         {
-            if (!await CancelPlannedAsync(ownership, profile, cleanupToken).ConfigureAwait(false))
+            if (!await TryStepAsync(async token => complete &=
+                await CancelPlannedAsync(ownership, profile, token).ConfigureAwait(false),
+                cleanupToken).ConfigureAwait(false))
             {
-                break;
+                complete = false;
             }
         }
 
-        await work.CloseOwnedSessionsAsync(cleanupToken).ConfigureAwait(false);
+        // The exact session fence still protects closure after a failed effect-index read.
+        if (ownership.ReadAuthority() is null)
+        {
+            return ControllerShutdownStatus.OwnershipUnavailable;
+        }
+        if (!await TryStepAsync(work.CloseOwnedSessionsAsync, cleanupToken).ConfigureAwait(false) || !complete)
+        {
+            return ControllerShutdownStatus.ReconciliationPending;
+        }
         foreach (var profile in profiles)
         {
             if (ownership.ReadAuthority() is not { } current)
@@ -97,8 +116,29 @@ public sealed class ControllerShutdownCoordinator
             }
         }
 
-        return await ownership.ReleaseAsync(cleanupToken).ConfigureAwait(false)
+        bool released = false;
+        _ = await TryStepAsync(async token => released =
+            await ownership.ReleaseAsync(token).ConfigureAwait(false), cleanupToken).ConfigureAwait(false);
+        return released
             ? ControllerShutdownStatus.Released : ControllerShutdownStatus.ReleaseUnconfirmed;
+    }
+
+    private static async Task<bool> TryStepAsync(Func<CancellationToken, Task> step, CancellationToken token)
+    {
+        if (token.IsCancellationRequested)
+        {
+            return false;
+        }
+        try
+        {
+            await step(token).ConfigureAwait(false);
+            return !token.IsCancellationRequested;
+        }
+        catch (Exception error) when (error is IOException or TimeoutException or OperationCanceledException or InvalidOperationException or
+            AmazonClientException or AmazonServiceException or AggregateException)
+        {
+            return false;
+        }
     }
 
     private async Task<bool> CancelPlannedAsync(ControllerLeaseOwnership ownership, LifecycleProfile profile, CancellationToken cleanupToken)

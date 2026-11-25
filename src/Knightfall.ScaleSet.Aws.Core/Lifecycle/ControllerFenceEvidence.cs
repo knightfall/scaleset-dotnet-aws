@@ -8,9 +8,14 @@ public enum ControllerTaskFenceStatus
     Missing = 3,
 }
 
+public readonly record struct ControllerTaskFenceObservation(ControllerTaskFenceStatus Status, DateTimeOffset? ValidUntil = null);
+
 public interface IControllerTaskFenceObserver
 {
     Task<ControllerTaskFenceStatus> ReadAsync(string taskArn, CancellationToken cancellationToken);
+
+    async Task<ControllerTaskFenceObservation> ObserveAsync(string taskArn, DateTimeOffset? acquiredAt, CancellationToken cancellationToken) =>
+        new(await ReadAsync(taskArn, cancellationToken).ConfigureAwait(false));
 }
 
 public sealed record ControllerClockEvidence(

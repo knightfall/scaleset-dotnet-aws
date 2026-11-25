@@ -124,16 +124,59 @@ public sealed class ControllerLeaseOwnership : IDisposable
     {
         ArgumentOutOfRangeException.ThrowIfLessThanOrEqual(interval, TimeSpan.Zero);
         ArgumentNullException.ThrowIfNull(readClock);
-        while (!_lost.IsCancellationRequested && !stoppingToken.IsCancellationRequested)
+        using var lifetime = CancellationTokenSource.CreateLinkedTokenSource(stoppingToken, _lost.Token);
+        try
         {
-            var evidence = await readClock(stoppingToken).ConfigureAwait(false);
-            if (await RenewAsync(evidence, stoppingToken).ConfigureAwait(false) == ControllerHeartbeatStatus.OwnershipLost)
+            while (!lifetime.IsCancellationRequested)
             {
-                return;
+                var remaining = ReadHeartbeatWindow();
+                if (remaining <= TimeSpan.Zero)
+                {
+                    _ = await LoseAsync().ConfigureAwait(false);
+                    return;
+                }
+
+                using var deadline = new CancellationTokenSource(remaining < interval ? remaining : interval, _clock);
+                using var attempt = CancellationTokenSource.CreateLinkedTokenSource(lifetime.Token, deadline.Token);
+                var evidence = await readClock(attempt.Token).ConfigureAwait(false);
+                if (await RenewAsync(evidence, attempt.Token).ConfigureAwait(false) == ControllerHeartbeatStatus.OwnershipLost)
+                {
+                    return;
+                }
+
+                remaining = ReadHeartbeatWindow();
+                if (remaining > TimeSpan.Zero)
+                {
+                    await Task.Delay(remaining < interval ? remaining : interval, _clock, lifetime.Token).ConfigureAwait(false);
+                }
             }
-            using var wait = CancellationTokenSource.CreateLinkedTokenSource(stoppingToken, _lost.Token);
-            await Task.Delay(interval, _clock, wait.Token).ConfigureAwait(false);
         }
+        catch (OperationCanceledException) when (lifetime.IsCancellationRequested)
+        {
+        }
+        catch (OperationCanceledException)
+        {
+            // An attempt deadline can interrupt a renewal with an unknown outcome.
+            _ = await LoseAsync().ConfigureAwait(false);
+        }
+        catch (Exception)
+        {
+            _ = await LoseAsync().ConfigureAwait(false);
+            throw;
+        }
+    }
+
+    private TimeSpan ReadHeartbeatWindow()
+    {
+        var current = Volatile.Read(ref _authority);
+        var now = _clock.GetUtcNow();
+        if (!current.Clock.TryGetUpperBound(now, current.Lease.ValidUntil, _reserve, out var upper))
+        {
+            return TimeSpan.Zero;
+        }
+        var leaseDeadline = current.Lease.ValidUntil - _reserve;
+        var deadline = current.Clock.ValidUntil < leaseDeadline ? current.Clock.ValidUntil : leaseDeadline;
+        return deadline - upper;
     }
 
     internal async Task<bool> ReleaseAsync(CancellationToken cancellationToken)

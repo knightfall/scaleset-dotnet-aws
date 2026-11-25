@@ -42,15 +42,31 @@ internal sealed class TelemetryPrivacy(FrozenDictionary<string, string> profiles
 
         data.TraceStateString = null;
         data.SetStatus(data.Status);
-        string? profile = Profile(data.GetTagItem("profile") as string, data.GetTagItem("provider") as string);
+        var tags = new Dictionary<string, object?>(StringComparer.Ordinal);
         foreach (var (key, value) in data.TagObjects.ToArray())
         {
-            if (!AllowsTag(data.Source.Name, key, value, profile))
+            // SetTag removes one occurrence. Drain the snapshot before writing approved values back.
+            data.SetTag(key, null);
+            if (!tags.TryAdd(key, value))
             {
-                data.SetTag(key, key == "reason" && TelemetryNames.Components.Contains(data.Source.Name) ? "other" : null);
+                tags[key] = null; // Repeated keys have no authoritative value.
             }
         }
-        data.DisplayName = data.Source.Name switch
+
+        string source = data.Source.Name;
+        string? profile = Profile(tags.GetValueOrDefault("profile") as string, tags.GetValueOrDefault("provider") as string);
+        foreach (var (key, value) in tags)
+        {
+            if (AllowsTag(source, key, value, profile))
+            {
+                data.SetTag(key, value);
+            }
+            else if (key == "reason" && TelemetryNames.Components.Contains(source))
+            {
+                data.SetTag(key, "other");
+            }
+        }
+        data.DisplayName = source switch
         {
             TelemetryNames.Http => data.GetTagItem("http.request.method") as string ?? "HTTP",
             TelemetryNames.Client => "scaleset.client.request",
@@ -95,8 +111,7 @@ internal sealed class TelemetryPrivacy(FrozenDictionary<string, string> profiles
         }
         return key switch
         {
-            "profile" => TelemetryNames.Components.Contains(source) && profile is not null,
-            "provider" => TelemetryNames.Components.Contains(source) && value is "ec2" or "fargate",
+            "profile" or "provider" => TelemetryNames.Components.Contains(source) && profile is not null,
             "operation" => value is string operation && TelemetryNames.Operations.Contains(operation),
             "outcome" => value is string outcome && TelemetryNames.Outcomes.Contains(outcome),
             "reason" => value is string reason && TelemetryNames.Reasons.Contains(reason),

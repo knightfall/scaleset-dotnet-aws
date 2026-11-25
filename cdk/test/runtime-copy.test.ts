@@ -19,7 +19,7 @@ const create = {
   },
 };
 
-function copy(versionId?: string) {
+function copy(versionId?: string, errorName?: string) {
   const calls: unknown[] = [];
   const exports: {
     begin?: (event: object) => Promise<unknown>;
@@ -33,6 +33,11 @@ function copy(versionId?: string) {
         S3Client: class {
           async send(command: unknown) {
             calls.push(command);
+            if (errorName) {
+              throw Object.assign(new Error("private-service-error-fixture"), {
+                name: errorName,
+              });
+            }
             return {
               VersionId: versionId,
               CopySourceVersionId: "source-version",
@@ -68,6 +73,24 @@ test("copies exact runtime bytes by key and returns only the destination version
       ExpectedSourceBucketOwner: "111122223333",
     },
   ]);
+});
+
+test("bootstrap copy access denial identifies the exact operator action without echoing a service message", async () => {
+  const fixture = copy(undefined, "AccessDenied");
+  await assert.rejects(
+    () => fixture.copy(create),
+    (error: unknown) => {
+      assert.ok(
+        typeof error === "object" &&
+          error !== null &&
+          "message" in error &&
+          typeof error.message === "string",
+      );
+      assert.match(error.message, /configure bootstrapAssetKeyArn/u);
+      assert.doesNotMatch(error.message, /private-service-error-fixture/u);
+      return true;
+    },
+  );
 });
 
 test("missing or null versions leave the waiter incomplete and removal retains the object", async () => {

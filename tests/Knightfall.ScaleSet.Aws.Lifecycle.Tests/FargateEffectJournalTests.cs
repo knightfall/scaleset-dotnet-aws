@@ -386,7 +386,7 @@ public sealed class FargateEffectJournalTests
         var pause = table.Wire.PauseNextTransactionWrite(key);
         var freshness = Timing.ObservationFreshness;
 
-        Task<LifecycleWriteOutcome> Close() => fixture.Store.CloseFargateAdmissionAsync(fixture.Lease, executor, freshness, token);
+        Task<LifecycleWriteOutcome> Close() => fixture.Store.CloseFargateAdmissionAsync(fixture.Lease, catalog, executor, freshness, token);
         Task<JitHandoffChange> Stage() => fixture.Store.StageJitHandoffAsync(fixture.Lease, catalog, executor, identity, runnerName, token);
         if (closureWins)
         {
@@ -438,8 +438,9 @@ public sealed class FargateEffectJournalTests
         var fixture = await CreateFixtureAsync(table, token);
         var binding = Bind(Launch(fixture.Profile));
         var executor = await SeedLiveAsync(fixture, binding, token);
+        var catalog = Assert.IsType<CatalogProfile>(await fixture.Store.ReadCatalogProfileAsync(fixture.Profile, token));
         Assert.Equal(LifecycleWriteOutcome.Committed,
-            await fixture.Store.CloseFargateAdmissionAsync(fixture.Lease, executor, Timing.ObservationFreshness, token));
+            await fixture.Store.CloseFargateAdmissionAsync(fixture.Lease, catalog, executor, Timing.ObservationFreshness, token));
         fixture.Clock.Now = fixture.Clock.Now.AddSeconds(1);
         var stop = Stop(fixture, binding);
         await PlanAsync(fixture, stop, token);
@@ -477,8 +478,9 @@ public sealed class FargateEffectJournalTests
         var fixture = await CreateFixtureAsync(table, token);
         var binding = Bind(Launch(fixture.Profile));
         var executor = await SeedLiveAsync(fixture, binding, token);
+        var catalog = Assert.IsType<CatalogProfile>(await fixture.Store.ReadCatalogProfileAsync(fixture.Profile, token));
         Assert.Equal(LifecycleWriteOutcome.Committed,
-            await fixture.Store.CloseFargateAdmissionAsync(fixture.Lease, executor, Timing.ObservationFreshness, token));
+            await fixture.Store.CloseFargateAdmissionAsync(fixture.Lease, catalog, executor, Timing.ObservationFreshness, token));
         var stop = Stop(fixture, binding);
         await PlanAsync(fixture, stop, token);
         var provider = new FixtureProvider(fixture.Clock);
@@ -494,9 +496,10 @@ public sealed class FargateEffectJournalTests
     }
 
     [Theory]
-    [InlineData(false)]
-    [InlineData(true)]
-    public async Task RevokedStopNeedsTheExactUnconsumedOfferAndNoOpenAcquisition(bool consumed)
+    [InlineData(false, false)]
+    [InlineData(false, true)]
+    [InlineData(true, false)]
+    public async Task FargateClosureRevokesOnlyAnExactUnconsumedOfferUnderCompleteInventory(bool consumed, bool loseRevocationReply)
     {
         var token = TestContext.Current.CancellationToken;
         using var table = await MiniStackTable.CreateAsync(token);
@@ -522,20 +525,36 @@ public sealed class FargateEffectJournalTests
         var registered = Assert.IsType<ExecutorSnapshot>(await fixture.Store.ReadExecutorAsync(fixture.Profile, binding.AllocationId, token));
         var freshness = Timing.ObservationFreshness;
 
-        Assert.Equal(LifecycleWriteOutcome.Conflict, await fixture.Store.CloseFargateAdmissionAsync(fixture.Lease, registered, freshness, token));
+        var inventory = await fixture.Store.ReadExecutorInventoryAsync(fixture.Profile, token);
+        var coverage = Assert.IsType<ExecutorInventoryObservation>(inventory.Coverage);
+        Assert.Equal(LifecycleWriteOutcome.Committed, await fixture.Store.PublishExecutorInventoryAsync(fixture.Profile,
+            fixture.Lease.Fence, inventory.Revision, coverage with { IsComplete = false }, token));
+        Assert.Equal(LifecycleWriteOutcome.Conflict, await CloseAsync(fixture.Store));
+        Assert.Equal(JitHandoffState.Offered, (await fixture.Store.ReadJitHandoffAsync(fixture.Profile, identity.AllocationId, token))?.State);
+        var partial = await fixture.Store.ReadExecutorInventoryAsync(fixture.Profile, token);
+        Assert.Equal(LifecycleWriteOutcome.Committed, await fixture.Store.PublishExecutorInventoryAsync(fixture.Profile,
+            fixture.Lease.Fence, partial.Revision, coverage, token));
         if (consumed)
         {
             Assert.Equal(BootstrapOfferStatus.Consumed, (await bootstrap.TryConsumeOfferAsync(recipient.Hello, token)).Status);
             Assert.Equal(LifecycleWriteOutcome.Conflict, (await fixture.Store.RevokeJitHandoffAsync(fixture.Lease, offered, token)).Outcome);
-            Assert.Equal(LifecycleWriteOutcome.Conflict, await fixture.Store.CloseFargateAdmissionAsync(fixture.Lease, registered, freshness, token));
+            Assert.Equal(LifecycleWriteOutcome.Conflict, await CloseAsync(fixture.Store));
         }
         else
         {
-            Assert.Equal(LifecycleWriteOutcome.Committed, (await fixture.Store.RevokeJitHandoffAsync(fixture.Lease, offered, token)).Outcome);
             await WriteAdmissionBalanceAsync(fixture, 1, token);
-            Assert.Equal(LifecycleWriteOutcome.Conflict, await fixture.Store.CloseFargateAdmissionAsync(fixture.Lease, registered, freshness, token));
+            Assert.Equal(LifecycleWriteOutcome.Conflict, await CloseAsync(fixture.Store));
+            Assert.Equal(JitHandoffState.Offered, (await fixture.Store.ReadJitHandoffAsync(fixture.Profile, identity.AllocationId, token))?.State);
             await WriteAdmissionBalanceAsync(fixture, 0, token);
-            Assert.Equal(LifecycleWriteOutcome.Committed, await fixture.Store.CloseFargateAdmissionAsync(fixture.Lease, registered, freshness, token));
+            if (loseRevocationReply)
+            {
+                table.Wire.DropNextSuccessfulTransactionResponse();
+            }
+            Assert.Equal(LifecycleWriteOutcome.Committed, await CloseAsync(fixture.Store));
+            var restarted = new DynamoDbLifecycleStore(table.Client, table.Name, fixture.Clock);
+            Assert.Equal(JitHandoffState.Revoked, (await restarted.ReadJitHandoffAsync(fixture.Profile, identity.AllocationId, token))?.State);
+            Assert.Equal(LifecycleWriteOutcome.Committed, await CloseAsync(restarted));
+            Assert.Equal(BootstrapOfferStatus.NotAvailable, (await bootstrap.TryConsumeOfferAsync(recipient.Hello, token)).Status);
         }
 
         fixture.Clock.Now = fixture.Clock.Now.AddSeconds(1);
@@ -548,6 +567,9 @@ public sealed class FargateEffectJournalTests
         Assert.Equal(consumed ? null : FargateAdmissionClosure.OfferRevoked, current.State.AdmissionClosure);
         Assert.Equal(RunnerId, current.State.RunnerId);
         Assert.Null(current.State.Job);
+
+        Task<LifecycleWriteOutcome> CloseAsync(DynamoDbLifecycleStore store) =>
+            store.CloseFargateAdmissionAsync(fixture.Lease, catalog, registered, freshness, token);
     }
 
     private static async Task<Fixture> CreateFixtureAsync(MiniStackTable table, CancellationToken cancellationToken, TimeSpan? leaseDuration = null)

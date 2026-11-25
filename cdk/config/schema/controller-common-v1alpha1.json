@@ -32,14 +32,18 @@
     "architecture": { "enum": ["x64", "arm64"] },
     "roleArn": {
       "type": "string",
-      "pattern": "^arn:aws(?:-[a-z0-9-]+)?:iam::[0-9]{12}:role/[^\\u0009-\\u000d\\u0020\\u00a0\\u1680\\u2000-\\u200a\\u2028-\\u2029\\u202f\\u205f\\u3000\\ufeff*?]+(?![\\s\\S])"
+      "pattern": "^arn:aws(?:-[a-z0-9-]+)?:iam::[0-9]{12}:role/(?=[!-~]{1,575}(?![\\s\\S]))(?:(?:(?![/*?])[!-~])+/)*[A-Za-z0-9_+=,.@-]{1,64}(?![\\s\\S])"
     },
     "metadata": {
       "type": "object",
       "additionalProperties": false,
       "required": ["name"],
       "properties": {
-        "name": { "type": "string", "$ref": "#/$defs/name", "maxLength": 238 }
+        "name": {
+          "type": "string",
+          "$comment": "The -runner-controller suffix consumes 18 of CloudFormation's 128 characters.",
+          "pattern": "^[A-Za-z][A-Za-z0-9-]{0,109}(?![\\s\\S])"
+        }
       }
     },
     "spec": {
@@ -128,10 +132,14 @@
             "type": { "const": "snapshot" },
             "s3Uri": {
               "type": "string",
-              "pattern": "^s3://[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]/[^\\u0009-\\u000d\\u0020\\u00a0\\u1680\\u2000-\\u200a\\u2028-\\u2029\\u202f\\u205f\\u3000\\ufeff?#]+(?![\\s\\S])"
+              "pattern": "^s3://(?![a-z0-9.-]*\\.\\.)(?!(?:[0-9]+\\.){3}[0-9]+/)[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]/(?=[A-Za-z0-9._/-]{1,1024}(?![\\s\\S]))[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)*(?![\\s\\S])",
+              "not": {
+                "pattern": "^s3://[a-z0-9.-]*(?:-s3alias|--ol-s3|\\.mrap|--x-s3|--table-s3)/|/\\.{1,2}(?:/|(?![\\s\\S]))"
+              }
             },
             "versionId": {
-              "$ref": "#/$defs/nonBlank",
+              "type": "string",
+              "pattern": "^[A-Za-z0-9._~+=/-]{1,1024}(?![\\s\\S])",
               "not": { "const": "null" }
             },
             "sha256": { "$ref": "#/$defs/sha256" }
@@ -157,8 +165,34 @@
           "type": "string",
           "pattern": "^[0-9]{12}\\.dkr\\.ecr\\.[a-z0-9-]+\\.amazonaws\\.com(?:\\.cn)?/[a-z0-9]+(?:[._/-][a-z0-9]+)*@sha256:[a-f0-9]{64}(?![\\s\\S])"
         },
-        "hosting": { "$ref": "#/$defs/hosting" }
+        "hosting": { "$ref": "#/$defs/hosting" },
+        "predecessorCapture": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "logGroupArn",
+            "eventRuleArn",
+            "qualifiedFrom",
+            "qualifiedUntil"
+          ],
+          "properties": {
+            "logGroupArn": {
+              "type": "string",
+              "pattern": "^arn:aws(?:-[a-z0-9-]+)?:logs:[a-z0-9-]+:[0-9]{12}:log-group:[A-Za-z0-9_./#-]{1,512}(?![\\s\\S])"
+            },
+            "eventRuleArn": {
+              "type": "string",
+              "pattern": "^arn:aws(?:-[a-z0-9-]+)?:events:[a-z0-9-]+:[0-9]{12}:rule/[A-Za-z0-9_.-]{1,64}(?![\\s\\S])"
+            },
+            "qualifiedFrom": { "$ref": "#/$defs/utcSecond" },
+            "qualifiedUntil": { "$ref": "#/$defs/utcSecond" }
+          }
+        }
       }
+    },
+    "utcSecond": {
+      "type": "string",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z(?![\\s\\S])"
     },
     "hosting": {
       "type": "object",

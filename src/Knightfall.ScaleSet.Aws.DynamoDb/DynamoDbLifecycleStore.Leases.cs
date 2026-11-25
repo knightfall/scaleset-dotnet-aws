@@ -1,4 +1,5 @@
 using System.Text.RegularExpressions;
+using System.Text.Json;
 using Amazon.DynamoDBv2.Model;
 using Knightfall.ScaleSet.Aws.Core.Lifecycle;
 
@@ -34,9 +35,10 @@ public sealed partial class DynamoDbLifecycleStore
             throw InvalidRecord();
         }
 
-        return new ControllerLease(deployment, ownerId, ownerTask, epoch, ReadWriterProtocol(item, "writerProtocol"),
+        var lease = new ControllerLease(deployment, ownerId, ownerTask, epoch, ReadWriterProtocol(item, "writerProtocol"),
             OptionalTimestamp(item, "validUntil") ?? throw InvalidRecord(), Revision(item), GuidValue(item, "transitionId"),
             mode, previous, requiredTask);
+        return ReadLeaseAcquisitionBounds(lease, item);
     }
 
     public async Task<ControllerLeaseChange> TryAcquireLeaseAsync(
@@ -74,21 +76,29 @@ public sealed partial class DynamoDbLifecycleStore
 
         ControllerLeasePredecessor? previous = null;
         string? requiredTask = null;
+        DateTimeOffset? requiredAcquiredAt = null;
         if (existing is not null)
         {
             bool clean = existing.Mode == ControllerLeaseMode.Released;
             previous = new ControllerLeasePredecessor(existing.OwnerId, existing.OwnerTaskArn, existing.Epoch,
-                existing.WriterProtocol, clean);
+                existing.WriterProtocol, clean) { AcquiredAt = existing.AcquiredAt };
             // Recovery-only owners could not dispatch external effects. Preserve the last potentially
             // active writer if a recovery owner is replaced before that writer has been isolated.
             requiredTask = existing.Mode == ControllerLeaseMode.Active
                 ? existing.OwnerTaskArn
                 : existing.RequiredFencingTaskArn;
+            requiredAcquiredAt = existing.Mode == ControllerLeaseMode.Active
+                ? existing.AcquiredAt
+                : existing.RequiredFencingTaskAcquiredAt;
         }
 
         var acquired = new ControllerLease(deployment, ownerId, ownerTaskArn, NextRevision(existing?.Epoch),
             writerProtocol, deadline, NextRevision(existing?.Revision), Guid.NewGuid(),
-            ControllerLeaseMode.RecoveryOnly, previous, requiredTask);
+            ControllerLeaseMode.RecoveryOnly, previous, requiredTask)
+        {
+            AcquiredAt = AtMillisecond(now),
+            RequiredFencingTaskAcquiredAt = requiredAcquiredAt,
+        };
         return telemetry.Complete(await WriteLeaseChangeAsync(acquired, existing, null,
             existing?.Mode == ControllerLeaseMode.Released ? null : expiredBy, cancellationToken).ConfigureAwait(false));
     }
@@ -148,6 +158,7 @@ public sealed partial class DynamoDbLifecycleStore
         {
             Mode = mode,
             RequiredFencingTaskArn = null,
+            RequiredFencingTaskAcquiredAt = null,
             Revision = NextRevision(expected.Revision),
             TransitionId = Guid.NewGuid(),
         };
@@ -180,6 +191,12 @@ public sealed partial class DynamoDbLifecycleStore
             item.Add("previousOwnerEpoch", NumberValue(previous.Epoch));
             item.Add("previousWriterProtocol", NumberValue(previous.WriterProtocol));
             item.Add("previousCleanRelease", new AttributeValue { BOOL = previous.CleanRelease });
+        }
+        if (replacement.AcquiredAt is { } acquiredAt)
+        {
+            var bounds = new LeaseAcquisitionBounds(replacement.OwnerId, replacement.OwnerTaskArn, replacement.Epoch,
+                acquiredAt, replacement.PreviousOwner?.AcquiredAt, replacement.RequiredFencingTaskAcquiredAt);
+            item.Add("acquisitionBounds", StringValue(JsonSerializer.Serialize(bounds)));
         }
 
         var action = CompareAndPut(key, item, expected?.Revision, replacement.Deployment);
@@ -279,6 +296,44 @@ public sealed partial class DynamoDbLifecycleStore
         long protocol = Number(item, name);
         return protocol is > 0 and <= int.MaxValue ? (int)protocol : throw InvalidRecord();
     }
+
+    private static ControllerLease ReadLeaseAcquisitionBounds(ControllerLease lease, Dictionary<string, AttributeValue> item)
+    {
+        if (!item.ContainsKey("acquisitionBounds"))
+        {
+            return lease;
+        }
+        LeaseAcquisitionBounds bounds;
+        try
+        {
+            bounds = JsonSerializer.Deserialize<LeaseAcquisitionBounds>(Text(item, "acquisitionBounds"), JsonSerializerOptions.Strict)
+                ?? throw InvalidRecord();
+        }
+        catch (JsonException)
+        {
+            return lease;
+        }
+        // A legacy writer can update the lease while leaving this additive field in place.
+        if (bounds.Epoch != lease.Epoch || bounds.OwnerId != lease.OwnerId || bounds.OwnerTaskArn != lease.OwnerTaskArn)
+        {
+            return lease;
+        }
+        if (bounds.AcquiredAt <= DateTimeOffset.UnixEpoch || bounds.AcquiredAt >= lease.ValidUntil ||
+            (lease.PreviousOwner is null && bounds.PreviousAcquiredAt is not null) ||
+            (lease.RequiredFencingTaskArn is null && bounds.RequiredAcquiredAt is not null))
+        {
+            return lease;
+        }
+        return lease with
+        {
+            AcquiredAt = bounds.AcquiredAt,
+            PreviousOwner = lease.PreviousOwner is { } prior ? prior with { AcquiredAt = bounds.PreviousAcquiredAt } : null,
+            RequiredFencingTaskAcquiredAt = bounds.RequiredAcquiredAt,
+        };
+    }
+
+    private sealed record LeaseAcquisitionBounds(string OwnerId, string OwnerTaskArn, long Epoch, DateTimeOffset AcquiredAt,
+        DateTimeOffset? PreviousAcquiredAt, DateTimeOffset? RequiredAcquiredAt);
 
     private DateTimeOffset ConservativeLatest(DateTimeOffset latestNow)
     {

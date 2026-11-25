@@ -9,8 +9,13 @@ on:
       - '.github/workflows/release.yml'
       - 'Directory.Build.*'
       - 'Directory.Packages.props'
+      - '.editorconfig'
       - 'global.json'
-      - 'src/Knightfall.ScaleSet.Aws.Controller/*.csproj'
+      - 'NuGet.Config'
+      - 'src/**'
+      - 'cdk/config/schema/**'
+      - 'testdata/config/**'
+      - 'tests/Knightfall.ScaleSet.Aws.Core.Tests/**'
       - 'tests/oci/**'
   push:
     branches: [main]
@@ -37,21 +42,41 @@ jobs:
     env:
       RID: ${{ matrix.rid }}
       BUILD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+      BUILD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
+      DOCKER_ENGINE_VERSION: '29.10.0'
       DOTNET_CLI_TELEMETRY_OPTOUT: '1'
       TESTINGPLATFORM_TELEMETRY_OPTOUT: '1'
     steps:
+      - name: Require an exact source for pull requests
+        if: github.event_name == 'pull_request'
+        env:
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
+        run: |
+          test -n "$PR_HEAD_SHA"
+          test "$BUILD_SHA" = "$PR_HEAD_SHA"
+          test -n "$PR_HEAD_REPOSITORY"
+          test "$BUILD_REPOSITORY" = "$PR_HEAD_REPOSITORY"
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          repository: ${{ env.BUILD_REPOSITORY }}
           ref: ${{ env.BUILD_SHA }}
           persist-credentials: false
+      - name: Verify the checked-out source commit
+        run: test "$(git rev-parse HEAD)" = "$BUILD_SHA"
       - uses: actions/setup-dotnet@0f4a354dd5547a28c70b7853dbd95d5b67886e73 # v6.1.0
         with:
           global-json-file: global.json
       - name: Set up the Docker containerd image store
         uses: docker/setup-docker-action@3f1ab1ab0e29231562e4db4ca600c1a49653bac6 # v5.7.0
         with:
+          version: v${{ env.DOCKER_ENGINE_VERSION }}
           set-host: true
           daemon-config: '{"features":{"containerd-snapshotter":true}}'
+      - name: Verify Docker client and daemon versions
+        run: |
+          test "$(docker version --format '{{.Client.Version}}')" = "$DOCKER_ENGINE_VERSION"
+          test "$(docker version --format '{{.Server.Version}}')" = "$DOCKER_ENGINE_VERSION"
       - name: Build, inspect and smoke-test the OCI archive
         run: bash .github/release/build-controller.sh "$RID" "$RUNNER_TEMP/controller"
       - uses: anchore/scan-action/download-grype@11983a512817154c80a9db660c1a184be7513ed6 # v7.4.3
@@ -63,6 +88,7 @@ jobs:
         env:
           GRYPE: ${{ steps.grype.outputs.cmd }}
           GRYPE_DB_VALIDATE_AGE: 'true'
+          GRYPE_DB_MAX_ALLOWED_BUILT_AGE: '72h'
           GRYPE_DB_REQUIRE_UPDATE_CHECK: 'true'
         run: |
           archive="$RUNNER_TEMP/controller/scaleset-aws-controller-$RID.tar.gz"
@@ -74,15 +100,20 @@ jobs:
           path: ${{ runner.temp }}/controller/scaleset-aws-controller-${{ matrix.rid }}.grype.json
           if-no-files-found: ignore
           retention-days: 14
-      - name: Inventory the tested image
-        uses: anchore/sbom-action@dfcb83b97731532d72be422cbc51ee64adb6fd56 # v0.24.4
+      - uses: anchore/sbom-action/download-syft@dfcb83b97731532d72be422cbc51ee64adb6fd56 # v0.24.4
+        id: syft
         with:
-          image: docker:scaleset-aws-controller:git-${{ env.BUILD_SHA }}-${{ matrix.rid }}
           syft-version: v1.57.2
-          format: spdx-json
-          output-file: ${{ runner.temp }}/controller/scaleset-aws-controller-${{ matrix.rid }}.spdx.json
-          upload-artifact: false
-          upload-release-assets: false
+      - name: Inventory the tested OCI archive
+        env:
+          SYFT: ${{ steps.syft.outputs.cmd }}
+          SYFT_CHECK_FOR_APP_UPDATE: 'false'
+        run: |
+          archive="$RUNNER_TEMP/controller/scaleset-aws-controller-$RID.tar.gz"
+          "$SYFT" scan "oci-archive:$archive" --source-name "${archive##*/}" \
+            --output "spdx-json=${archive%.tar.gz}.spdx.json"
+      - name: Verify the inventory and scan bind to the tested archived image
+        run: python3 .github/release/candidate.py check-image "$RUNNER_TEMP/controller" --rid "$RID"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: controller-${{ matrix.rid }}-${{ github.run_attempt }}

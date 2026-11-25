@@ -61,7 +61,7 @@ gh attestation verify "$download_dir/release.json" --repo "$repo" \
   --signer-workflow "$repo/.github/workflows/release-candidate.yml" \
   --source-ref refs/heads/main --source-digest "$commit" --deny-self-hosted-runners || exit 1
 python3 .github/release/candidate.py verify "$download_dir" \
-  --commit "$commit" --run-id "$candidate_run_id" --attempt "$candidate_attempt" || exit 1
+  --commit "$commit" --run-id "$candidate_run_id" --attempt "$candidate_attempt" --promotion || exit 1
 candidate_manifest_sha256=$(shasum -a 256 "$download_dir/release.json" | cut -d ' ' -f 1)
 printf '%s\n' "$candidate_manifest_sha256"
 ```
@@ -70,7 +70,9 @@ printf '%s\n' "$candidate_manifest_sha256"
 
 `release.json` records each archive's transport SHA-256 and OCI manifest
 digest. Choose `linux-x64` for ECS x86-64 or `linux-arm64` for ECS Arm.
-The corresponding `.spdx.json` inventories that image. Use Docker with the
+Starting with manifest schema 3, it also records the OCI config digest and
+the SPDX subject linked to that manifest and platform. The corresponding
+`.spdx.json` inventories that archive. Use Docker with the
 containerd image store to load the verified OCI archive. After importing the
 archive into ECR, bind the confirmed ECR manifest digest in the controller
 YAML. Each `.grype.json` records the architecture's scan and database evidence

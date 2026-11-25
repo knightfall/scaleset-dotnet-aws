@@ -36,6 +36,74 @@ public sealed class Ec2BootstrapTests
     private static readonly RunnerBootstrapTarget Target = new(Account + ":" + Region + ":fixture", "ec2", "github.com/fixture/repository", 99);
 
     [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task ExitReporterRetainsTheExactObservationUntilRolledBackTimeRecovers(bool recovers)
+    {
+        var token = TestContext.Current.CancellationToken;
+        using var recipient = JitRecipientKey.Create();
+        var start = MiniStackTable.Now;
+        var clock = new StatusRetryClock(start);
+        var principal = new VerifiedEc2BootstrapIdentity(Arn, Principal, new SessionAWSCredentials("fixture", "fixture", "fixture"));
+        var sent = new List<JitEc2BootstrapStatus>();
+        int verified = 0;
+        string qualification = new('b', 64);
+        var reporter = new Ec2BootstrapStatusReporter(principal, qualification, clock,
+            _ =>
+            {
+                verified++;
+                return Task.FromResult(principal);
+            },
+            (current, hello, status, _) =>
+            {
+                Assert.Same(principal, current);
+                Assert.Equal(recipient.Hello, hello);
+                Assert.True(status.ObservedAt <= clock.Now);
+                sent.Add(status);
+                return Task.FromResult(status.Exited && sent.Count == 2 ? LifecycleWriteOutcome.Indeterminate : LifecycleWriteOutcome.Committed);
+            });
+        var ready = new BootstrapRunnerObservation(recipient.Hello, new string('a', 64), 100, Exited: false);
+        Assert.Equal(LifecycleWriteOutcome.Committed, await reporter.ReportAsync(ready, token));
+        clock.Now = start.AddSeconds(-1);
+        int delays = 0;
+        clock.OnDelay = () =>
+        {
+            delays++;
+            if (recovers)
+            {
+                clock.Now = start.AddSeconds(delays);
+            }
+        };
+        Assert.Equal(recovers ? LifecycleWriteOutcome.Committed : LifecycleWriteOutcome.Indeterminate,
+            await reporter.ReportAsync(ready with { Exited = true }, token));
+        Assert.Equal(2, delays);
+        Assert.Equal(recovers ? 3 : 1, verified);
+        Assert.Equal(recovers ? 3 : 1, sent.Count);
+        if (recovers)
+        {
+            Assert.Equal(new JitEc2BootstrapStatus(ready.OfferId, ready.RunnerId, 2, Exited: true, start.AddMilliseconds(1))
+            {
+                QualificationSha256 = qualification,
+            }, sent[1]);
+            Assert.Same(sent[1], sent[2]);
+        }
+    }
+
+    private sealed class StatusRetryClock(DateTimeOffset start) : TimeProvider
+    {
+        internal DateTimeOffset Now { get; set; } = start;
+        internal Action? OnDelay { get; set; }
+
+        public override DateTimeOffset GetUtcNow() => Now;
+
+        public override ITimer CreateTimer(TimerCallback callback, object? state, TimeSpan dueTime, TimeSpan period)
+        {
+            OnDelay?.Invoke();
+            return TimeProvider.System.CreateTimer(callback, state, TimeSpan.Zero, period);
+        }
+    }
+
+    [Theory]
     [InlineData("valid")]
     [InlineData("account")]
     [InlineData("region")]

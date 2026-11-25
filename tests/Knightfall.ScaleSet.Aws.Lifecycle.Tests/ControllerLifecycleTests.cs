@@ -1,6 +1,7 @@
 using System.Net;
 using System.Text.Json;
 using System.Text.Json.Nodes;
+using Amazon.Runtime;
 using Amazon.SecretsManager;
 using Knightfall.ScaleSet.Aws.Core.Catalog;
 using Knightfall.ScaleSet.Aws.Core.Configuration;
@@ -252,6 +253,89 @@ public sealed class ControllerLifecycleTests
     }
 
     [Theory]
+    [InlineData("ExpiredTokenException", true)]
+    [InlineData("AccessDeniedException", false)]
+    public async Task HeartbeatOnlyRetriesRecoverableStorageErrorsWithinTheExistingFence(string errorCode, bool retry)
+    {
+        var cancellation = TestContext.Current.CancellationToken;
+        using var table = await MiniStackTable.CreateAsync(cancellation);
+        var clock = new FixtureClock();
+        var store = new DynamoDbLifecycleStore(table.Client, table.Name, clock);
+        var configuration = await ConfigurationAsync(draining: false, cancellation);
+        var lease = await AcquireAsync(store, configuration, clock, MiniStackTable.FirstTask, cancellation);
+        using var ownership = new ControllerLeaseOwnership(store, lease, ClockProof(clock), clock, LeaseDuration, Reserve);
+        clock.Now = clock.Now.AddSeconds(20);
+        table.Wire.Clear();
+        int reads = 0;
+        Task<ControllerClockEvidence?> ReadClock(CancellationToken token)
+        {
+            token.ThrowIfCancellationRequested();
+            if (++reads == 1)
+            {
+                table.Wire.FailNextGetItem(LifecycleKey.Lease(lease.Deployment), HttpStatusCode.Forbidden, errorCode);
+            }
+            else
+            {
+                Assert.Equal(lease, ownership.ReadAuthority()?.Lease);
+                clock.Now = lease.ValidUntil - Reserve;
+            }
+            return Task.FromResult<ControllerClockEvidence?>(ClockProof(clock));
+        }
+
+        var heartbeat = ownership.RunHeartbeatsAsync(TimeSpan.FromSeconds(1), ReadClock, cancellation);
+        if (retry)
+        {
+            await heartbeat;
+        }
+        else
+        {
+            _ = await Assert.ThrowsAnyAsync<AmazonServiceException>(() => heartbeat);
+        }
+
+        Assert.True(ownership.OwnershipLost.IsCancellationRequested);
+        Assert.Null(ownership.ReadAuthority());
+        Assert.Equal(retry ? 2 : 1, reads);
+        Assert.DoesNotContain(table.Wire.Requests, request => request.Operation == "TransactWriteItems");
+        Assert.Equal(lease, await store.ReadLeaseAsync(lease.Deployment, cancellation));
+    }
+
+    [Fact]
+    public async Task HeartbeatDeadlineAfterCommitEndsLocalAuthorityWithoutAnotherWrite()
+    {
+        var cancellation = TestContext.Current.CancellationToken;
+        using var table = await MiniStackTable.CreateAsync(cancellation);
+        var clock = new FixtureClock { HoldTimers = true };
+        var store = new DynamoDbLifecycleStore(table.Client, table.Name, clock);
+        var configuration = await ConfigurationAsync(draining: false, cancellation);
+        var lease = await AcquireAsync(store, configuration, clock, MiniStackTable.FirstTask, cancellation);
+        using var ownership = new ControllerLeaseOwnership(store, lease, ClockProof(clock), clock, LeaseDuration, Reserve);
+        clock.Now = clock.Now.AddSeconds(20);
+        table.Wire.Clear();
+        var paused = table.Wire.PauseAfterNextSuccessfulTransactionWrite(LifecycleKey.Lease(lease.Deployment));
+        try
+        {
+            var heartbeat = ownership.RunHeartbeatsAsync(TimeSpan.FromSeconds(1),
+                _ => Task.FromResult<ControllerClockEvidence?>(ClockProof(clock)), cancellation);
+            await paused.Captured.WaitAsync(TimeSpan.FromSeconds(5), cancellation);
+            Assert.Equal(lease, ownership.ReadAuthority()?.Lease);
+            Assert.IsType<Action>(clock.FireTimer)();
+            await heartbeat.WaitAsync(TimeSpan.FromSeconds(5), cancellation);
+        }
+        finally
+        {
+            paused.Resume();
+        }
+
+        Assert.True(ownership.OwnershipLost.IsCancellationRequested);
+        Assert.Null(ownership.ReadAuthority());
+        Assert.Single(table.Wire.Requests, request => request.Operation == "TransactWriteItems");
+        var durable = Assert.IsType<ControllerLease>(await store.ReadLeaseAsync(lease.Deployment, cancellation));
+        Assert.Equal(lease.Fence, durable.Fence);
+        Assert.Equal(ControllerLeaseMode.Active, durable.Mode);
+        Assert.Equal(lease.Revision + 1, durable.Revision);
+    }
+
+    [Theory]
     [InlineData(false)]
     [InlineData(true)]
     public async Task RootShutdownJoinsBeforeCancelingOnlyUnstartedEffectsAndReleasesWhenClear(bool ambiguous)
@@ -306,6 +390,35 @@ public sealed class ControllerLifecycleTests
             (await store.ReadLeaseAsync(lease.Deployment, cancellation))?.Mode);
         Assert.True(ownership.OwnershipLost.IsCancellationRequested);
         Assert.Null(ownership.ReadAuthority());
+    }
+
+    [Theory]
+    [InlineData("admissions", ControllerShutdownStatus.QuiescenceUnconfirmed)]
+    [InlineData("polls", ControllerShutdownStatus.QuiescenceUnconfirmed)]
+    [InlineData("join", ControllerShutdownStatus.QuiescenceUnconfirmed)]
+    [InlineData("close", ControllerShutdownStatus.ReconciliationPending)]
+    public async Task RootShutdownAttemptsEverySafeStageAndRetainsAnUnconfirmedLease(string failingStage, ControllerShutdownStatus expected)
+    {
+        var cancellation = TestContext.Current.CancellationToken;
+        using var table = await MiniStackTable.CreateAsync(cancellation);
+        var clock = new FixtureClock();
+        var store = new DynamoDbLifecycleStore(table.Client, table.Name, clock);
+        var configuration = await ConfigurationAsync(draining: false, cancellation);
+        var lease = await AcquireAsync(store, configuration, clock, MiniStackTable.FirstTask, cancellation);
+        using var ownership = new ControllerLeaseOwnership(store, lease, ClockProof(clock), clock, LeaseDuration, Reserve);
+        var dispatcher = new DynamoDbEffectDispatcher(store, clock,
+            new EffectDispatcherTiming(TimeSpan.FromSeconds(25), Reserve, TimeSpan.FromMinutes(10), TimeSpan.FromSeconds(10)));
+        var shutdown = new ControllerShutdownCoordinator(store, dispatcher);
+        var stages = new List<string>();
+        var work = new ShutdownWork(stages, (stage, _) => stage == failingStage
+            ? Task.FromException(new TimeoutException("Synthetic shutdown stage fault.")) : Task.CompletedTask);
+
+        var status = await shutdown.StopAsync(ownership, [], work, cancellation);
+
+        Assert.Equal(expected, status);
+        Assert.Equal(failingStage == "close" ? ["admissions", "polls", "join", "close"] : ["admissions", "polls", "join"], stages);
+        Assert.Equal(lease, await store.ReadLeaseAsync(lease.Deployment, cancellation));
+        Assert.True(ownership.OwnershipLost.IsCancellationRequested);
     }
 
     private static async Task ApplyCatalogAsync(DynamoDbLifecycleStore store, ControllerLease lease,
@@ -390,8 +503,20 @@ public sealed class ControllerLifecycleTests
     private sealed class FixtureClock : TimeProvider
     {
         internal DateTimeOffset Now { get; set; } = MiniStackTable.Now;
+        internal bool HoldTimers { get; init; }
+        internal Action? FireTimer { get; private set; }
 
         public override DateTimeOffset GetUtcNow() => Now;
+
+        public override ITimer CreateTimer(TimerCallback callback, object? state, TimeSpan dueTime, TimeSpan period)
+        {
+            if (!HoldTimers)
+            {
+                return System.CreateTimer(callback, state, dueTime, period);
+            }
+            FireTimer = () => callback(state);
+            return System.CreateTimer(callback, state, Timeout.InfiniteTimeSpan, Timeout.InfiniteTimeSpan);
+        }
     }
 
     private sealed class StoppedObserver(string stoppedTask) : IControllerTaskFenceObserver

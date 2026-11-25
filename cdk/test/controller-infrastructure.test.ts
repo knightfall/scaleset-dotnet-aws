@@ -3,8 +3,10 @@ import { mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
+import { isDeepStrictEqual } from "node:util";
 import { Match, Template } from "aws-cdk-lib/assertions";
 import { compileConfig } from "../lib/config/compiler.ts";
+import { ConfigValidationError } from "../lib/config/errors.ts";
 import type { RunnerControllerRuntime } from "../lib/config/types.ts";
 import { synthesizeController } from "../lib/infrastructure/controller-stack.ts";
 
@@ -69,6 +71,70 @@ function rolePolicy(
     ([, policy]) => policy.Properties.PolicyDocument.Statement as Statement[],
   );
 }
+
+test("qualifying predecessor capture grants only an exact active log-group read", () => {
+  const baseline = fixture("ec2-only-pinned");
+  const { spec } = baseline.runtime;
+  const { account, region } = spec.aws;
+  const capture = {
+    logGroupArn: `arn:aws:logs:${region}:${account}:log-group:/aws/events/controller-fence`,
+    eventRuleArn: `arn:aws:events:${region}:${account}:rule/controller-fence`,
+    qualifiedFrom: "2026-11-25T00:00:00Z",
+    qualifiedUntil: "2026-12-02T00:00:00Z",
+  };
+  const controller = { ...spec.controller, predecessorCapture: capture };
+  const active = rewrite(baseline, { ...spec, mode: "active", controller });
+  assert.deepEqual(active.runtime.spec.controller.predecessorCapture, capture);
+  const captured = synthesize(active);
+  assert.deepEqual(
+    rolePolicy(captured).filter(({ Action }) =>
+      [Action].flat().some((action) => action.startsWith("logs:")),
+    ),
+    [
+      {
+        Action: "logs:FilterLogEvents",
+        Effect: "Allow",
+        Resource: capture.logGroupArn,
+      },
+    ],
+  );
+  const withoutCapture = synthesize(
+    rewrite(baseline, { ...spec, mode: "active" }),
+  );
+  assert.deepEqual(
+    captured.findResources("AWS::Logs::LogGroup"),
+    withoutCapture.findResources("AWS::Logs::LogGroup"),
+  );
+  for (const config of [
+    rewrite(baseline, { ...spec, mode: "dry-run", controller }),
+    rewrite(baseline, { ...spec, mode: "active" }),
+  ]) {
+    assert.ok(!actions(synthesize(config)).has("logs:FilterLogEvents"));
+  }
+  for (const invalid of [
+    { logGroupArn: capture.logGroupArn + ":*" },
+    {
+      logGroupArn: `arn:aws:logs:${region}:${account}:log-group:/ecs/${baseline.runtime.metadata.name}-runner-controller`,
+    },
+    { eventRuleArn: capture.eventRuleArn.replace(account, "000000000000") },
+    { qualifiedFrom: "2026-11-31T00:00:00Z" },
+    { qualifiedUntil: capture.qualifiedFrom },
+  ]) {
+    assert.throws(
+      () =>
+        rewrite(baseline, {
+          ...spec,
+          controller: {
+            ...controller,
+            predecessorCapture: { ...capture, ...invalid },
+          },
+        }),
+      (error: unknown) =>
+        error instanceof ConfigValidationError &&
+        error.path.startsWith("/spec/controller/predecessorCapture"),
+    );
+  }
+});
 
 function actions(template: Template) {
   return new Set(rolePolicy(template).flatMap(({ Action }) => Action));
@@ -141,6 +207,69 @@ test("active service waits for its HELLO brokers and runner invocation policies"
   for (const id of [...brokerResources, ...runnerPolicies]) {
     assert.ok(dependencies.includes(id), id);
   }
+});
+
+test("HELLO reservations add enabled capacity by role, cap it, and stay disabled in dry-run", () => {
+  const config = fixture("mixed-ec2-fargate");
+  const spec = config.runtime.spec;
+  const profiles = spec.profiles.map((profile) =>
+    profile.provisioner.type === "fargate"
+      ? {
+          ...profile,
+          state:
+            profile.id === "linux-ci-arm"
+              ? ("draining" as const)
+              : profile.state,
+          capacity: { ...profile.capacity, maxRunners: 6 },
+          provisioner: {
+            ...profile.provisioner,
+            bootstrapRoleArn:
+              "arn:aws:iam::111122223333:role/fargate-shell-bootstrap",
+          },
+        }
+      : profile,
+  );
+
+  function brokers(mode: "active" | "dry-run") {
+    const resources = synthesize(
+      rewrite(config, { ...spec, profiles, mode }),
+    ).findResources("AWS::Lambda::Function");
+    return Object.entries(resources).filter(([id]) =>
+      id.includes("HelloBroker"),
+    );
+  }
+  const active = brokers("active");
+  const dryRun = brokers("dry-run");
+  assert.deepEqual(
+    active.map(([id]) => id),
+    dryRun.map(([id]) => id),
+  );
+  assert.deepEqual(
+    Object.fromEntries(
+      active.map(([, { Properties }]) => [
+        Properties.Environment.Variables.BOOTSTRAP_ROLE_NAME,
+        Properties.ReservedConcurrentExecutions,
+      ]),
+    ),
+    {
+      "runner-linux-bootstrap": 12,
+      "runner-arm64-bootstrap": 16,
+      "fargate-shell-bootstrap": 12,
+    },
+  );
+  for (const [, { Properties }] of dryRun) {
+    assert.equal(Properties.ReservedConcurrentExecutions, 0);
+    assert.equal(Properties.Environment.Variables.HELLO_ENABLED, "false");
+  }
+  synthesize(config).hasResourceProperties("AWS::Lambda::Function", {
+    ReservedConcurrentExecutions: 16,
+    Environment: {
+      Variables: Match.objectLike({
+        BOOTSTRAP_ROLE_NAME: "fargate-shell-bootstrap",
+        HELLO_ENABLED: "true",
+      }),
+    },
+  });
 });
 
 test("explicit Fargate preflight changes only the controller task definition environment", () => {
@@ -277,7 +406,19 @@ test("Fargate preflight is available in inspection mode and refuses unrelated pr
         : profile,
     ),
   });
-  for (const config of [offline, disabled, fixture("ec2-only-pinned")]) {
+  const snapshot = rewrite(inspection, {
+    ...inspection.runtime.spec,
+    dryRun: {
+      demand: { type: "snapshot", path: "demand.json" },
+      inspectAws: true,
+    },
+  });
+  for (const config of [
+    offline,
+    snapshot,
+    disabled,
+    fixture("ec2-only-pinned"),
+  ]) {
     assert.throws(
       () => synthesize(config, evidence),
       /SCALESET_FARGATE_PREFLIGHT is invalid/u,
@@ -348,6 +489,41 @@ test("Fargate preflight rejects invalid or oversized JSON without reflecting inp
       message:
         "SCALESET_FARGATE_PREFLIGHT is invalid for the configured deployment.",
     });
+  }
+});
+
+test("observation queues redrive and controller-stack logs have bounded retention", () => {
+  const config = fixture("mixed-ec2-fargate");
+  const template = synthesize(config);
+  template.resourceCountIs("AWS::CloudWatch::Alarm", 0);
+  const groups = template.findResources("AWS::Logs::LogGroup");
+  const functionResources = template.findResources("AWS::Lambda::Function");
+  const usedByLambda = new Set<string>();
+  for (const resource of Object.values(functionResources)) {
+    const id = resource.Properties.LoggingConfig?.LogGroup?.Ref as
+      string | undefined;
+    assert.ok(
+      id && groups[id],
+      "Each controller-managed Lambda uses a managed log group.",
+    );
+    usedByLambda.add(id);
+    assert.equal(groups[id].Properties.RetentionInDays, 30);
+    assert.equal(groups[id].DeletionPolicy, "Retain");
+  }
+  assert.ok([...usedByLambda].some((id) => id.startsWith("RuntimeConfigLogs")));
+  assert.ok([...usedByLambda].some((id) => /^Bootstrap.*HelloLogs/u.test(id)));
+  const queues = Object.entries(template.findResources("AWS::SQS::Queue"));
+  for (const id of ["Ec2", "Fargate"]) {
+    const source = queues.find(([name]) => name.startsWith(`${id}EventQueue`));
+    const dlq = queues.find(([name]) =>
+      name.startsWith(`${id}EventDeadLetters`),
+    );
+    assert.ok(source && dlq);
+    assert.deepEqual(source[1].Properties.RedrivePolicy, {
+      maxReceiveCount: 5,
+      deadLetterTargetArn: { "Fn::GetAtt": [dlq[0], "Arn"] },
+    });
+    assert.equal(dlq[1].Properties.MessageRetentionPeriod, 14 * 24 * 60 * 60);
   }
 });
 
@@ -618,6 +794,156 @@ test("offline synth rejects unsupported Fargate task sizes and awsvpc limits", (
   assert.throws(() => synthesize(badNetwork), /ECS awsvpc limits/u);
 });
 
+test("mixed launch policies bind each EC2 template to its network and each Fargate definition to its cluster", () => {
+  const config = fixture("mixed-ec2-fargate");
+  const { spec } = config.runtime;
+  const [firstEc2, secondEc2, firstFargate, secondFargate] = spec.profiles;
+  assert.equal(firstEc2.provisioner.type, "ec2");
+  assert.equal(secondEc2.provisioner.type, "ec2");
+  assert.equal(firstFargate.provisioner.type, "fargate");
+  assert.equal(secondFargate.provisioner.type, "fargate");
+  const firstNetwork = spec.networks[firstEc2.provisioner.network];
+  const secondNetwork = {
+    ...firstNetwork,
+    subnets: [
+      { id: "subnet-0123456789abcdef4", az: "ap-southeast-2a" },
+      { id: "subnet-0123456789abcdef5", az: "ap-southeast-2b" },
+    ],
+    securityGroupIds: ["sg-0123456789abcdef2"],
+  };
+  const template = synthesize(
+    rewrite(config, {
+      ...spec,
+      networks: { ...spec.networks, "runner-alt": secondNetwork },
+      profiles: [
+        firstEc2,
+        {
+          ...secondEc2,
+          provisioner: { ...secondEc2.provisioner, network: "runner-alt" },
+        },
+        firstFargate,
+        secondFargate,
+      ],
+    }),
+  );
+  const statements = rolePolicy(template);
+  const ec2Arn = (resource: string, region = spec.aws.region) => ({
+    "Fn::Join": [
+      "",
+      [
+        "arn:",
+        { Ref: "AWS::Partition" },
+        `:ec2:${region}:111122223333:${resource}`,
+      ],
+    ],
+  });
+  const ec2Grants = statements.filter(({ Action }) =>
+    [Action].flat().includes("ec2:RunInstances"),
+  );
+  const networkGrants = ec2Grants.filter(({ Resource }) =>
+    JSON.stringify(Resource).match(/:(?:subnet|security-group)\//u),
+  );
+  assert.equal(networkGrants.length, 2);
+  for (const [provisioner, network] of [
+    [firstEc2.provisioner, firstNetwork],
+    [secondEc2.provisioner, secondNetwork],
+  ] as const) {
+    const launchTemplate = ec2Arn(
+      `launch-template/${provisioner.launchTemplateId}`,
+    );
+    const resources = [
+      ...network.subnets.map(({ id }) => ec2Arn(`subnet/${id}`)),
+      ...network.securityGroupIds.map((id) => ec2Arn(`security-group/${id}`)),
+    ];
+    const grant = networkGrants.find(({ Condition }) =>
+      isDeepStrictEqual(Condition, {
+        ArnEquals: { "ec2:LaunchTemplate": launchTemplate },
+      }),
+    );
+    assert.ok(grant);
+    assert.deepEqual(grant.Resource, resources);
+    assert.ok(
+      ec2Grants.some(
+        ({ Resource, Condition }) =>
+          isDeepStrictEqual(Resource, launchTemplate) && !Condition,
+      ),
+    );
+    const instance = ec2Grants.find(
+      ({ Resource, Condition }) =>
+        isDeepStrictEqual(Resource, ec2Arn("instance/*")) &&
+        isDeepStrictEqual(
+          (Condition?.ArnEquals as Record<string, unknown>)?.[
+            "ec2:LaunchTemplate"
+          ],
+          launchTemplate,
+        ),
+    );
+    assert.deepEqual(instance?.Condition?.ArnEquals, {
+      "ec2:LaunchTemplate": launchTemplate,
+      "ec2:InstanceProfile": provisioner.instanceProfileArn,
+    });
+  }
+  const runTask = statements.filter(({ Action }) =>
+    [Action].flat().includes("ecs:RunTask"),
+  );
+  assert.equal(runTask.length, 2);
+  for (const { id, provisioner } of [firstFargate, secondFargate]) {
+    assert.equal(provisioner.type, "fargate");
+    const cluster = spec.ecsClusters[provisioner.cluster];
+    assert.equal(cluster.type, "import");
+    const grant = runTask.find(
+      ({ Resource }) => Resource === provisioner.taskDefinitionArn,
+    );
+    assert.deepEqual(grant?.Condition, {
+      ArnEquals: { "ecs:cluster": cluster.arn },
+      StringEquals: {
+        "aws:RequestTag/scaleset-aws:controller": "scaleset-dotnet-aws",
+        "aws:RequestTag/scaleset-aws:deployment":
+          "111122223333:ap-southeast-2:engineering-dev",
+        "aws:RequestTag/scaleset-aws:profile": id,
+        "aws:RequestTag/scaleset-aws:bootstrap-protocol": "v1",
+      },
+      Bool: { "ecs:enable-execute-command": "false" },
+      Null: { "aws:RequestTag/scaleset-aws:allocation": "false" },
+    });
+  }
+  const passRole = statements.filter(({ Action }) =>
+    [Action].flat().includes("iam:PassRole"),
+  );
+  assert.deepEqual(
+    new Set(passRole),
+    new Set([
+      {
+        Action: "iam:PassRole",
+        Resource: [
+          firstEc2.provisioner.bootstrapRoleArn,
+          secondEc2.provisioner.bootstrapRoleArn,
+        ].sort(),
+        Effect: "Allow",
+        Condition: {
+          StringEquals: { "iam:PassedToService": "ec2.amazonaws.com" },
+          ArnLike: {
+            "iam:AssociatedResourceArn": ec2Arn("instance/*", "*"),
+          },
+        },
+      },
+      {
+        Action: "iam:PassRole",
+        Resource: [
+          firstFargate.provisioner.bootstrapRoleArn,
+          firstFargate.provisioner.executionRoleArn,
+          secondFargate.provisioner.bootstrapRoleArn,
+          secondFargate.provisioner.executionRoleArn,
+        ].sort(),
+        Effect: "Allow",
+        Condition: {
+          StringEquals: { "iam:PassedToService": "ecs-tasks.amazonaws.com" },
+        },
+      },
+    ]),
+  );
+});
+
 test("active profiles alone supply provider permissions, event rules and role-scoped bootstrap actions", () => {
   for (const [name, ec2, ecs] of [
     ["ec2-only-pinned", true, false],
@@ -743,6 +1069,23 @@ test("only an active qualified EC2 role receives the supervisor STATUS policy", 
   assert.equal(statement.Action, "dynamodb:PutItem");
   assert.deepEqual(statement.Condition["ForAllValues:StringEquals"], {
     "dynamodb:LeadingKeys": ["STATUS#${aws:userid}"],
+    "dynamodb:Attributes": [
+      "PK",
+      "SK",
+      "awsUserId",
+      "resourceArn",
+      "helloSha256",
+      "offerId",
+      "runnerId",
+      "sequence",
+      "observedAt",
+      "exited",
+      "payload",
+      "qualificationSha256",
+    ],
+  });
+  assert.deepEqual(statement.Condition.StringEqualsIfExists, {
+    "dynamodb:ReturnValues": ["NONE", "ALL_OLD"],
   });
   assert.deepEqual(statement.Condition.NumericEquals, {
     "ec2:RoleDelivery": "2.0",
@@ -753,6 +1096,7 @@ test("only an active qualified EC2 role receives the supervisor STATUS policy", 
   );
   assert.deepEqual(statement.Condition.Null, {
     "dynamodb:LeadingKeys": "false",
+    "dynamodb:Attributes": "false",
     "dynamodb:EnclosingOperation": "true",
   });
   assert.doesNotMatch(
@@ -800,7 +1144,7 @@ test("only an active qualified EC2 role receives the supervisor STATUS policy", 
   );
 });
 
-test("dry run uses neither lifecycle mutations nor event consumers", () => {
+test("S3 snapshot dry run grants only the nominated object, version, and account in addition to runtime input", () => {
   const config = fixture("mixed-ec2-fargate");
   for (const inspectAws of [false, true]) {
     const template = synthesize(
@@ -810,8 +1154,8 @@ test("dry run uses neither lifecycle mutations nor event consumers", () => {
         dryRun: {
           demand: {
             type: "snapshot",
-            s3Uri: "s3://snapshot-fixture/engineer/data.json",
-            versionId: "fixture-version",
+            s3Uri: "s3://snapshot-fixture/profile-blue/v1/Runner_demand.json",
+            versionId: "specific+version/=",
             sha256: "a".repeat(64),
           },
           inspectAws,
@@ -833,39 +1177,74 @@ test("dry run uses neither lifecycle mutations nor event consumers", () => {
     assert.equal(command[0], "run");
     assert.ok(!command.includes("--ec2-event-queue-url"));
     assert.ok(!command.includes("--ecs-event-queue-url"));
-    for (const action of [
-      "secretsmanager:GetSecretValue",
-      "iam:PassRole",
-      "ec2:RunInstances",
-      "ec2:TerminateInstances",
-      "ec2:CreateTags",
-      "ecs:RunTask",
-      "ecs:StopTask",
-      "ecs:TagResource",
-      "sqs:ReceiveMessage",
-      "sqs:DeleteMessage",
-      "dynamodb:ConditionCheckItem",
-      "dynamodb:PutItem",
-      "dynamodb:UpdateItem",
-      "dynamodb:DeleteItem",
-    ]) {
-      assert.ok(!names.has(action), action);
-    }
-    assert.equal(names.has("ec2:DescribeInstances"), inspectAws);
-    assert.equal(names.has("ecs:DescribeTaskDefinition"), inspectAws);
-    assert.equal(names.has("dynamodb:GetItem"), inspectAws);
-    const reads = rolePolicy(template).filter(
-      ({ Action }) => Action === "s3:GetObjectVersion",
-    );
+    assert.deepEqual([...names], ["s3:GetObjectVersion"]);
+    const reads = rolePolicy(template);
     assert.equal(reads.length, 2);
-    assert.ok(
-      reads.some(
-        (statement) =>
-          JSON.stringify(statement).includes(
-            "snapshot-fixture/engineer/data.json",
-          ) && statement.Condition?.StringEquals !== undefined,
+    assert.deepEqual(
+      reads.find((statement) =>
+        JSON.stringify(statement.Resource).includes("snapshot-fixture"),
       ),
+      {
+        Action: "s3:GetObjectVersion",
+        Condition: {
+          StringEquals: {
+            "s3:VersionId": "specific+version/=",
+            "s3:ResourceAccount": config.runtime.spec.aws.account,
+          },
+        },
+        Effect: "Allow",
+        Resource: {
+          "Fn::Join": [
+            "",
+            [
+              "arn:",
+              { Ref: "AWS::Partition" },
+              ":s3:::snapshot-fixture/profile-blue/v1/Runner_demand.json",
+            ],
+          ],
+        },
+      },
     );
+  }
+});
+
+test("dry-run inventory reads follow inspectAws and enabled mixed provisioners without lifecycle access", () => {
+  const config = fixture("mixed-ec2-fargate");
+  for (const inspectAws of [false, true]) {
+    for (const disabled of [undefined, "ec2", "fargate"] as const) {
+      const template = synthesize(
+        rewrite(config, {
+          ...config.runtime.spec,
+          mode: "dry-run",
+          dryRun: { demand: { type: "none" }, inspectAws },
+          profiles: config.runtime.spec.profiles.map((profile) =>
+            profile.provisioner.type === disabled
+              ? { ...profile, state: "disabled" }
+              : profile,
+          ),
+        }),
+      );
+      const names = actions(template);
+      assert.equal(
+        names.has("ec2:DescribeInstances"),
+        inspectAws && disabled !== "ec2",
+      );
+      assert.equal(
+        names.has("ecs:ListTasks"),
+        inspectAws && disabled !== "fargate",
+      );
+      assert.equal(
+        names.has("iam:GetInstanceProfile"),
+        inspectAws && disabled !== "ec2",
+      );
+      assert.ok([...names].every((action) => !action.startsWith("dynamodb:")));
+      assert.equal(
+        rolePolicy(template).filter(
+          ({ Action }) => Action === "s3:GetObjectVersion",
+        ).length,
+        1,
+      );
+    }
   }
 });
 

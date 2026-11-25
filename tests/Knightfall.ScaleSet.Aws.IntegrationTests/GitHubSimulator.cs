@@ -51,6 +51,7 @@ internal sealed class GitHubSimulator(string groupName, GitHubSimulatorAddress? 
     internal const string Sets = ServiceBase + "/_apis/runtime/runnerscalesets";
     internal const string Runners = ServiceBase + "/_apis/distributedtask/pools/0/agents";
     internal static readonly string Sessions = FormattableString.Invariant($"{Sets}/{SetId}/sessions");
+    internal static readonly string ExactSet = FormattableString.Invariant($"{Sets}/{SetId}");
     private const string RegistrationToken = "fixture-registration-token";
     private const string AdminToken = "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJleHAiOjQwNzA5MDg4MDB9.fixture-signature";
     private const string AsRequested = "RunnerScaleSetJobMessages";
@@ -75,6 +76,8 @@ internal sealed class GitHubSimulator(string groupName, GitHubSimulatorAddress? 
     internal long? RegisteredRunnerId { get { lock (_sync) { return _runners.Values.SingleOrDefault()?.Id; } } }
     internal long[] AcquiredRequests { get { lock (_sync) { return _acquired.Order().ToArray(); } } }
     internal int TotalAssignedJobs { get; set; }
+    internal Func<HttpContext, IResult>? ReadExactSetResponse { get; set; }
+    internal Func<DateTimeOffset>? CurrentStatisticsTime { get; set; }
 
     internal void SeedScaleSet(string name, IEnumerable<string> labels)
     {
@@ -230,7 +233,7 @@ internal sealed class GitHubSimulator(string groupName, GitHubSimulatorAddress? 
                 (context.Request.Query["name"].Count == 0 || context.Request.Query["name"] == _scaleSet.Name))))
             .RequireHost(Address.ServiceHost);
         app.MapGet(Sets + "/{id:long}", (long id, HttpContext context) => Admin(context, () =>
-            _scaleSet is { } existing && existing.Id == id ? Results.Json(existing) : Results.NotFound()))
+            _scaleSet is { } existing && existing.Id == id ? ReadExactSet(context, existing) : Results.NotFound()))
             .RequireHost(Address.ServiceHost);
         app.MapPost(Sets, (JsonElement input, HttpContext context) => Admin(context, () => Execute(SimulatorOperation.CreateScaleSet, () =>
         {
@@ -381,6 +384,20 @@ internal sealed class GitHubSimulator(string groupName, GitHubSimulatorAddress? 
         totalIdleRunners = _runners.Values.Count(runner => runner.Listening && !runner.Assigned),
         totalBusyRunners = _runners.Values.Count(runner => runner.Assigned),
     };
+
+    private IResult ReadExactSet(HttpContext context, SimulatedScaleSet set)
+    {
+        if (ReadExactSetResponse is { } read)
+        {
+            return read(context);
+        }
+
+        if (CurrentStatisticsTime is { } time)
+        {
+            context.Response.Headers.Date = time().ToString("R", CultureInfo.InvariantCulture);
+        }
+        return Results.Json(new { set.Id, set.Name, set.RunnerGroupId, set.Labels, statistics = Statistics() });
+    }
 
     private IResult RemoveRunner(long id)
     {

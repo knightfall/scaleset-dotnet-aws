@@ -30,28 +30,20 @@ export function fargateProfiles(profiles: readonly RunnerProfile[]) {
   );
 }
 
-export function grantTableAccess(
-  role: iam.Role,
-  table: ITable,
-  active: boolean,
-  inspect: boolean,
-) {
-  if (!active && !inspect) return;
+export function grantTableAccess(role: iam.Role, table: ITable) {
   allow(role, ["dynamodb:GetItem", "dynamodb:Query"], [table.tableArn]);
   allow(role, ["dynamodb:Query"], [`${table.tableArn}/index/due`]);
-  if (active) {
-    allow(
-      role,
-      [
-        "dynamodb:ConditionCheckItem",
-        "dynamodb:PutItem",
-        "dynamodb:UpdateItem",
-        "dynamodb:DeleteItem",
-      ],
-      [table.tableArn],
-      { StringEquals: { "dynamodb:EnclosingOperation": "TransactWriteItems" } },
-    );
-  }
+  allow(
+    role,
+    [
+      "dynamodb:ConditionCheckItem",
+      "dynamodb:PutItem",
+      "dynamodb:UpdateItem",
+      "dynamodb:DeleteItem",
+    ],
+    [table.tableArn],
+    { StringEquals: { "dynamodb:EnclosingOperation": "TransactWriteItems" } },
+  );
 }
 
 export function grantHostFence(role: iam.Role, cluster: RunnerCluster) {
@@ -146,7 +138,10 @@ export function grantEc2(
     const owned = ownership(runtime, profile, "ResourceTag");
     const launchTemplate = { "ec2:LaunchTemplate": template };
 
-    allow(role, ["ec2:RunInstances"], [template, ...subnets, ...groups]);
+    allow(role, ["ec2:RunInstances"], [template]);
+    allow(role, ["ec2:RunInstances"], [...subnets, ...groups], {
+      ArnEquals: launchTemplate,
+    });
     allow(
       role,
       ["ec2:RunInstances"],
@@ -197,6 +192,15 @@ export function grantEc2(
     unique(profiles.map(({ provisioner }) => provisioner.bootstrapRoleArn)),
     {
       StringEquals: { "iam:PassedToService": "ec2.amazonaws.com" },
+      ArnLike: {
+        "iam:AssociatedResourceArn": Stack.of(role).formatArn({
+          service: "ec2",
+          region: "*",
+          resource: "instance",
+          resourceName: "*",
+          arnFormat: ArnFormat.SLASH_RESOURCE_NAME,
+        }),
+      },
     },
   );
 }
@@ -305,6 +309,23 @@ export function ec2SupervisorStatusPolicy(table: ITable) {
     conditions: {
       "ForAllValues:StringEquals": {
         "dynamodb:LeadingKeys": ["STATUS#${aws:userid}"],
+        "dynamodb:Attributes": [
+          "PK",
+          "SK",
+          "awsUserId",
+          "resourceArn",
+          "helloSha256",
+          "offerId",
+          "runnerId",
+          "sequence",
+          "observedAt",
+          "exited",
+          "payload",
+          "qualificationSha256",
+        ],
+      },
+      StringEqualsIfExists: {
+        "dynamodb:ReturnValues": ["NONE", "ALL_OLD"],
       },
       ArnLike: {
         "ec2:SourceInstanceARN": stack.formatArn({
@@ -317,6 +338,7 @@ export function ec2SupervisorStatusPolicy(table: ITable) {
       NumericEquals: { "ec2:RoleDelivery": "2.0" },
       Null: {
         "dynamodb:LeadingKeys": "false",
+        "dynamodb:Attributes": "false",
         "dynamodb:EnclosingOperation": "true",
       },
     },

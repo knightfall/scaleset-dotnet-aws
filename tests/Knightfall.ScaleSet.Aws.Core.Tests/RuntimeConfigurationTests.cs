@@ -126,6 +126,25 @@ public sealed class RuntimeConfigurationTests
             Assert.IsType<ImportEcsClusterConfiguration>(configuration.EcsClusters["runner-arm"]).Arn);
     }
 
+    [Fact]
+    public void PreservesSamePurposeRoleSharingAndChecksDisabledBindingWhenEnabled()
+    {
+        var shared = ConfigurationFixtures.EditRuntime(ConfigurationFixtures.Mixed,
+            ConfigurationEdit.Set("/spec/profiles/1/provisioner/bootstrapRoleArn", "arn:aws:iam::111122223333:role/runner-linux-bootstrap"),
+            ConfigurationEdit.Set("/spec/profiles/3/provisioner/executionRoleArn", "arn:aws:iam::111122223333:role/fargate-shell-execution"));
+        Assert.Equal(4, RuntimeConfigurationLoader.Load(shared).Profiles.Length);
+
+        const string path = "/spec/profiles/3/provisioner/executionRoleArn";
+        var overlap = ConfigurationEdit.Set(path, "arn:aws:iam::111122223333:role/fargate-shell-bootstrap");
+        var disabled = ConfigurationFixtures.EditRuntime(ConfigurationFixtures.Mixed,
+            overlap, ConfigurationEdit.Set("/spec/profiles/2/state", "disabled"));
+        Assert.Equal(RunnerProfileState.Disabled, RuntimeConfigurationLoader.Load(disabled).Profiles[2].State);
+        var enabled = ConfigurationFixtures.EditRuntime(ConfigurationFixtures.Mixed, overlap);
+        var error = AssertRejected(enabled, "semantic");
+        Assert.Equal(path, error.Path);
+        Assert.Contains("execution-only role", error.Message, StringComparison.Ordinal);
+    }
+
     [Theory]
     [InlineData(true)]
     [InlineData(false)]

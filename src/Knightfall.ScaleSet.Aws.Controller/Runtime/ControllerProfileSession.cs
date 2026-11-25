@@ -9,7 +9,7 @@ using ScaleSet.Listener;
 
 namespace Knightfall.ScaleSet.Aws.Controller.Runtime;
 
-internal sealed class ControllerProfileSession : IDisposable
+internal sealed class ControllerProfileSession : IAsyncDisposable
 {
     private static readonly TimeSpan PollRetry = TimeSpan.FromSeconds(1);
     private static readonly TimeSpan RotationInterval = TimeSpan.FromMinutes(1);
@@ -37,6 +37,7 @@ internal sealed class ControllerProfileSession : IDisposable
     private readonly string _scaleSet;
     private readonly string[] _labels;
     private readonly SemaphoreSlim _serial = new(1);
+    private readonly object _disposalGate = new();
     private readonly CancellationTokenSource _admissions = new();
     private readonly CancellationTokenSource _polls;
     private readonly CancellationToken _processStopping;
@@ -45,6 +46,7 @@ internal sealed class ControllerProfileSession : IDisposable
     private GitHubListenerLane? _lane;
     private GitHubListenerLaneResult? _listenerResult;
     private Task? _pollTask;
+    private Task? _disposal;
     private DateTimeOffset _nextRotation;
     private int _disposed;
 
@@ -84,6 +86,15 @@ internal sealed class ControllerProfileSession : IDisposable
     }
 
     internal GitHubListenerLaneResult? ListenerResult => Volatile.Read(ref _listenerResult);
+
+    internal Action? ListenerHealthChanged { get; set; }
+
+    internal bool RequiresListenerHealth => _profile.State == RunnerProfileState.Active;
+
+    internal bool IsListenerAvailable => ReadCredentialCooldown() is null &&
+        ListenerResult is not { Status: GitHubListenerLaneStatus.RecoveryRequired or GitHubListenerLaneStatus.Failed or
+            GitHubListenerLaneStatus.OwnershipUnavailable or GitHubListenerLaneStatus.StorageUnavailable or
+            GitHubListenerLaneStatus.StorageRejected or GitHubListenerLaneStatus.Stopped };
 
     internal DateTimeOffset? ReadCredentialCooldown()
     {
@@ -181,9 +192,17 @@ internal sealed class ControllerProfileSession : IDisposable
         }
     }
 
-    internal Task StopAdmissionsAsync(CancellationToken cancellationToken) => _admissions.CancelAsync().WaitAsync(cancellationToken);
+    internal Task StopAdmissionsAsync(CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        return _admissions.CancelAsync();
+    }
 
-    internal Task CancelPollsAsync(CancellationToken cancellationToken) => _polls.CancelAsync().WaitAsync(cancellationToken);
+    internal Task CancelPollsAsync(CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        return _polls.CancelAsync();
+    }
 
     internal async Task JoinMutatorsAsync(CancellationToken cancellationToken)
     {
@@ -192,7 +211,14 @@ internal sealed class ControllerProfileSession : IDisposable
         _serial.Release();
         if (poll is not null)
         {
-            await poll.WaitAsync(cancellationToken).ConfigureAwait(false);
+            try
+            {
+                await poll.WaitAsync(cancellationToken).ConfigureAwait(false);
+            }
+            catch (Exception) when (poll.IsFaulted)
+            {
+                RecordPollFailure();
+            }
         }
     }
 
@@ -200,7 +226,7 @@ internal sealed class ControllerProfileSession : IDisposable
     {
         if (Volatile.Read(ref _lane) is { } lane)
         {
-            Volatile.Write(ref _listenerResult, await lane.StopAsync(cancellationToken).ConfigureAwait(false));
+            PublishListenerResult(await lane.StopAsync(cancellationToken).ConfigureAwait(false));
         }
     }
 
@@ -233,7 +259,7 @@ internal sealed class ControllerProfileSession : IDisposable
         await CancelPollsAsync(cancellationToken).ConfigureAwait(false);
         await JoinMutatorsAsync(cancellationToken).ConfigureAwait(false);
         var result = await lane.RetireDrainingSessionAsync(retirement, cancellationToken).ConfigureAwait(false);
-        Volatile.Write(ref _listenerResult, result);
+        PublishListenerResult(result);
         return result;
     }
 
@@ -332,13 +358,18 @@ internal sealed class ControllerProfileSession : IDisposable
                 }
                 if (_clock.GetUtcNow() >= rotation)
                 {
-                    Volatile.Write(ref _listenerResult, await lane.RotateAsync(token).ConfigureAwait(false));
+                    var rotated = await lane.RotateAsync(token).ConfigureAwait(false);
+                    PublishListenerResult(rotated);
+                    if (rotated.Status == GitHubListenerLaneStatus.StorageRejected)
+                    {
+                        return;
+                    }
                     rotation = _clock.GetUtcNow() + RotationInterval;
                 }
 
                 var stepped = await lane.StepAsync(token).ConfigureAwait(false);
-                Volatile.Write(ref _listenerResult, stepped);
-                if (stepped.Status == GitHubListenerLaneStatus.Stopped)
+                PublishListenerResult(stepped);
+                if (stepped.Status is GitHubListenerLaneStatus.Stopped or GitHubListenerLaneStatus.StorageRejected)
                 {
                     return;
                 }
@@ -351,10 +382,21 @@ internal sealed class ControllerProfileSession : IDisposable
         catch (OperationCanceledException) when (token.IsCancellationRequested)
         {
         }
-        catch (Exception error) when (error is InvalidOperationException or IOException or GitHubOperationException or TimeoutException or OperationCanceledException)
+        catch (Exception)
         {
-            Volatile.Write(ref _listenerResult, new GitHubListenerLaneResult(GitHubListenerLaneStatus.Failed,
-                Failure: new GitHubOperationException(GitHubOperationError.RequestFailed)));
+            RecordPollFailure();
+        }
+    }
+
+    private void RecordPollFailure() =>
+        PublishListenerResult(new GitHubListenerLaneResult(GitHubListenerLaneStatus.Failed,
+            Failure: new GitHubOperationException(GitHubOperationError.RequestFailed)));
+
+    private void PublishListenerResult(GitHubListenerLaneResult result)
+    {
+        if (Interlocked.Exchange(ref _listenerResult, result)?.Status != result.Status)
+        {
+            ListenerHealthChanged?.Invoke();
         }
     }
 
@@ -427,23 +469,33 @@ internal sealed class ControllerProfileSession : IDisposable
     private static bool MatchesBound(CatalogProfile catalog, GitHubScaleSetBinding binding) =>
         catalog.Binding.RunnerGroupId == binding.RunnerGroupId && catalog.Binding.ScaleSetId == binding.ScaleSetId;
 
-    public void Dispose()
+    public ValueTask DisposeAsync()
     {
-        if (Interlocked.Exchange(ref _disposed, 1) == 0)
+        lock (_disposalGate)
         {
-            _ = DisposeResourcesAsync();
+            if (_disposal is null)
+            {
+                Volatile.Write(ref _disposed, 1);
+                _disposal = DisposeResourcesAsync();
+            }
+            return new ValueTask(_disposal);
         }
     }
 
     private async Task DisposeResourcesAsync()
     {
-        await _admissions.CancelAsync().ConfigureAwait(false);
-        await _polls.CancelAsync().ConfigureAwait(false);
-        await JoinMutatorsAsync(CancellationToken.None).ConfigureAwait(false);
-        _lane?.Dispose();
-        _connection?.Dispose();
-        _serial.Dispose();
-        _admissions.Dispose();
-        _polls.Dispose();
+        try
+        {
+            await Task.WhenAll(_admissions.CancelAsync(), _polls.CancelAsync()).ConfigureAwait(false);
+        }
+        finally
+        {
+            await JoinMutatorsAsync(CancellationToken.None).ConfigureAwait(false);
+            _lane?.Dispose();
+            _connection?.Dispose();
+            _serial.Dispose();
+            _admissions.Dispose();
+            _polls.Dispose();
+        }
     }
 }

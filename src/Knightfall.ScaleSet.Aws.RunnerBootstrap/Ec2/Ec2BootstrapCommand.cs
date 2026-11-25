@@ -42,6 +42,16 @@ internal static class Ec2BootstrapCommand
             Console.Error.WriteLine("EC2 bootstrap stopped.");
             return 1;
         }
+        catch (RunnerTeardownQualificationException)
+        {
+            Console.Error.WriteLine("EC2 supervisor STATUS requires a current boot proof of job process teardown.");
+            return 1;
+        }
+        catch (RunnerCleanupIncompleteException)
+        {
+            Console.Error.WriteLine("EC2 runner cleanup was incomplete. Retain the instance for operator recovery.");
+            return 1;
+        }
         catch (Exception error) when (error is IOException or ArgumentException or JsonException or Win32Exception or
                                       AmazonClientException or AmazonServiceException or InvalidOperationException or UnauthorizedAccessException)
         {

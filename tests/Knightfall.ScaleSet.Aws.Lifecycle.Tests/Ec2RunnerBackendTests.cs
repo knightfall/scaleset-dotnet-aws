@@ -46,6 +46,18 @@ public sealed class Ec2RunnerBackendTests
         Assert.Equal(ProfileArn, resource.BootstrapCredentialArn);
         Assert.Null(await rig.Store.ReadExecutorAsync(rig.Catalog.Profile, binding.AllocationId, token));
 
+        wire.InventoryResponse = static _ => AwsWireTransport.Xml(InventoryPage(Instance(state: "stopped", code: 80, instanceProfileArn: ProfileArn)));
+        var stopped = Assert.Single((await backend.ReadAsync(rig.Authority.Lease, token)).Resources);
+        Assert.Equal(binding, stopped.Binding);
+        Assert.True(stopped.IsStoppedEc2);
+        Assert.Equal(ExecutorResourceState.Unknown, stopped.Observation?.State);
+
+        wire.InventoryResponse = static _ => AwsWireTransport.Xml(InventoryPage(Instance(state: "shutting-down", code: 32, instanceProfileArn: ProfileArn)));
+        var shuttingDown = Assert.Single((await backend.ReadAsync(rig.Authority.Lease, token)).Resources);
+        Assert.Equal(binding, shuttingDown.Binding);
+        Assert.False(shuttingDown.IsStoppedEc2);
+        Assert.Equal(ExecutorResourceState.Unknown, shuttingDown.Observation?.State);
+
         wire.InventoryResponse = static _ => AwsWireTransport.Xml(InventoryPage(Instance(originalLaunch: null, instanceProfileArn: ProfileArn)));
         var unknown = await backend.ReadAsync(rig.Authority.Lease, token);
         Assert.True(unknown.IsComplete);

@@ -174,6 +174,7 @@ public sealed partial class Ec2ProfileInspector
             "running" => (Ec2InstanceState.Running, 16),
             "shutting-down" => (Ec2InstanceState.ShuttingDown, 32),
             "terminated" => (Ec2InstanceState.Terminated, 48),
+            "stopped" => (Ec2InstanceState.Stopped, 80),
             _ => (Ec2InstanceState.Unknown, -1),
         };
         return state?.Code is int code && (code & 255) != expectedCode ? Ec2InstanceState.Unknown : normalized;

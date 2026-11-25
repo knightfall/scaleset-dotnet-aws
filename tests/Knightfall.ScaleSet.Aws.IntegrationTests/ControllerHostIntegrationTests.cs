@@ -131,7 +131,7 @@ public sealed class ControllerHostIntegrationTests(ITestOutputHelper output)
                 await process.WaitForExitAsync(token).WaitAsync(ShutdownBudget, token);
                 await operationAborted.Task.WaitAsync(TimeSpan.FromSeconds(5), token);
                 Assert.True(Stopwatch.GetElapsedTime(signalSent) < ShutdownBudget);
-                Assert.Equal(0, process.ExitCode);
+                Assert.Equal(holdEffect ? 1 : 0, process.ExitCode);
 
                 Assert.Equal(1, heldRequests);
                 Assert.Null(simulator.SessionId);

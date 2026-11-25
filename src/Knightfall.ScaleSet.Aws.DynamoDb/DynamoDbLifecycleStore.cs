@@ -126,6 +126,21 @@ public sealed partial class DynamoDbLifecycleStore
 
     private async Task<Dictionary<string, AttributeValue>?> ReadItemAsync(LifecycleKey key, CancellationToken cancellationToken)
     {
+        var item = await ReadItemAttributesAsync(key, cancellationToken).ConfigureAwait(false);
+        if (item is null)
+        {
+            return null;
+        }
+        RequireKey(item, key.PartitionKey, key.SortKey);
+        if (key.Deployment is string deployment && Text(item, "deployment") != deployment)
+        {
+            throw InvalidRecord();
+        }
+        return item;
+    }
+
+    private async Task<Dictionary<string, AttributeValue>?> ReadItemAttributesAsync(LifecycleKey key, CancellationToken cancellationToken)
+    {
         var request = new GetItemRequest
         {
             TableName = _tableName,
@@ -134,17 +149,7 @@ public sealed partial class DynamoDbLifecycleStore
         };
         var reply = await ReadWithOutageMappingAsync(token => _client.GetItemAsync(request, token), cancellationToken).ConfigureAwait(false);
 
-        if (reply.Item is not { Count: > 0 } item)
-        {
-            return null;
-        }
-
-        RequireKey(item, key.PartitionKey, key.SortKey);
-        if (key.Deployment is string deployment && Text(item, "deployment") != deployment)
-        {
-            throw InvalidRecord();
-        }
-        return item;
+        return reply.Item is { Count: > 0 } item ? item : null;
     }
 
     private async Task<BasePage> ReadBasePageAsync(
@@ -209,7 +214,8 @@ public sealed partial class DynamoDbLifecycleStore
     {
         AmazonServiceException service => IsTransientStorageStatus(service.StatusCode) || service.Retryable is { Throttling: true } ||
             service.ErrorCode is "ProvisionedThroughputExceededException" or "ProvisionedThroughputExceeded" or
-                "RequestLimitExceeded" or "RequestLimitExceededException" or "ThrottlingException",
+                "RequestLimitExceeded" or "RequestLimitExceededException" or "ThrottlingException" or "ExpiredToken" or "ExpiredTokenException",
+        AmazonClientException or TimeoutException or OperationCanceledException => true,
         HttpRequestException { StatusCode: null } => true,
         HttpRequestException { StatusCode: { } status } => IsTransientStorageStatus(status),
         _ => false,
@@ -357,7 +363,7 @@ public sealed partial class DynamoDbLifecycleStore
         {
             return telemetry.Complete(LifecycleWriteOutcome.Indeterminate);
         }
-        catch (Exception error) when (error is HttpRequestException or IOException or TimeoutException)
+        catch (Exception error) when (error is AmazonClientException or HttpRequestException or IOException or TimeoutException)
         {
             return telemetry.Complete(LifecycleWriteOutcome.Indeterminate);
         }

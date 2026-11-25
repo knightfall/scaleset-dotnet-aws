@@ -137,29 +137,6 @@ internal static partial class BootstrapItems
         _ => false,
     };
 
-    internal static async Task<LifecycleWriteOutcome> PutAsync(
-        IAmazonDynamoDB client, PutItemRequest request, CancellationToken cancellationToken)
-    {
-        cancellationToken.ThrowIfCancellationRequested();
-        try
-        {
-            var reply = await client.PutItemAsync(request, cancellationToken).ConfigureAwait(false);
-            return reply.HttpStatusCode == HttpStatusCode.OK ? LifecycleWriteOutcome.Committed : LifecycleWriteOutcome.Indeterminate;
-        }
-        catch (ConditionalCheckFailedException)
-        {
-            return LifecycleWriteOutcome.Conflict;
-        }
-        catch (Exception error) when (IsIndeterminate(error))
-        {
-            return LifecycleWriteOutcome.Indeterminate;
-        }
-        catch (AmazonServiceException)
-        {
-            throw new IOException("The bootstrap item write was rejected.");
-        }
-    }
-
     internal static Dictionary<string, AttributeValue> Key(LifecycleKey key) =>
         new(StringComparer.Ordinal) { ["PK"] = String(key.PartitionKey), ["SK"] = String(key.SortKey) };
 
@@ -168,10 +145,10 @@ internal static partial class BootstrapItems
     internal static AttributeValue Number(long value) => new() { N = value.ToString(CultureInfo.InvariantCulture) };
 
     internal static string Text(Dictionary<string, AttributeValue> item, string field) =>
-        item.TryGetValue(field, out var attribute) && attribute.S is { } value ? value : throw InvalidItem();
+        item.TryGetValue(field, out var attribute) && attribute is { S: { } value } ? value : throw InvalidItem();
 
     internal static long Integer(Dictionary<string, AttributeValue> item, string field) =>
-        item.TryGetValue(field, out var attribute) &&
+        item.TryGetValue(field, out var attribute) && attribute is not null &&
         long.TryParse(attribute.N, NumberStyles.None, CultureInfo.InvariantCulture, out long value) ? value : throw InvalidItem();
 
     internal static void RequireKey(LifecycleKey key, Dictionary<string, AttributeValue> item, bool allowExpiration = false)

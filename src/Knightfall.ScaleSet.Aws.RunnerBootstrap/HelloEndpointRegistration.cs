@@ -14,6 +14,8 @@ namespace Knightfall.ScaleSet.Aws.RunnerBootstrap;
 /// <summary>Submits immutable HELLO bytes to the role's authenticated regional ingress.</summary>
 internal sealed class HelloEndpointRegistration
 {
+    private const int MaximumAttempts = 7;
+    private static readonly TimeSpan RetryBudget = TimeSpan.FromSeconds(25);
     private readonly HttpClient _http;
     private readonly Uri _endpoint;
     private readonly string _region;
@@ -41,35 +43,59 @@ internal sealed class HelloEndpointRegistration
     {
         JitOfferCryptography.ValidateHello(hello);
         byte[] payload = JsonSerializer.SerializeToUtf8Bytes(hello, BootstrapJson.Options);
-        for (int attempt = 0; attempt < 3; attempt++)
+        using var deadline = new CancellationTokenSource(RetryBudget, _clock);
+        using var lifetime = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, deadline.Token);
+        var token = lifetime.Token;
+        try
         {
-            cancellationToken.ThrowIfCancellationRequested();
-            var credentials = await _credentials.GetCredentialsAsync().WaitAsync(cancellationToken).ConfigureAwait(false);
-            using var request = Sign(payload, credentials);
-            try
+            for (int attempt = 0; attempt < MaximumAttempts; attempt++)
             {
-                using var response = await _http.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancellationToken)
-                    .ConfigureAwait(false);
-                if (response.StatusCode == HttpStatusCode.NoContent)
+                token.ThrowIfCancellationRequested();
+                var credentials = await _credentials.GetCredentialsAsync().WaitAsync(token).ConfigureAwait(false);
+                using var request = Sign(payload, credentials);
+                try
                 {
-                    return LifecycleWriteOutcome.Committed;
+                    using var response = await _http.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, token)
+                        .ConfigureAwait(false);
+                    token.ThrowIfCancellationRequested();
+                    if (response.StatusCode == HttpStatusCode.NoContent)
+                    {
+                        return LifecycleWriteOutcome.Committed;
+                    }
+                    if (!IsTransient(response.StatusCode))
+                    {
+                        return LifecycleWriteOutcome.Conflict;
+                    }
                 }
-                if (response.StatusCode != HttpStatusCode.TooManyRequests && (int)response.StatusCode < 500)
+                catch (HttpRequestException error) when (error.HttpRequestError is HttpRequestError.Unknown or
+                    HttpRequestError.NameResolutionError or HttpRequestError.ConnectionError or HttpRequestError.HttpProtocolError or
+                    HttpRequestError.InvalidResponse or HttpRequestError.ResponseEnded)
                 {
-                    return LifecycleWriteOutcome.Conflict;
+                    // A lost response can follow a committed write. Only resend the original bytes.
                 }
-            }
-            catch (Exception error) when (!cancellationToken.IsCancellationRequested && error is HttpRequestException or OperationCanceledException)
-            {
-                // Only the same immutable body can be retried after a lost response.
-            }
-            if (attempt < 2)
-            {
-                await Task.Delay(TimeSpan.FromMilliseconds(200 * (attempt + 1)), _clock, cancellationToken).ConfigureAwait(false);
+                catch (OperationCanceledException) when (!token.IsCancellationRequested)
+                {
+                    // The HTTP transport's per-request timeout can expire before the registration budget.
+                }
+                if (attempt + 1 < MaximumAttempts)
+                {
+                    int ceiling = Math.Min(250 << attempt, 4_000);
+                    var delay = TimeSpan.FromMilliseconds(Random.Shared.Next(ceiling / 2, ceiling + 1));
+                    await Task.Delay(delay, _clock, token).ConfigureAwait(false);
+                }
             }
         }
+        catch (OperationCanceledException) when (deadline.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
+        {
+            // Exhausted elapsed-time budget. The server may have committed a request whose reply was lost.
+        }
+        cancellationToken.ThrowIfCancellationRequested();
         return LifecycleWriteOutcome.Indeterminate;
     }
+
+    private static bool IsTransient(HttpStatusCode statusCode) => statusCode is HttpStatusCode.RequestTimeout or
+        HttpStatusCode.TooManyRequests or HttpStatusCode.InternalServerError or HttpStatusCode.BadGateway or
+        HttpStatusCode.ServiceUnavailable or HttpStatusCode.GatewayTimeout;
 
     private HttpRequestMessage Sign(byte[] payload, ImmutableCredentials credentials)
     {

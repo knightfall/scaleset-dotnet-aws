@@ -32,6 +32,8 @@ internal sealed class MixedControllerCloud : IAsyncDisposable
     internal const string QuotaKey = "capacity/on-demand.json";
     internal const string Account = FargateNativeFixture.Account;
     internal const string Region = FargateNativeFixture.Region;
+    internal const string CaptureLogGroup = "arn:aws:logs:" + Region + ":" + Account + ":log-group:/aws/events/controller-fence";
+    internal const string CaptureRule = "arn:aws:events:" + Region + ":" + Account + ":rule/controller-fence";
     private const string EcsTarget = "AmazonEC2ContainerServiceV20141113.";
     private static readonly string[] RelayHeaders = ["Authorization", "X-Amz-Date", "X-Amz-Target", "X-Amz-Security-Token"];
     private static readonly JsonSerializerOptions WireNames = new();
@@ -46,12 +48,17 @@ internal sealed class MixedControllerCloud : IAsyncDisposable
     private readonly ConcurrentQueue<MixedCloudCall> _calls = new();
     private readonly ConcurrentDictionary<string, ControllerMetadata> _metadata = new(StringComparer.Ordinal);
     private readonly TaskCompletionSource<HeldEc2Launch> _held = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private readonly TaskCompletionSource<string> _heldFargate = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private readonly TaskCompletionSource _resumeFargate = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private readonly TaskCompletionSource _recoveryRead = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
     private string? _holdTemplate;
+    private string? _holdFargateState;
     private string? _recoveryToken;
     private byte[]? _quotaSample;
     private int _degradeEc2;
+    private ExpiredTask? _expiredTask;
+    private string? _capturedStop;
 
     private MixedControllerCloud(WebApplication app, Uri nativeEndpoint)
     {
@@ -67,11 +74,32 @@ internal sealed class MixedControllerCloud : IAsyncDisposable
     internal Uri Endpoint => new(_app.Urls.Single());
     internal MixedCloudCall[] Calls => _calls.ToArray();
     internal Task<HeldEc2Launch> HeldLaunch => _held.Task;
+    internal Task<string> HeldFargateEffect => _heldFargate.Task;
     internal Task RecoveryRead => _recoveryRead.Task;
 
     internal void DegradeEc2(bool enabled) => Volatile.Write(ref _degradeEc2, enabled ? 1 : 0);
     internal void HoldNextEc2Launch(string template) => Volatile.Write(ref _holdTemplate, template);
+    internal void HoldNextFargateWrite(string state) => Volatile.Write(ref _holdFargateState, state);
+    internal void ReleaseFargateWrite() => _resumeFargate.TrySetResult();
     internal void ReleaseRecoveryRead() => Volatile.Write(ref _recoveryToken, null);
+
+    internal void ExpireStoppedTask(string clusterArn, string taskArn) => Volatile.Write(ref _expiredTask, new ExpiredTask(clusterArn, taskArn));
+
+    internal void PublishCapturedStop(DateTimeOffset taskAcquiredAt)
+    {
+        var task = Volatile.Read(ref _expiredTask) ?? throw new InvalidOperationException("No expired task was selected.");
+        var now = TimeProvider.System.GetUtcNow();
+        Volatile.Write(ref _capturedStop, JsonSerializer.Serialize(new Dictionary<string, object>
+        {
+            ["version"] = "0", ["id"] = Guid.NewGuid(), ["source"] = "aws.ecs", ["detail-type"] = "ECS Task State Change",
+            ["account"] = Account, ["region"] = Region, ["resources"] = new[] { task.TaskArn }, ["time"] = now.UtcDateTime,
+            ["detail"] = new
+            {
+                clusterArn = task.ClusterArn, taskArn = task.TaskArn, lastStatus = "STOPPED", desiredStatus = "STOPPED",
+                launchType = "FARGATE", version = 12, createdAt = taskAcquiredAt.UtcDateTime.AddSeconds(-1), stoppedAt = now.UtcDateTime,
+            },
+        }));
+    }
 
     internal static async Task<MixedControllerCloud> StartAsync(CancellationToken token)
     {
@@ -191,6 +219,23 @@ internal sealed class MixedControllerCloud : IAsyncDisposable
         string operation = target.Length == 0 ? query!["Action"] ?? "" : target[(target.LastIndexOf('.') + 1)..];
         _calls.Enqueue(new MixedCloudCall(service, operation, body));
 
+        if (Volatile.Read(ref _expiredTask) is { } expired)
+        {
+            if (service == "ecs" && operation == "DescribeTasks" && ExactExpiredTask(body, expired))
+            {
+                await context.Response.WriteAsJsonAsync(new
+                {
+                    tasks = Array.Empty<object>(), failures = new[] { new { arn = expired.TaskArn, reason = "MISSING" } },
+                }, token);
+                return;
+            }
+            if (service == "logs" && operation == "FilterLogEvents")
+            {
+                await ReadCaptureAsync(context, body, expired, token);
+                return;
+            }
+        }
+
         if (service == "ec2" && operation == "DescribeImages" && Volatile.Read(ref _degradeEc2) != 0)
         {
             context.Response.StatusCode = StatusCodes.Status503ServiceUnavailable;
@@ -225,6 +270,14 @@ internal sealed class MixedControllerCloud : IAsyncDisposable
             _ => _native,
         };
         using var response = await http.SendAsync(outgoing, HttpCompletionOption.ResponseHeadersRead, token);
+        string? fargateState = Volatile.Read(ref _holdFargateState);
+        if (service == "dynamodb" && operation == "TransactWriteItems" && response.IsSuccessStatusCode &&
+            fargateState is not null && FargateIntentInTransaction(body, fargateState) is { } intent &&
+            ReferenceEquals(Interlocked.CompareExchange(ref _holdFargateState, null, fargateState), fargateState))
+        {
+            _heldFargate.TrySetResult(intent);
+            await _resumeFargate.Task.WaitAsync(token);
+        }
         string? hold = Volatile.Read(ref _holdTemplate);
         if (service == "ec2" && operation == "RunInstances" && response.IsSuccessStatusCode && hold is not null &&
             query!["LaunchTemplate.LaunchTemplateId"] == hold &&
@@ -239,6 +292,48 @@ internal sealed class MixedControllerCloud : IAsyncDisposable
         context.Response.StatusCode = (int)response.StatusCode;
         context.Response.ContentType = response.Content.Headers.ContentType?.ToString();
         await response.Content.CopyToAsync(context.Response.Body, token);
+    }
+
+    private static string? FargateIntentInTransaction(string body, string state)
+    {
+        const string prefix = "OP#fargate-launch-";
+        using var transaction = JsonDocument.Parse(body);
+        foreach (var action in transaction.RootElement.GetProperty("TransactItems").EnumerateArray())
+        {
+            if (action.TryGetProperty("Put", out var put) && put.TryGetProperty("Item", out var item) &&
+                item.TryGetProperty("effectState", out var effect) && effect.GetProperty("S").GetString() == state &&
+                item.GetProperty("SK").GetProperty("S").GetString() is { } sortKey && sortKey.StartsWith(prefix, StringComparison.Ordinal))
+            {
+                return sortKey["OP#".Length..];
+            }
+        }
+        return null;
+    }
+
+    private static bool ExactExpiredTask(string body, ExpiredTask expired)
+    {
+        using var json = JsonDocument.Parse(body);
+        var request = json.RootElement;
+        return request.GetProperty("cluster").GetString() == expired.ClusterArn &&
+            request.GetProperty("tasks").GetArrayLength() == 1 && request.GetProperty("tasks")[0].GetString() == expired.TaskArn;
+    }
+
+    private async Task ReadCaptureAsync(HttpContext context, string body, ExpiredTask expired, CancellationToken token)
+    {
+        using var json = JsonDocument.Parse(body);
+        var request = json.RootElement;
+        if (request.GetProperty("logGroupIdentifier").GetString() != CaptureLogGroup ||
+            request.GetProperty("filterPattern").GetString() != $"\"{expired.TaskArn}\"")
+        {
+            context.Response.StatusCode = StatusCodes.Status403Forbidden;
+            return;
+        }
+        if (Volatile.Read(ref _capturedStop) is not { } message)
+        {
+            await context.Response.WriteAsJsonAsync(new { events = Array.Empty<object>() }, token);
+            return;
+        }
+        await context.Response.WriteAsJsonAsync(new { events = new[] { new { message } } }, token);
     }
 
     private static async Task<HeldEc2Launch> ReadLaunchReceiptAsync(NameValueCollection query, HttpResponseMessage response,
@@ -256,6 +351,8 @@ internal sealed class MixedControllerCloud : IAsyncDisposable
     }
 
     private static string ShortId(string taskArn) => taskArn[(taskArn.LastIndexOf('/') + 1)..];
+
+    private sealed record ExpiredTask(string ClusterArn, string TaskArn);
 
     public async ValueTask DisposeAsync()
     {

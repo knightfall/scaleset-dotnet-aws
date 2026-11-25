@@ -110,6 +110,8 @@ public sealed class FargatePreflightTests
     [InlineData("image")]
     [InlineData("nonessential")]
     [InlineData("restart")]
+    [InlineData("injected-init")]
+    [InlineData("task-pid-mode")]
     [InlineData("writable-root")]
     [InlineData("environment")]
     [InlineData("secret-logs")]
@@ -130,6 +132,8 @@ public sealed class FargatePreflightTests
             case "image": runner["image"] = "docker.io/runner:latest"; break;
             case "nonessential": runner["essential"] = false; break;
             case "restart": runner["restartPolicy"] = new JsonObject { ["enabled"] = true }; break;
+            case "injected-init": runner["linuxParameters"] = new JsonObject { ["initProcessEnabled"] = true }; break;
+            case "task-pid-mode": aws.TaskDefinition["pidMode"] = "task"; break;
             case "writable-root": runner["readonlyRootFilesystem"] = false; break;
             case "environment": runner["environment"] = JsonNode.Parse("""[{"name":"TOKEN","value":"fixture-plaintext-token"}]"""); break;
             case "secret-logs": runner["logConfiguration"] = JsonNode.Parse("""{"logDriver":"splunk","options":{"splunk-token":"fixture-plaintext-token"}}"""); break;
@@ -141,6 +145,21 @@ public sealed class FargatePreflightTests
         Assert.DoesNotContain("fixture-plaintext-token", result.ToString(), StringComparison.Ordinal);
         string[] expectedOperations = ["DescribeClusters", "ListAccountSettings", "DescribeTaskDefinition"];
         Assert.Equal(expectedOperations, aws.Requests.Select(Operation));
+    }
+
+    [Fact]
+    public async Task ExplicitlyDisabledInitRetainsPrivateContainerPidNamespace()
+    {
+        var token = TestContext.Current.CancellationToken;
+        using var aws = new FargateInspectionFixture();
+        var config = await ConfigurationAsync(token);
+        aws.TaskDefinition["containerDefinitions"]![0]!["linuxParameters"] =
+            new JsonObject { ["initProcessEnabled"] = false };
+
+        var result = await aws.Inspector.ResolvePreflightAsync(config, Profile, Approval, token);
+
+        Assert.Equal(FargatePreflightStatus.Verified, result.Status);
+        Assert.True(result.IsReady);
     }
 
     [Theory]

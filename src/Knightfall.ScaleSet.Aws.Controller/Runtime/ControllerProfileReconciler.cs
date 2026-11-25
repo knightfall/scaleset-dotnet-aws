@@ -1,6 +1,5 @@
-using System.Collections.Immutable;
-using System.Globalization;
 using Knightfall.ScaleSet.Aws.Controller.Lifecycle;
+using Knightfall.ScaleSet.Aws.Controller.Telemetry;
 using Knightfall.ScaleSet.Aws.Core.Catalog;
 using Knightfall.ScaleSet.Aws.Core.Configuration;
 using Knightfall.ScaleSet.Aws.Core.Lifecycle;
@@ -8,18 +7,20 @@ using Knightfall.ScaleSet.Aws.Core.Planning;
 using Knightfall.ScaleSet.Aws.Core.Telemetry;
 using Knightfall.ScaleSet.Aws.DynamoDb;
 using Knightfall.ScaleSet.Aws.GitHub;
+using Microsoft.Extensions.Logging;
 
 namespace Knightfall.ScaleSet.Aws.Controller.Runtime;
 
-internal sealed class ControllerProfileReconciler(
+internal sealed partial class ControllerProfileReconciler(
     RuntimeConfiguration configuration, RunnerProfile profile, LifecycleProfile key, long generation,
     IRunnerBackend backend, ControllerProfileSession session, ControllerLeaseOwnership ownership,
     DynamoDbLifecycleStore store, DynamoDbEffectDispatcher effects, ControllerJitCoordinator jit,
     GitHubJitHandoff handoff, ProfileRetirementCoordinator retirement, ProfileTelemetry telemetry,
-    TimeProvider clock, EffectDispatcherTiming timing)
+    TimeProvider clock, EffectDispatcherTiming timing, ILogger<ControllerProfileReconciler> logger)
 {
     private EffectCandidateCursor? _effectsCursor;
     private string? _handoffCursor;
+    private bool _reportedStoppedEc2;
 
     internal LifecycleProfile Key { get; } = key;
 
@@ -61,7 +62,8 @@ internal sealed class ControllerProfileReconciler(
         var snapshot = await store.ReadExecutorInventoryAsync(Key, cancellationToken).ConfigureAwait(false);
         bool complete = cloud.IsComplete && observed.Complete && (snapshot.IsConsistent || snapshot.Revision is null) &&
             snapshot.Executors.All(executor => observed.Exact.ContainsKey(executor.Binding.AllocationId));
-        var sample = ProjectInventory(snapshot, cloud, observed.Unowned, complete);
+        var sample = RunnerCapacityProjection.Project(profile, snapshot, cloud.ObservedAt, observed.Unowned, complete,
+            cloud.LaunchHeadroom, clock.GetUtcNow(), timing);
         var coverage = new ExecutorInventoryObservation(sample.ObservedAt, complete, observed.Unowned,
             sample.BackendCapacityCeiling, sample.BackendLaunchHeadroom);
         var published = await store.PublishExecutorInventoryAsync(Key, current.Lease.Fence, snapshot.Revision, coverage, cancellationToken)
@@ -70,6 +72,10 @@ internal sealed class ControllerProfileReconciler(
         {
             diagnostics?.Complete("deferred", "inventory_unconfirmed");
             return false;
+        }
+        if (complete)
+        {
+            ObserveStoppedEc2(observed);
         }
 
         GitHubScaleSetBinding? binding = null;
@@ -82,10 +88,7 @@ internal sealed class ControllerProfileReconciler(
         var effectIndex = await store.ReadEffectIndexAsync(Key, cancellationToken).ConfigureAwait(false);
         bool exactIndex = effectIndex is { State: EffectIndexState.Ready } && effectIndex.OwnerEpoch == current.Lease.Epoch &&
             effectIndex.WriterProtocol == current.Lease.WriterProtocol;
-        bool listenerAvailable = Session.ListenerResult is not { Status: GitHubListenerLaneStatus.RecoveryRequired or
-            GitHubListenerLaneStatus.Failed or GitHubListenerLaneStatus.OwnershipUnavailable or GitHubListenerLaneStatus.StorageUnavailable or
-            GitHubListenerLaneStatus.Stopped };
-        bool ready = IsReady(catalog.State, binding, plan, exactIndex, complete, listenerAvailable);
+        bool ready = IsReady(catalog.State, binding, plan, exactIndex, complete, Session.IsListenerAvailable);
         var now = clock.GetUtcNow();
         telemetry.SetOwnership(current.Lease, current.Clock, timing.WriteReserve);
         telemetry.SetListenerCooldown(current.Lease.Fence, Key.ProfileId, Session.ReadCredentialCooldown());
@@ -95,7 +98,7 @@ internal sealed class ControllerProfileReconciler(
             exactIndex ? effectIndex!.UnfinishedCount : null, oldestCleanup, ready));
 
         var connection = binding is null ? null : await Session.GetConnectionAsync(cancellationToken).ConfigureAwait(false);
-        await AdvanceExecutorsAsync(catalog, current, observed.Exact, connection, cancellationToken).ConfigureAwait(false);
+        await AdvanceExecutorsAsync(catalog, current, observed.Exact, connection, complete, cancellationToken).ConfigureAwait(false);
         if (ownership.ReadAuthority() is not { } latest)
         {
             diagnostics?.Complete("deferred", "ownership_unavailable");
@@ -142,32 +145,6 @@ internal sealed class ControllerProfileReconciler(
         return oldest;
     }
 
-    private InventorySample ProjectInventory(ExecutorInventorySnapshot snapshot, RunnerBackendInventory cloud, int unowned, bool complete)
-    {
-        var slots = ImmutableArray.CreateBuilder<RunnerSlot>();
-        var now = clock.GetUtcNow();
-        foreach (var executor in snapshot.Executors)
-        {
-            var classified = ExecutorClassifier.Classify(executor.State, now, timing.ObservationFreshness, timing.LogFlushGrace);
-            if (classified.Occupied)
-            {
-                // The sample's cut-off can precede a concurrent event update. Such a start adds no credible pending capacity.
-                var start = executor.State.StartedAt <= cloud.ObservedAt ? executor.State.StartedAt : null;
-                slots.Add(new RunnerSlot(executor.Binding.ResourceArn, classified.SlotState, OwnershipVerified: true, start)
-                {
-                    CoversIdleReserve = classified.CoversIdleReserve,
-                });
-            }
-        }
-        for (int index = 0; index < unowned; index++)
-        {
-            slots.Add(new RunnerSlot("unowned-" + index.ToString(CultureInfo.InvariantCulture), RunnerSlotState.Unknown, OwnershipVerified: false));
-        }
-        int? ceiling = complete && cloud.LaunchHeadroom is int headroom
-            ? (int)Math.Min(profile.Capacity.MaxRunners, (long)slots.Count + headroom) : null;
-        return new InventorySample(cloud.ObservedAt, complete, ceiling, complete ? cloud.LaunchHeadroom : null, slots.ToImmutable());
-    }
-
     private async Task<ObservedResources> ObserveResourcesAsync(
         DeploymentLeaseFence fence, RunnerBackendInventory cloud, CancellationToken cancellationToken)
     {
@@ -210,8 +187,7 @@ internal sealed class ControllerProfileReconciler(
             current.Identity.Incarnation == binding.Incarnation &&
             profile.Provisioner is Ec2ProvisionerConfiguration { StatusQualification: { } ec2 } &&
             current.Identity.AwsUserId.StartsWith(ec2.RoleId + ":", StringComparison.Ordinal) &&
-            await store.ReadEc2BootstrapStatusAsync(current, cancellationToken).ConfigureAwait(false) is { } status &&
-            status.QualificationSha256 == qualification)
+            await store.ReadEc2BootstrapStatusAsync(current, qualification, cancellationToken).ConfigureAwait(false) is { } status)
         {
             var observation = new ExecutorProcessObservation(status.RunnerId,
                 status.Exited ? ExecutorProcessState.Exited : ExecutorProcessState.Ready, status.ObservedAt, Guid.NewGuid());
@@ -220,7 +196,8 @@ internal sealed class ControllerProfileReconciler(
     }
 
     private async Task AdvanceExecutorsAsync(CatalogProfile catalog, ActiveControllerAuthority authority,
-        Dictionary<string, RunnerBackendResource> exact, GitHubScaleSetConnection? connection, CancellationToken cancellationToken)
+        Dictionary<string, RunnerBackendResource> exact, GitHubScaleSetConnection? connection, bool inventoryComplete,
+        CancellationToken cancellationToken)
     {
         foreach (var (allocation, resource) in exact)
         {
@@ -230,7 +207,11 @@ internal sealed class ControllerProfileReconciler(
             {
                 continue;
             }
-            await backend.CleanupAsync(current, catalog, executor, ownership.OwnershipLost, cancellationToken).ConfigureAwait(false);
+            if (inventoryComplete || executor.Binding.Provider is not FargateExecutorIdentity ||
+                executor.State.Resource?.State == ExecutorResourceState.IrreversiblyTerminated)
+            {
+                await backend.CleanupAsync(current, catalog, executor, ownership.OwnershipLost, cancellationToken).ConfigureAwait(false);
+            }
             if (connection is not null && executor.State.Resource is { State: ExecutorResourceState.Starting or ExecutorResourceState.Running } observed &&
                 executor.State.Job is not { Phase: ExecutorJobPhase.Completed } && executor.State.AdmissionClosure is null &&
                 resource.BootstrapCredentialArn is { } principal)
@@ -267,6 +248,32 @@ internal sealed class ControllerProfileReconciler(
         }
         _handoffCursor = pending.Continuation;
     }
+
+    private void ObserveStoppedEc2(ObservedResources observed)
+    {
+        bool stopped = observed.Exact.Values.Any(static resource => resource.IsStoppedEc2);
+        if (stopped && !_reportedStoppedEc2)
+        {
+            try
+            {
+                using var logScope = logger.BeginScope(new KeyValuePair<string, object?>[]
+                {
+                    new("profile", profile.Id),
+                    new("provider", "ec2"),
+                    new("reason", "external_reclamation_required"),
+                });
+                LogRecoveryHold(logger, "reconcile", "held");
+            }
+            catch (Exception error) when (error is AggregateException or IOException or InvalidOperationException)
+            {
+                // A logging failure must not change reconciliation.
+            }
+        }
+        _reportedStoppedEc2 = stopped;
+    }
+
+    [LoggerMessage(EventId = 902, Level = LogLevel.Warning, Message = TelemetryNames.EventTemplate)]
+    private static partial void LogRecoveryHold(ILogger logger, string operation, string outcome);
 
     private static bool IsReady(CatalogProfileState state, GitHubScaleSetBinding? binding, CapacityPlan plan,
         bool exactIndex, bool complete, bool listenerAvailable) =>

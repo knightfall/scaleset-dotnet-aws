@@ -225,15 +225,73 @@ public sealed class TelemetrySettings
         {
             return null;
         }
-        if (value.Length > 2_048 || value.Any(static character => char.IsWhiteSpace(character) || char.IsControl(character) || character == '\\') ||
+        if (value.Length > 2_048 || value.Any(static character => char.IsWhiteSpace(character) || char.IsControl(character) ||
+            character is '\ufeff' or '\\' or '?' or '#' or '<' or '>' or '"' or '{' or '}' or '|' or '^' or '`') ||
+            (!value.StartsWith("https://", StringComparison.OrdinalIgnoreCase) && !value.StartsWith("http://", StringComparison.OrdinalIgnoreCase)) ||
             !Uri.TryCreate(value, UriKind.Absolute, out var endpoint) || endpoint.Scheme is not ("http" or "https") ||
             endpoint.Host.Length == 0 || endpoint.Port <= 0 || endpoint.UserInfo.Length != 0 ||
-            value.Contains('?') || value.Contains('#') ||
-            !endpoint.IsWellFormedOriginalString())
+            !IsLiteralEndpoint(value))
         {
             throw Invalid(setting);
         }
         return endpoint;
+    }
+
+    private static bool IsLiteralEndpoint(string value)
+    {
+        int locationStart = value.IndexOf("://", StringComparison.Ordinal) + 3;
+        var location = value.AsSpan(locationStart);
+        int delimiter = location.IndexOf('/');
+        var authority = delimiter < 0 ? location : location[..delimiter];
+        // Validate the authority independently. System.Uri's whole-IRI check rejects some Unicode paths it can safely encode.
+        if (authority.IsEmpty || authority.ContainsAny('@', '%') ||
+            !Uri.IsWellFormedUriString(value[..(locationStart + authority.Length)], UriKind.Absolute))
+        {
+            return false;
+        }
+
+        ReadOnlySpan<char> path = delimiter < 0 ? [] : location[delimiter..];
+        if (path.ContainsAny('[', ']'))
+        {
+            return false;
+        }
+        foreach (var segment in path.Split('/'))
+        {
+            if (path[segment] is "." or "..")
+            {
+                return false;
+            }
+        }
+        for (int index = 0; index < path.Length; index++)
+        {
+            if (char.IsSurrogate(path[index]))
+            {
+                if (index + 1 >= path.Length || !char.IsSurrogatePair(path[index], path[index + 1]))
+                {
+                    return false;
+                }
+                index++;
+                continue;
+            }
+            if (path[index] != '%')
+            {
+                continue;
+            }
+            if (index + 2 >= path.Length)
+            {
+                return false;
+            }
+            var digits = path.Slice(index + 1, 2);
+            if (!byte.TryParse(digits, NumberStyles.AllowHexSpecifier, CultureInfo.InvariantCulture, out byte octet) ||
+                char.IsAsciiLetterOrDigit((char)octet) || (octet >= 0x80 && digits.ContainsAnyInRange('a', 'f')) ||
+                (char)octet is '.' or '_' or '~' or '-' or '\\' or <= '\u001f' or '\u007f')
+            {
+                return false;
+            }
+
+            index += 2;
+        }
+        return true;
     }
 
     private static Uri AppendPath(Uri endpoint, string path) =>

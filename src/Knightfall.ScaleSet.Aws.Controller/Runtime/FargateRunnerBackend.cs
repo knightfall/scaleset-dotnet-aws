@@ -4,6 +4,7 @@ using Knightfall.ScaleSet.Aws.Controller.Configuration;
 using Knightfall.ScaleSet.Aws.Core.Catalog;
 using Knightfall.ScaleSet.Aws.Core.Configuration;
 using Knightfall.ScaleSet.Aws.Core.Lifecycle;
+using Knightfall.ScaleSet.Aws.Core.Planning;
 using Knightfall.ScaleSet.Aws.DynamoDb;
 using Knightfall.ScaleSet.Aws.Providers.Fargate;
 
@@ -14,8 +15,9 @@ internal sealed class FargateRunnerBackend(
     FargateRuntimeEvidence evidence, FargateQuotaReader quota, IReadOnlyCollection<LifecycleProfile> deploymentProfiles,
     ConcurrentDictionary<string, FargateInventorySnapshot> deploymentInventory,
     DynamoDbLifecycleStore store, DynamoDbEffectJournal journal, DynamoDbEffectDispatcher dispatcher,
-    TimeProvider clock, TimeSpan observationFreshness) : IRunnerBackend
+    TimeProvider clock, EffectDispatcherTiming timing) : IRunnerBackend
 {
+    private static readonly TimeSpan DemandFreshness = TimeSpan.FromMinutes(10);
     private FargateResolvedTask? _launchTask;
 
     public IReconciliationEffectProvider Effects { get; } = evidence.ForProfile(profile.Id) is { } approval
@@ -92,7 +94,7 @@ internal sealed class FargateRunnerBackend(
 
                 if (effect.Entry.State == EffectState.Planned)
                 {
-                    await DispatchFirstLaunchAsync(authority, effect.Entry.Envelope, ownershipLost, cancellationToken).ConfigureAwait(false);
+                    _ = await DispatchFirstLaunchAsync(authority, effect.Entry.Envelope, ownershipLost, cancellationToken).ConfigureAwait(false);
                 }
                 else
                 {
@@ -121,28 +123,70 @@ internal sealed class FargateRunnerBackend(
             earliest, earliest.AddMinutes(50));
         if (await journal.PlanAsync(authority.Lease, envelope, Guid.NewGuid(), cancellationToken).ConfigureAwait(false) == LifecycleWriteOutcome.Committed)
         {
-            await DispatchFirstLaunchAsync(authority, envelope, ownershipLost, cancellationToken).ConfigureAwait(false);
+            _ = await DispatchFirstLaunchAsync(authority, envelope, ownershipLost, cancellationToken).ConfigureAwait(false);
         }
     }
 
-    private async Task DispatchFirstLaunchAsync(ActiveControllerAuthority authority, EffectEnvelope envelope,
-        CancellationToken ownershipLost, CancellationToken cancellationToken)
+    private Task<EffectDispatchStatus> DispatchFirstLaunchAsync(ActiveControllerAuthority authority, EffectEnvelope envelope,
+        CancellationToken ownershipLost, CancellationToken cancellationToken) =>
+        dispatcher.DispatchFirstFargateLaunchAsync(authority.Lease, authority.Clock, key, envelope.IntentId, Effects,
+            token => ReadFirstLaunchEvidenceAsync(authority.Lease.Fence, envelope, token), ownershipLost, cancellationToken);
+
+    private async Task<FargateFirstLaunchEvidence?> ReadFirstLaunchEvidenceAsync(
+        DeploymentLeaseFence lease, EffectEnvelope envelope, CancellationToken cancellationToken)
     {
         if (envelope.Request is not FargateLaunchEffectRequest launch || _launchTask is not { } task ||
-            !deploymentInventory.TryGetValue(profile.Id, out var inventory))
+            !deploymentInventory.TryGetValue(profile.Id, out var inventory) ||
+            await store.ReadFargateLaunchDemandAsync(key, lease, cancellationToken).ConfigureAwait(false) is not { } demand)
         {
-            return;
+            return null;
         }
-        var reservations = await ReadReservationsAsync(authority.Lease.Fence, cancellationToken).ConfigureAwait(false);
+        var snapshot = await store.ReadExecutorInventoryAsync(key, cancellationToken).ConfigureAwait(false);
+        if (!snapshot.IsConsistent || snapshot.Revision is not { } inventoryRevision ||
+            snapshot.Coverage is not { IsComplete: true } coverage || coverage.ObservedAt != inventory.ObservedAt)
+        {
+            return null;
+        }
+        var readback = await inspector.ReadInventoryAsync(configuration, profile.Id, inventory, cancellationToken).ConfigureAwait(false);
+        if (!readback.IsProfileComplete || readback.Scope != inventory.Scope ||
+            !OccupiedTasks(inventory).ToHashSet().SetEquals(OccupiedTasks(readback)))
+        {
+            // The next pass can publish a changed provider inventory before deciding whether to launch.
+            return null;
+        }
+        var reservations = await ReadReservationsAsync(lease, cancellationToken).ConfigureAwait(false);
         var sample = await quota.ReadAsync(cancellationToken).ConfigureAwait(false);
-        if (sample is null || inspector.EstimateReservedLaunchHeadroom(task, inventory, sample, reservations,
-                deploymentInventory.Values.ToArray(), launch).LaunchSlots is not > 0)
+        var now = clock.GetUtcNow();
+        if (sample is null || reservations is null || coverage.ObservedAt > now ||
+            now - coverage.ObservedAt >= timing.ObservationFreshness || demand.Demand.ObservedAt > now ||
+            now - demand.Demand.ObservedAt >= DemandFreshness)
         {
-            return;
+            return null;
         }
-        _ = await dispatcher.DispatchPlannedAsync(authority.Lease, authority.Clock, key, envelope.IntentId,
-            Effects, sample.ValidUntil, ownershipLost, cancellationToken).ConfigureAwait(false);
+        var headroom = inspector.EstimateReservedLaunchHeadroom(task, readback, sample, reservations,
+            deploymentInventory.Values.ToArray(), launch).LaunchSlots;
+        long unowned = (long)coverage.UnownedOccupied + reservations.Count(reservation =>
+            reservation.Scope == task.Scope && reservation.AllocationId != launch.AllocationId && reservation.TaskArn is null);
+        if (headroom is not > 0 || unowned >= profile.Capacity.MaxRunners)
+        {
+            return null;
+        }
+        var current = RunnerCapacityProjection.Project(profile, snapshot, coverage.ObservedAt, (int)unowned,
+            complete: true, headroom, now, timing);
+        var plan = CapacityPlanner.Plan(profile, new DemandSample(demand.Demand.ObservedAt, demand.Demand.TotalAssignedJobs), current, clock);
+        if (plan.ProposedStarts == 0)
+        {
+            return null;
+        }
+        DateTimeOffset[] deadlines = [sample.ValidUntil, coverage.ObservedAt + timing.ObservationFreshness,
+            demand.Demand.ObservedAt + DemandFreshness];
+        return new FargateFirstLaunchEvidence(deadlines.Min(), demand.DemandRevision, demand.SessionRevision, inventoryRevision);
     }
+
+    private static IEnumerable<(string Arn, Guid? Allocation, Guid? Incarnation, FargateTaskState State)> OccupiedTasks(
+        FargateInventorySnapshot inventory) => inventory.Tasks
+        .Where(task => !task.IsForeign && task.State != FargateTaskState.Stopped)
+        .Select(task => (task.ResourceArn, task.AllocationId, task.Incarnation, task.State));
 
     public async Task CleanupAsync(ActiveControllerAuthority authority, CatalogProfile catalog, ExecutorSnapshot executor,
         CancellationToken ownershipLost, CancellationToken cancellationToken)
@@ -160,7 +204,7 @@ internal sealed class FargateRunnerBackend(
             var now = clock.GetUtcNow();
             var startupExpired = executor.State.StartedAt is { } start && now - start >= TimeSpan.FromSeconds(profile.Capacity.StartupTimeoutSeconds);
             if ((catalog.State != CatalogProfileState.Draining && !startupExpired) ||
-                await store.CloseFargateAdmissionAsync(authority.Lease, executor, observationFreshness, cancellationToken).ConfigureAwait(false) !=
+                await store.CloseFargateAdmissionAsync(authority.Lease, catalog, executor, timing.ObservationFreshness, cancellationToken).ConfigureAwait(false) !=
                     LifecycleWriteOutcome.Committed)
             {
                 return;
@@ -183,7 +227,9 @@ internal sealed class FargateRunnerBackend(
                 return;
             }
         }
-        else if (existing.Entry.State != EffectState.Planned || existing.Entry.Envelope.Request != request)
+        else if (existing.Entry.Envelope.Request != request || existing.Entry is not
+            ({ State: EffectState.Planned } or
+             { State: EffectState.Settled, Resolution.Kind: EffectResolutionKind.AbandonedBeforeSend or EffectResolutionKind.CanceledBeforeSend }))
         {
             return;
         }

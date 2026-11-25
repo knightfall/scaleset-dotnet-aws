@@ -1,18 +1,22 @@
 import { readFileSync } from "node:fs";
-import { CfnOutput, Duration, Stack } from "aws-cdk-lib";
+import { CfnOutput, Duration, RemovalPolicy, Stack } from "aws-cdk-lib";
 import type { ITable } from "aws-cdk-lib/aws-dynamodb";
 import * as iam from "aws-cdk-lib/aws-iam";
 import * as lambda from "aws-cdk-lib/aws-lambda";
+import * as logs from "aws-cdk-lib/aws-logs";
 import type { Construct } from "constructs";
+import { trackingTableDecrypt } from "./imported-encryption.ts";
 
 export function helloIngress(
   scope: Construct,
   id: string,
   table: ITable,
   bootstrapRole: iam.IRole,
-  active: boolean,
+  reservedConcurrency: number,
+  tableKeyArn?: string,
 ) {
   const stack = Stack.of(scope);
+  const active = reservedConcurrency > 0;
   const broker = new lambda.Function(scope, `${id}HelloBroker`, {
     runtime: lambda.Runtime.NODEJS_24_X,
     architecture: lambda.Architecture.ARM_64,
@@ -21,7 +25,11 @@ export function helloIngress(
       readFileSync(new URL("hello-ingress.cjs", import.meta.url), "utf8"),
     ),
     timeout: Duration.seconds(5),
-    reservedConcurrentExecutions: active ? 4 : 0,
+    logGroup: new logs.LogGroup(scope, `${id}HelloLogs`, {
+      retention: logs.RetentionDays.ONE_MONTH,
+      removalPolicy: RemovalPolicy.RETAIN,
+    }),
+    reservedConcurrentExecutions: reservedConcurrency,
     environment: {
       BOOTSTRAP_ACCOUNT: stack.account,
       BOOTSTRAP_PARTITION: stack.partition,
@@ -39,6 +47,10 @@ export function helloIngress(
   });
   const dependencies = [broker, endpoint];
   if (!active) return { dependencies, statements: [] };
+  if (tableKeyArn)
+    broker.addToRolePolicy(
+      trackingTableDecrypt(scope, tableKeyArn, table.tableName),
+    );
 
   broker.addToRolePolicy(
     new iam.PolicyStatement({

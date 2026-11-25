@@ -54,14 +54,16 @@ internal sealed class MixedRuntimeFixture : IAsyncDisposable
     private string ControllerSubnet { get; set; } = null!;
 
     internal static async Task<MixedRuntimeFixture> CreateAsync(string mode, CancellationToken token,
-        bool sharedFargateCluster = false, long remainingFargateCpuUnits = 32_768, int? warmFargateMaximum = null)
+        bool sharedFargateCluster = false, long remainingFargateCpuUnits = 32_768, int? warmFargateMaximum = null,
+        bool qualifyFirstEc2 = false, bool qualifyCapture = false, Func<HttpContext, Task>? beforeGitHubRequest = null)
     {
         var cloud = await MixedControllerCloud.StartAsync(token);
         MixedRuntimeFixture? fixture = null;
         try
         {
             fixture = new MixedRuntimeFixture(cloud, await MiniStackTable.CreateAsync(token));
-            await fixture.SeedAsync(mode, sharedFargateCluster, remainingFargateCpuUnits, warmFargateMaximum, token);
+            await fixture.SeedAsync(mode, sharedFargateCluster, remainingFargateCpuUnits, warmFargateMaximum, qualifyFirstEc2,
+                qualifyCapture, beforeGitHubRequest, token);
             return fixture;
         }
         catch
@@ -79,12 +81,21 @@ internal sealed class MixedRuntimeFixture : IAsyncDisposable
     }
 
     private async Task SeedAsync(string mode, bool sharedFargateCluster, long remainingFargateCpuUnits, int? warmFargateMaximum,
-        CancellationToken token)
+        bool qualifyFirstEc2, bool qualifyCapture, Func<HttpContext, Task>? beforeGitHubRequest, CancellationToken token)
     {
         string raw = await File.ReadAllTextAsync(Path.Combine(AppContext.BaseDirectory, "mixed-ec2-fargate.json"), token);
         var root = JsonNode.Parse(raw.Replace("111122223333", MixedControllerCloud.Account, StringComparison.Ordinal)
             .Replace("ap-southeast-2", MixedControllerCloud.Region, StringComparison.Ordinal))!;
         var spec = root["spec"]!;
+        if (qualifyCapture)
+        {
+            var captureTime = TimeProvider.System.GetUtcNow();
+            spec["controller"]!["predecessorCapture"] = new JsonObject
+            {
+                ["logGroupArn"] = MixedControllerCloud.CaptureLogGroup, ["eventRuleArn"] = MixedControllerCloud.CaptureRule,
+                ["qualifiedFrom"] = CaptureSecond(captureTime.AddMinutes(-1)), ["qualifiedUntil"] = CaptureSecond(captureTime.AddMinutes(10)),
+            };
+        }
         string deployment = "t25-" + Guid.NewGuid().ToString("N");
         root["metadata"]!["name"] = deployment;
         spec["tracking"]!["table"] = new JsonObject { ["type"] = "import", ["name"] = Table.Name };
@@ -149,6 +160,16 @@ internal sealed class MixedRuntimeFixture : IAsyncDisposable
                 provisioner["instanceProfileArn"] = source.InstanceProfileArn;
                 provisioner["bootstrapRoleArn"] = role.Arn;
                 roleId = role.RoleId;
+                if (qualifyFirstEc2)
+                {
+                    provisioner["statusQualification"] = new JsonObject
+                    {
+                        ["imageId"] = DirectEc2Fixture.LinuxImage,
+                        ["roleId"] = roleId,
+                        ["evidenceSha256"] = DirectEc2Fixture.StatusQualificationDigest,
+                    };
+                    qualifyFirstEc2 = false;
+                }
             }
             else
             {
@@ -206,8 +227,18 @@ internal sealed class MixedRuntimeFixture : IAsyncDisposable
             quota = new FargateQuotaEvidence(MixedControllerCloud.Account, MixedControllerCloud.Region,
                 now, now.AddMinutes(10), remainingFargateCpuUnits, 0),
         }, JsonSerializerOptions.Web);
-        GitHub = await GitHubProtocolHost.StartAsync(Profiles.Values.Select(value => value.GitHub).ToArray(), token, PacePollsAsync);
+        GitHub = await GitHubProtocolHost.StartAsync(Profiles.Values.Select(value => value.GitHub).ToArray(), token, async context =>
+        {
+            if (beforeGitHubRequest is not null)
+            {
+                await beforeGitHubRequest(context);
+            }
+            await PacePollsAsync(context);
+        });
     }
+
+    private static string CaptureSecond(DateTimeOffset instant) =>
+        instant.ToString("yyyy-MM-dd'T'HH:mm:ss'Z'", CultureInfo.InvariantCulture);
 
     internal Task<string> StartControllerTaskAsync(CancellationToken token) =>
         Cloud.StartControllerTaskAsync(ControllerCluster, ControllerDefinition, ControllerSubnet, token);

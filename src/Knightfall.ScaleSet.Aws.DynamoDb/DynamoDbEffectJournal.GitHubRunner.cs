@@ -150,14 +150,28 @@ public sealed partial class DynamoDbEffectJournal
             : Task.FromResult(LifecycleWriteOutcome.Conflict);
     }
 
-    internal Task<LifecycleWriteOutcome> RearmAbandonedFargateStopAsync(
-        ControllerLease lease, EffectJournalSnapshot expected, EffectDispatchGuard guard, CancellationToken cancellationToken) =>
-        expected.Entry.Envelope.Request is FargateStopEffectRequest { Incarnation: not null }
-            ? RearmAbandonedEffectAsync(lease, expected, cancellationToken, guard)
-            : Task.FromResult(LifecycleWriteOutcome.Conflict);
+    internal Task<LifecycleWriteOutcome> ReplanUnsentFargateStopAsync(ControllerLease lease, EffectJournalSnapshot expected,
+        EffectEnvelope replacement, EffectDispatchGuard guard, Guid transition, DateTimeOffset leaseValidThrough,
+        CancellationToken cancellationToken)
+    {
+        var previous = expected.Entry.Envelope;
+        if (lease.Mode != ControllerLeaseMode.Active || lease.Deployment != previous.Profile.Deployment)
+        {
+            return Task.FromResult(LifecycleWriteOutcome.LeaseRejected);
+        }
+        if (!expected.Entry.IsUnsentFargateStop() || replacement.Profile != previous.Profile ||
+            replacement.IntentId != previous.IntentId || replacement.Request != previous.Request ||
+            replacement.Generation != guard.Catalog.AppliedGeneration || replacement.Generation < previous.Generation ||
+            (expected.Entry.State == EffectState.Planned && replacement.Generation == previous.Generation))
+        {
+            return Task.FromResult(LifecycleWriteOutcome.Conflict);
+        }
+        return _store.WriteExactEffectAsync(lease.Fence, transition, expected, EffectJournalEntry.Plan(replacement), leaseValidThrough,
+            cancellationToken, guard);
+    }
 
     private async Task<LifecycleWriteOutcome> RearmAbandonedEffectAsync(
-        ControllerLease lease, EffectJournalSnapshot expected, CancellationToken cancellationToken, EffectDispatchGuard? guard = null)
+        ControllerLease lease, EffectJournalSnapshot expected, CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(lease);
         ArgumentNullException.ThrowIfNull(expected);
@@ -182,7 +196,7 @@ public sealed partial class DynamoDbEffectJournal
         {
             return LifecycleWriteOutcome.Conflict;
         }
-        var outcome = await _store.WriteExactEffectAsync(owner.Fence, transition, current, planned, null, cancellationToken, guard)
+        var outcome = await _store.WriteExactEffectAsync(owner.Fence, transition, current, planned, null, cancellationToken)
             .ConfigureAwait(false);
         if (outcome is LifecycleWriteOutcome.Conflict or LifecycleWriteOutcome.Indeterminate)
         {

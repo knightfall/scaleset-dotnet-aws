@@ -68,7 +68,7 @@ function event(body: string, id = taskId, role = roleName) {
   };
 }
 
-function fixture(enabled = true) {
+function fixture(enabled = true, lostResponses = new Set<string>()) {
   const rows = new Map<string, Item>();
   const calls = { reads: 0, putAttempts: 0, writes: 0, clock: 1_700_000_000 };
   const handle = createHandler({
@@ -97,6 +97,9 @@ function fixture(enabled = true) {
       }
       rows.set(key, request.Item);
       calls.writes++;
+      if (lostResponses.delete(key)) {
+        throw new Error("fixture lost the acknowledged write");
+      }
     },
   });
   return { handle, rows, calls };
@@ -193,4 +196,40 @@ test("invalid or disabled requests perform no write and disclose no payload", as
     writes: 0,
     clock: 1_700_000_000,
   });
+});
+
+test("concurrent principals replay lost responses without rewriting HELLO or expiry", async () => {
+  const burst = Array.from({ length: 8 }, (_, index) => {
+    const id = (index + 1).toString(16).padStart(32, "0");
+    return {
+      id,
+      body: JSON.stringify(payload()),
+      key: `HELLO#BROKER#${roleId}:${id}`,
+    };
+  });
+  const { handle, rows, calls } = fixture(
+    true,
+    new Set([burst[0]!.key, burst[4]!.key]),
+  );
+  const statuses = await Promise.all(
+    burst.map(({ body, id }) => handle(event(body, id))),
+  );
+  assert.deepEqual(
+    statuses.map(({ statusCode }) => statusCode),
+    [503, 204, 204, 204, 503, 204, 204, 204],
+  );
+  assert.equal(rows.size, burst.length);
+  for (const { key, body } of burst) {
+    assert.equal(rows.get(key)?.payload.S, body);
+    assert.equal(rows.get(key)?.expiresAt.N, String(calls.clock + 3_600));
+  }
+  const receipts = structuredClone(rows);
+  calls.clock += 10;
+  const retries = await Promise.all(
+    burst.map(({ body, id }) => handle(event(body, id))),
+  );
+  assert.ok(retries.every(({ statusCode }) => statusCode === 204));
+  assert.deepEqual(rows, receipts);
+  assert.equal(calls.putAttempts, burst.length);
+  assert.equal(calls.writes, burst.length);
 });

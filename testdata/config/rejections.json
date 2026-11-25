@@ -259,6 +259,150 @@
     ]
   },
   {
+    "name": "snapshot S3 key contains an IAM wildcard",
+    "fault": "configuration",
+    "code": "schema",
+    "edits": [
+      {
+        "path": "/spec/dryRun/demand",
+        "value": {
+          "type": "snapshot",
+          "s3Uri": "s3://config-fixtures/demand*.json",
+          "versionId": "recorded-version",
+          "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      }
+    ]
+  },
+  {
+    "name": "snapshot S3 key contains an IAM substitution",
+    "fault": "configuration",
+    "code": "schema",
+    "edits": [
+      {
+        "path": "/spec/dryRun/demand",
+        "value": {
+          "type": "snapshot",
+          "s3Uri": "s3://config-fixtures/${aws:username}/demand.json",
+          "versionId": "recorded-version",
+          "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      }
+    ]
+  },
+  {
+    "name": "snapshot S3 key contains an escaped delimiter",
+    "fault": "configuration",
+    "code": "schema",
+    "edits": [
+      {
+        "path": "/spec/dryRun/demand",
+        "value": {
+          "type": "snapshot",
+          "s3Uri": "s3://config-fixtures/events%2Fdemand.json",
+          "versionId": "recorded-version",
+          "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      }
+    ]
+  },
+  {
+    "name": "snapshot S3 key contains a relative path segment",
+    "fault": "configuration",
+    "code": "schema",
+    "edits": [
+      {
+        "path": "/spec/dryRun/demand",
+        "value": {
+          "type": "snapshot",
+          "s3Uri": "s3://config-fixtures/events/../demand.json",
+          "versionId": "recorded-version",
+          "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      }
+    ]
+  },
+  {
+    "name": "snapshot S3 key contains an empty path segment",
+    "fault": "configuration",
+    "code": "schema",
+    "edits": [
+      {
+        "path": "/spec/dryRun/demand",
+        "value": {
+          "type": "snapshot",
+          "s3Uri": "s3://config-fixtures/events//demand.json",
+          "versionId": "recorded-version",
+          "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      }
+    ]
+  },
+  {
+    "name": "snapshot S3 key contains an invalid delimiter",
+    "fault": "configuration",
+    "code": "schema",
+    "edits": [
+      {
+        "path": "/spec/dryRun/demand",
+        "value": {
+          "type": "snapshot",
+          "s3Uri": "s3://config-fixtures/events\\demand.json",
+          "versionId": "recorded-version",
+          "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      }
+    ]
+  },
+  {
+    "name": "snapshot S3 bucket is an access point alias",
+    "fault": "configuration",
+    "code": "schema",
+    "edits": [
+      {
+        "path": "/spec/dryRun/demand",
+        "value": {
+          "type": "snapshot",
+          "s3Uri": "s3://config-fixtures-123-s3alias/demand.json",
+          "versionId": "recorded-version",
+          "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      }
+    ]
+  },
+  {
+    "name": "snapshot S3 version contains an IAM substitution",
+    "fault": "configuration",
+    "code": "schema",
+    "edits": [
+      {
+        "path": "/spec/dryRun/demand",
+        "value": {
+          "type": "snapshot",
+          "s3Uri": "s3://config-fixtures/demand.json",
+          "versionId": "${aws:username}",
+          "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      }
+    ]
+  },
+  {
+    "name": "snapshot S3 version is not pinned",
+    "fault": "configuration",
+    "code": "schema",
+    "edits": [
+      {
+        "path": "/spec/dryRun/demand",
+        "value": {
+          "type": "snapshot",
+          "s3Uri": "s3://config-fixtures/demand.json",
+          "versionId": "null",
+          "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      }
+    ]
+  },
+  {
     "name": "inline GitHub token",
     "fault": "configuration",
     "code": "inline-credentials-unsupported",
@@ -818,5 +962,35 @@
       }
     ],
     "errorPath": "/spec/profiles/1/github/scaleSetId"
+  },
+  {
+    "name": "Fargate execution role cannot also be its bootstrap role",
+    "fault": "configuration",
+    "code": "semantic",
+    "base": "mixed-ec2-fargate",
+    "edits": [
+      {
+        "path": "/spec/profiles/2/provisioner/executionRoleArn",
+        "value": "arn:aws:iam::111122223333:role/fargate-shell-bootstrap"
+      }
+    ],
+    "errorPath": "/spec/profiles/2/provisioner/executionRoleArn"
+  },
+  {
+    "name": "Fargate execution role cannot alias a draining EC2 bootstrap role by path or case",
+    "fault": "configuration",
+    "code": "semantic",
+    "base": "mixed-ec2-fargate",
+    "edits": [
+      {
+        "path": "/spec/profiles/0/state",
+        "value": "draining"
+      },
+      {
+        "path": "/spec/profiles/2/provisioner/executionRoleArn",
+        "value": "arn:aws:iam::111122223333:role/imported/RUNNER-LINUX-BOOTSTRAP"
+      }
+    ],
+    "errorPath": "/spec/profiles/2/provisioner/executionRoleArn"
   }
 ]

@@ -98,6 +98,12 @@ internal sealed class MixedControllerProcess : IAsyncDisposable
         await _process.WaitForExitAsync(token);
     }
 
+    internal async Task<int> ExitCodeAsync(CancellationToken token)
+    {
+        await _process.WaitForExitAsync(token);
+        return _process.ExitCode;
+    }
+
     internal async Task<string> DiagnosticsAsync() => await _output + await _errors;
 
     public async ValueTask DisposeAsync()

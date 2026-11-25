@@ -10,6 +10,7 @@ public sealed record ControllerEventQueues(string? Ec2, string? Ecs);
 public sealed class ControllerRunContext
 {
     private readonly Action<ControllerHealthSnapshot> _publishHealth;
+    private readonly ControllerRunLifetime _lifetime;
 
     internal ControllerRunContext(
         RuntimeConfiguration configuration, long generation, TelemetryPipeline telemetry, ControllerEventQueues eventQueues,
@@ -21,6 +22,7 @@ public sealed class ControllerRunContext
         EventQueues = eventQueues;
         AwsLoopbackEndpoint = awsLoopbackEndpoint;
         _publishHealth = publishHealth;
+        _lifetime = lifetime;
         Stopping = lifetime.Stopping;
         ShutdownDeadline = lifetime.ShutdownDeadline;
     }
@@ -36,6 +38,8 @@ public sealed class ControllerRunContext
 
     /// <summary>Bounds lifecycle cleanup before the process reserves time to stop health and telemetry.</summary>
     public CancellationToken ShutdownDeadline { get; }
+
+    internal void RequestStop() => _lifetime.RequestStop();
 
     public void PublishHealth(ControllerHealthSnapshot snapshot)
     {

@@ -25,6 +25,21 @@ dotnet publish "$project" --configuration Release --no-restore /t:PublishContain
 python3 tests/oci/verify_controller_image.py "$archive" "${platform#linux/}" --assembly "$assembly"
 
 docker image load --input "$archive"
+runtime_fixture="$PWD/testdata/config/runtime/ec2-only-pinned.json"
+runtime_digest=$(sha256sum "$runtime_fixture" | cut -d ' ' -f 1)
+run_controller() {
+  docker run --rm --pull=never --platform "$platform" --network none --read-only \
+    --env ECS_CONTAINER_METADATA_URI_V4= \
+    --mount "type=bind,source=$runtime_fixture,target=/runtime.json,readonly" \
+    "scaleset-aws-controller:$tag" "$@"
+}
+test "$(run_controller config verify --file /runtime.json --sha256 "$runtime_digest")" = "$runtime_digest"
+clock_exit=0
+clock_output=$(run_controller preflight clock --config /runtime.json --sha256 "$runtime_digest" 2>&1) || clock_exit=$?
+if [[ "$clock_exit" != 1 || "$clock_output" != 'Controller clock preflight could not verify a fresh synchronized ECS task clock.' ]]; then
+  echo "The packaged clock preflight did not accept the ECS command arguments and fail closed without metadata." >&2
+  exit 1
+fi
 docker run --rm --pull=never --platform "$platform" --network none --read-only \
   --mount "type=bind,source=$PWD/$test_build,target=/tests,readonly" \
   --env TESTINGPLATFORM_TELEMETRY_OPTOUT=1 \

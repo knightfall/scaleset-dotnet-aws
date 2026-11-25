@@ -13,7 +13,6 @@ import {
 import * as dynamodb from "aws-cdk-lib/aws-dynamodb";
 import * as ecs from "aws-cdk-lib/aws-ecs";
 import * as events from "aws-cdk-lib/aws-events";
-import * as targets from "aws-cdk-lib/aws-events-targets";
 import * as iam from "aws-cdk-lib/aws-iam";
 import * as kms from "aws-cdk-lib/aws-kms";
 import * as sqs from "aws-cdk-lib/aws-sqs";
@@ -39,6 +38,11 @@ import type { ControllerDeploymentEnvironment } from "./deployment-input.ts";
 import { validateFargatePreflight } from "./fargate-preflight.ts";
 import { helloIngress } from "./hello-ingress.ts";
 import {
+  resolveImportedEncryption,
+  s3ObjectDecrypt,
+  trackingTableDecrypt,
+} from "./imported-encryption.ts";
+import {
   bootstrapPolicy,
   ec2Profiles,
   ec2SupervisorStatusPolicy,
@@ -51,6 +55,8 @@ import {
 } from "./runner-iam.ts";
 import type { RunnerCluster } from "./runner-iam.ts";
 import { RuntimeArtifact } from "./runtime-artifact.ts";
+
+const maximumHelloConcurrencyPerRole = 16;
 
 export interface ControllerInfrastructureProps extends ControllerDeploymentEnvironment {
   readonly compiled: ReturnType<typeof compileConfig>;
@@ -80,10 +86,16 @@ export class ControllerInfrastructure extends Stack {
       runtime,
       props.fargatePreflight,
     );
+    const encryption = resolveImportedEncryption(
+      props.encryption,
+      runtime,
+      Boolean(fargatePreflight?.quotaSource),
+    );
     const telemetry = resolveControllerTelemetry(props.telemetry, spec.aws);
 
     const active = spec.mode === "active";
-    const inspect = !active && spec.dryRun.inspectAws;
+    const inspect =
+      !active && spec.dryRun.inspectAws && spec.dryRun.demand.type === "none";
     const enabled = spec.profiles
       .filter(({ state }) => state !== "disabled")
       .toSorted((a, b) => (a.id < b.id ? -1 : Number(a.id > b.id)));
@@ -109,6 +121,7 @@ export class ControllerInfrastructure extends Stack {
       "RuntimeConfig",
       props.artifactPath,
       sha256,
+      encryption.bootstrapAssetKeyArn,
     );
     this.controllerRole = new iam.Role(this, "ControllerTaskRole", {
       assumedBy: new iam.ServicePrincipal("ecs-tasks.amazonaws.com", {
@@ -129,31 +142,54 @@ export class ControllerInfrastructure extends Stack {
     );
     if (fargatePreflight?.quotaSource) {
       const { bucket, key } = fargatePreflight.quotaSource;
+      const objectArn = this.formatArn({
+        service: "s3",
+        account: "",
+        region: "",
+        resource: bucket,
+        resourceName: key,
+        arnFormat: ArnFormat.SLASH_RESOURCE_NAME,
+      });
       this.controllerRole.addToPolicy(
         new iam.PolicyStatement({
           actions: ["s3:GetObject"],
-          resources: [
-            this.formatArn({
-              service: "s3",
-              account: "",
-              region: "",
-              resource: bucket,
-              resourceName: key,
-              arnFormat: ArnFormat.SLASH_RESOURCE_NAME,
-            }),
-          ],
+          resources: [objectArn],
           conditions: { StringEquals: { "s3:ResourceAccount": this.account } },
         }),
       );
+      if (encryption.fargateQuotaKeyArn) {
+        this.controllerRole.addToPolicy(
+          s3ObjectDecrypt(this, encryption.fargateQuotaKeyArn, objectArn),
+        );
+      }
     }
-    if (!active) {
-      this.grantSnapshot(runtime);
+    if (active) {
+      grantTableAccess(this.controllerRole, this.trackingTable);
+      if (encryption.trackingTableKeyArn) {
+        this.controllerRole.addToPolicy(
+          trackingTableDecrypt(
+            this,
+            encryption.trackingTableKeyArn,
+            this.trackingTable.tableName,
+          ),
+        );
+      }
+    } else {
+      this.grantSnapshot(runtime, encryption.snapshotKeyArn);
     }
-    grantTableAccess(this.controllerRole, this.trackingTable, active, inspect);
+    if (encryption.trackingTableKeyArn) {
+      new CfnOutput(this, "TrackingTableKmsKeyArn", {
+        value: encryption.trackingTableKeyArn,
+      });
+    }
     grantEc2(this.controllerRole, runtime, ec2, active);
     grantFargate(this.controllerRole, runtime, fargate, clusters, active);
     const runnerPolicyDependencies = supportsHelloIngress
-      ? this.configureBootstrapRoles(enabled, active)
+      ? this.configureBootstrapRoles(
+          enabled,
+          active,
+          encryption.trackingTableKeyArn,
+        )
       : [];
 
     const args = [
@@ -171,6 +207,14 @@ export class ControllerInfrastructure extends Stack {
     ];
     if (active) {
       grantHostFence(this.controllerRole, this.hostingCluster);
+      if (spec.controller.predecessorCapture) {
+        this.controllerRole.addToPolicy(
+          new iam.PolicyStatement({
+            actions: ["logs:FilterLogEvents"],
+            resources: [spec.controller.predecessorCapture.logGroupArn],
+          }),
+        );
+      }
       grantGitHubCredentials(this.controllerRole, runtime, enabled);
       const statusRoles = new Set(
         ec2
@@ -312,22 +356,44 @@ export class ControllerInfrastructure extends Stack {
   private configureBootstrapRoles(
     profiles: readonly RunnerProfile[],
     active: boolean,
+    tableKeyArn?: string,
   ) {
     const dependencies: Construct[] = [];
-    const roleArns = [
-      ...new Set(
-        profiles.map(({ provisioner }) => provisioner.bootstrapRoleArn),
-      ),
-    ].sort();
-    for (const arn of roleArns) {
+    const concurrencyByRole = new Map<string, number>();
+    for (const { capacity, provisioner } of profiles) {
+      const arn = provisioner.bootstrapRoleArn;
+      const configured =
+        (concurrencyByRole.get(arn) ?? 0) + capacity.maxRunners;
+      concurrencyByRole.set(
+        arn,
+        active ? Math.min(configured, maximumHelloConcurrencyPerRole) : 0,
+      );
+    }
+    for (const arn of [...concurrencyByRole.keys()].sort()) {
       const id = stableId("Bootstrap", arn);
       const role = iam.Role.fromRoleArn(this, id, arn);
-      const ingress = helloIngress(this, id, this.trackingTable, role, active);
+      const ingress = helloIngress(
+        this,
+        id,
+        this.trackingTable,
+        role,
+        concurrencyByRole.get(arn)!,
+        tableKeyArn,
+      );
       if (active) {
         const policy = new iam.Policy(this, `${id}Policy`, {
           roles: [role],
           statements: [
             ...bootstrapPolicy(this.trackingTable),
+            ...(tableKeyArn
+              ? [
+                  trackingTableDecrypt(
+                    this,
+                    tableKeyArn,
+                    this.trackingTable.tableName,
+                  ),
+                ]
+              : []),
             ...ingress.statements,
           ],
         });
@@ -337,24 +403,31 @@ export class ControllerInfrastructure extends Stack {
     return dependencies;
   }
 
-  private grantSnapshot(runtime: RunnerControllerRuntime) {
+  private grantSnapshot(runtime: RunnerControllerRuntime, keyArn?: string) {
     const demand = runtime.spec.dryRun.demand;
     if (demand.type !== "snapshot" || !("s3Uri" in demand)) return;
+    // The shared runtime schema admits only literal snapshot addresses. IAM and the SDK use the same key.
     const path = demand.s3Uri.slice("s3://".length);
+    const objectArn = this.formatArn({
+      service: "s3",
+      account: "",
+      region: "",
+      resource: path,
+    });
     this.controllerRole.addToPolicy(
       new iam.PolicyStatement({
         actions: ["s3:GetObjectVersion"],
-        resources: [
-          this.formatArn({
-            service: "s3",
-            account: "",
-            region: "",
-            resource: path,
-          }),
-        ],
-        conditions: { StringEquals: { "s3:VersionId": demand.versionId } },
+        resources: [objectArn],
+        conditions: {
+          StringEquals: {
+            "s3:VersionId": demand.versionId,
+            "s3:ResourceAccount": runtime.spec.aws.account,
+          },
+        },
       }),
     );
+    if (keyArn)
+      this.controllerRole.addToPolicy(s3ObjectDecrypt(this, keyArn, objectArn));
   }
 
   private observationQueues(id: string) {
@@ -366,6 +439,7 @@ export class ControllerInfrastructure extends Stack {
         principals: [new iam.ServicePrincipal("events.amazonaws.com")],
         actions: ["kms:Decrypt", "kms:GenerateDataKey"],
         resources: ["*"],
+        conditions: { StringEquals: { "aws:SourceAccount": this.account } },
       }),
     );
     const security = {
@@ -404,7 +478,23 @@ export class ControllerInfrastructure extends Stack {
         region: [this.region],
       },
     });
-    rule.addTarget(new targets.SqsQueue(queue, { deadLetterQueue: dlq }));
+    for (const destination of [queue, dlq]) {
+      destination.addToResourcePolicy(
+        new iam.PolicyStatement({
+          principals: [new iam.ServicePrincipal("events.amazonaws.com")],
+          actions: ["sqs:SendMessage"],
+          resources: [destination.queueArn],
+          conditions: { ArnEquals: { "aws:SourceArn": rule.ruleArn } },
+        }),
+      );
+    }
+    // The standard CDK SQS target adds broad queue and KMS grants for encrypted targets.
+    rule.addTarget({
+      bind: () => ({
+        arn: queue.queueArn,
+        deadLetterConfig: { arn: dlq.queueArn },
+      }),
+    });
   }
 }
 
@@ -432,6 +522,7 @@ export function synthesizeController(
       artifactPath,
       fargatePreflight: environment.fargatePreflight,
       telemetry: environment.telemetry,
+      encryption: environment.encryption,
     });
     return app.synth().getStackArtifact(stack.artifactId);
   } finally {

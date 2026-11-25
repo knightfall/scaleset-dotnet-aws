@@ -219,8 +219,8 @@ internal sealed class Ec2RunnerBackend(
             await store.ReadJitHandoffAsync(key, Guid.ParseExact(executor.Binding.AllocationId, "D"), cancellationToken).ConfigureAwait(false) is not { } handoff ||
             handoff.Identity.ResourceArn != executor.Binding.ResourceArn || handoff.Identity.Incarnation != executor.Binding.Incarnation ||
             !handoff.Identity.AwsUserId.StartsWith(qualification.RoleId + ":", StringComparison.Ordinal) ||
-            await store.ReadEc2BootstrapStatusAsync(handoff, cancellationToken).ConfigureAwait(false) is not { Exited: true } confirmed ||
-            confirmed.QualificationSha256 != qualification.EvidenceSha256 || confirmed.RunnerId != exit.RunnerId ||
+            await store.ReadEc2BootstrapStatusAsync(handoff, qualification.EvidenceSha256, cancellationToken).ConfigureAwait(false)
+                is not { Exited: true } confirmed || confirmed.RunnerId != exit.RunnerId ||
             confirmed.ObservedAt != exit.ObservedAt)
         {
             return false;
@@ -250,6 +250,7 @@ internal sealed class Ec2RunnerBackend(
         string? credential = entry.InstanceProfileArn == _provisioner.InstanceProfileArn ? entry.InstanceProfileArn : null;
         return new RunnerBackendResource(entry.ResourceArn, binding, observation, credential)
         {
+            IsStoppedEc2 = entry.State == Ec2InstanceState.Stopped,
             Ec2StatusQualificationSha256 = _provisioner.StatusQualification is { } qualification && template?.VersionNumber == version &&
                 entry.ImageId == qualification.ImageId && credential is not null ? qualification.EvidenceSha256 : null,
         };

@@ -31,6 +31,10 @@ test "$(stat -c %a .credentials)" = 600
 test "$(stat -f -c %T .credentials)" = tmpfs
 test "$(cat .credentials)" = offline-fargate-jit-sentinel
 test "$(stat -f -c %T "$SCALESET_RUNNER_ROOT")" = tmpfs
+mkdir -p home/job/nested
+printf 'fixture\n' > home/job/nested/output
+chmod 000 home/job/nested
+chmod 500 home/job
 if [ "${0##*/}" = fixture-dotnet-stop ]; then
     trap 'echo signal > _work/receipt; exit 0' TERM
     printf '2000-01-01 00:00:00Z: Listening for Jobs\n'
@@ -61,12 +65,21 @@ DOCKERFILE
 
 image=$(DOCKER_BUILDKIT=0 docker build --quiet --network=none --pull=false \
     --build-arg "RUNNER_IMAGE=$runner_image" --build-arg "DOTNET_IMAGE=$dotnet_image" "$context")
-output=$(docker run --rm --pull never --network none --read-only --user 1001:1001 \
-    --cap-drop ALL --memory=768m --memory-swap=768m \
-    --tmpfs /work:rw,nosuid,nodev,size=256m,mode=1777 \
-    --mount "type=bind,source=$fixture/bin/Release/net10.0,target=/fixture,readonly" \
-    --entrypoint /opt/scaleset/bootstrap-dotnet/dotnet "$image" \
+run_fixture() {
+    docker run --rm --pull never --network none --read-only --user 1001:1001 \
+        --cap-drop ALL --memory=768m --memory-swap=768m \
+        --tmpfs /work:rw,nosuid,nodev,size=256m,mode=1777 \
+        --mount "type=bind,source=$fixture/bin/Release/net10.0,target=/fixture,readonly" \
+        --entrypoint /opt/scaleset/bootstrap-dotnet/dotnet "$@"
+}
+output=$(run_fixture "$image" \
     /fixture/Knightfall.ScaleSet.Aws.Bootstrap.LinuxChecks.dll fargate)
+
+if rejection=$(run_fixture --init "$image" /fixture/Knightfall.ScaleSet.Aws.RunnerBootstrap.dll \
+    fargate /fixture/unused.json 2>&1) || [ "$rejection" != "Fargate bootstrap must run as PID 1." ]; then
+    printf '%s\n' "$rejection" >&2
+    exit 1
+fi
 
 case "$output" in
     *offline-fargate-jit-sentinel*|*offline-parent-credential-sentinel*|*offline-parent-jit-sentinel*) exit 1 ;;

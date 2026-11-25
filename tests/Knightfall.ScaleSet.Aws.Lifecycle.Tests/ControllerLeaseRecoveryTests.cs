@@ -76,13 +76,23 @@ public sealed class ControllerLeaseRecoveryTests
         Assert.Equal(EffectState.Executing, (await journal.ReadAsync(profile, envelope.IntentId, cancellation))?.Entry.State);
 
         clock.Now = clock.Now.AddSeconds(1);
+        var qualificationEnds = clock.Now.AddSeconds(2);
+        observer.QualificationEnds = qualificationEnds;
+        Task<EffectEvidence?> ObserveAfterExpiry(EffectJournalSnapshot requested, CancellationToken token)
+        {
+            clock.Now = qualificationEnds;
+            return Observe(requested, token);
+        }
+        Assert.Equal(LifecycleWriteOutcome.LeaseRejected, await recovery.ResolveFencedEffectAsync(successor, executing,
+            Guid.NewGuid(), ClockProof(clock), [], ObserveAfterExpiry, cancellation));
+        observer.QualificationEnds = null;
         Assert.Equal(LifecycleWriteOutcome.Indeterminate, await recovery.ResolveFencedEffectAsync(successor, executing,
             Guid.NewGuid(), ClockProof(clock), [], Observe, cancellation));
-        Assert.Equal(1, evidenceCalls);
+        Assert.Equal(2, evidenceCalls);
         absence = absence with { ObservedAt = clock.Now };
         Assert.Equal(LifecycleWriteOutcome.Committed, await recovery.ResolveFencedEffectAsync(successor, executing,
             Guid.NewGuid(), ClockProof(clock), [], Observe, cancellation));
-        Assert.Equal(2, evidenceCalls);
+        Assert.Equal(3, evidenceCalls);
         Assert.Equal(absence with { EarliestObservedAt = clock.Now.AddSeconds(-1) },
             (await journal.ReadAsync(profile, envelope.IntentId, cancellation))?.Entry.Resolution);
 
@@ -106,6 +116,17 @@ public sealed class ControllerLeaseRecoveryTests
         var first = await AcquireAsync(store, configuration, clock, "first", MiniStackTable.FirstTask, cancellation);
         var initial = await recovery.TryActivateAsync(first, configuration, ClockProof(clock), [], cancellation);
         Assert.Equal(LeaseActivationStatus.Activated, initial.Status);
+        var current = Assert.IsType<ControllerLease>(initial.Lease);
+        var profile = new LifecycleProfile(current.Deployment, Assert.Single(configuration.Profiles).Id);
+        var journal = new DynamoDbEffectJournal(store, clock);
+        var envelope = EffectEnvelope.Create(profile, "session-retire", 1,
+            new GitHubSessionRetireEffectRequest("https://example.ghe.com/engineering/tools", 42, Guid.NewGuid()), clock.Now, null);
+        Assert.Equal(LifecycleWriteOutcome.Committed, await journal.PlanAsync(current, envelope, Guid.NewGuid(), cancellation));
+        var planned = Assert.IsType<EffectJournalSnapshot>(await journal.ReadAsync(profile, envelope.IntentId, cancellation));
+        Assert.Equal(LifecycleWriteOutcome.Committed, (await journal.BeginAsync(current, planned, Guid.NewGuid(), Guid.NewGuid(),
+            clock.Now, clock.Now.AddSeconds(40), Reserve, cancellation)).Outcome);
+        var executing = Assert.IsType<EffectJournalSnapshot>(await journal.ReadAsync(profile, envelope.IntentId, cancellation));
+        Assert.Equal(EffectState.Executing, executing.Entry.State);
 
         clock.Now = first.ValidUntil.AddSeconds(2);
         var second = await AcquireAsync(store, configuration, clock, "second", TaskTwo, cancellation);
@@ -113,6 +134,8 @@ public sealed class ControllerLeaseRecoveryTests
         var third = await AcquireAsync(store, configuration, clock, "third", TaskThree, cancellation);
         Assert.Equal(TaskTwo, third.PreviousOwner?.OwnerTaskArn);
         Assert.Equal(first.OwnerTaskArn, third.RequiredFencingTaskArn);
+        Assert.Equal(second.AcquiredAt, third.PreviousOwner?.AcquiredAt);
+        Assert.Equal(first.AcquiredAt, third.RequiredFencingTaskAcquiredAt);
 
         observer.Statuses[TaskTwo] = ControllerTaskFenceStatus.Missing;
         observer.Statuses[first.OwnerTaskArn] = ControllerTaskFenceStatus.Unknown;
@@ -133,8 +156,31 @@ public sealed class ControllerLeaseRecoveryTests
         Assert.Equal(third, await store.ReadLeaseAsync(third.Deployment, cancellation));
 
         observer.Statuses[first.OwnerTaskArn] = ControllerTaskFenceStatus.Unknown;
-        Assert.Equal(LeaseActivationStatus.Activated,
-            (await recovery.TryActivateAsync(third, configuration, ClockProof(clock), [immediate, oldest], cancellation)).Status);
+        var wrongCluster = oldest with { TaskArn = oldest.TaskArn.Replace("task/controller/", "task/wrong-cluster/", StringComparison.Ordinal) };
+        var restarted = new ControllerLeaseRecoveryCoordinator(new DynamoDbLifecycleStore(table.Client, table.Name, clock), observer, clock, Reserve);
+        Assert.Equal(LeaseActivationStatus.PriorTaskUnisolated,
+            (await restarted.TryActivateAsync(third, configuration, ClockProof(clock), [immediate, wrongCluster], cancellation)).Status);
+        var stale = oldest with { ObservedAt = clock.Now.AddMinutes(-1), ValidUntil = clock.Now };
+        int observations = 0;
+        Task<EffectEvidence?> Observe(EffectJournalSnapshot requested, CancellationToken token)
+        {
+            token.ThrowIfCancellationRequested();
+            Assert.Equal(executing.TransitionId, requested.TransitionId);
+            observations++;
+            return Task.FromResult<EffectEvidence?>(new EffectEvidence(EffectResolutionKind.Absent, envelope.Sha256, envelope.Target, clock.Now));
+        }
+        Assert.Equal(LifecycleWriteOutcome.LeaseRejected, await restarted.ResolveFencedEffectAsync(third, executing,
+            Guid.NewGuid(), ClockProof(clock), [immediate, stale], Observe, cancellation));
+        Assert.Equal(0, observations);
+        Assert.Equal(LeaseActivationStatus.ProfileRecoveryPending,
+            (await restarted.TryActivateAsync(third, configuration, ClockProof(clock), [immediate, oldest], cancellation)).Status);
+        Assert.Equal(LifecycleWriteOutcome.Committed, await restarted.ResolveFencedEffectAsync(third, executing,
+            Guid.NewGuid(), ClockProof(clock), [immediate, oldest], Observe, cancellation));
+        Assert.Equal(1, observations);
+        var recovered = await restarted.TryActivateAsync(third, configuration, ClockProof(clock), [immediate, oldest], cancellation);
+        Assert.Equal(LeaseActivationStatus.Activated, recovered.Status);
+        Assert.Equal((third.Fence, ControllerLeaseMode.Active), (recovered.Lease?.Fence, recovered.Lease?.Mode));
+        Assert.Null(recovered.Lease?.RequiredFencingTaskArn);
     }
 
     [Fact]
@@ -237,6 +283,7 @@ public sealed class ControllerLeaseRecoveryTests
         internal readonly Dictionary<string, ControllerTaskFenceStatus> Statuses = new(StringComparer.Ordinal);
         internal readonly List<string> Reads = [];
         internal Action? OnRead { get; set; }
+        internal DateTimeOffset? QualificationEnds { get; set; }
 
         public Task<ControllerTaskFenceStatus> ReadAsync(string taskArn, CancellationToken cancellationToken)
         {
@@ -245,5 +292,8 @@ public sealed class ControllerLeaseRecoveryTests
             OnRead?.Invoke();
             return Task.FromResult(Statuses.GetValueOrDefault(taskArn));
         }
+
+        public async Task<ControllerTaskFenceObservation> ObserveAsync(string taskArn, DateTimeOffset? acquiredAt, CancellationToken cancellationToken) =>
+            new(await ReadAsync(taskArn, cancellationToken), QualificationEnds);
     }
 }

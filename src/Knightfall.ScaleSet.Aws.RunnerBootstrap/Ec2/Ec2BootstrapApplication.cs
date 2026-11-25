@@ -5,6 +5,7 @@ using Amazon.Runtime;
 using Knightfall.ScaleSet.Aws.Core.Configuration;
 using Knightfall.ScaleSet.Aws.Core.Lifecycle;
 using Knightfall.ScaleSet.Aws.DynamoDb;
+using Knightfall.ScaleSet.Aws.Handoff;
 using Knightfall.ScaleSet.Aws.RunnerBootstrap.Linux;
 
 namespace Knightfall.ScaleSet.Aws.RunnerBootstrap.Ec2;
@@ -29,6 +30,8 @@ internal sealed class Ec2BootstrapApplication(Ec2BootstrapSettings settings, Tim
             identity.Credentials, clock);
         var offers = new DynamoDbBootstrapOfferClient(dynamodb, settings.TableName, identity.AwsUserId, identity.ResourceArn, clock);
         var spent = new Ec2SpentMarker(settings.SpentDirectory, identity.ResourceArn);
+        var reporter = qualification is null ? null : new Ec2BootstrapStatusReporter(identity, qualification.EvidenceSha256, clock,
+            token => verifier.VerifyAsync(settings.Authority, token, qualification.ImageId), PublishStatusAsync);
         var bootstrap = new RunnerBootstrap(offers, settings.Target, identity.ResourceArn, identity.AwsUserId, spent.TryReserve,
             new LinuxOneJobRunner(boundary), clock, TimeSpan.FromMinutes(5), TimeSpan.FromSeconds(2),
             registration.RegisterAsync, ReportAsync, telemetryProvider: RunnerProvisionerType.Ec2);
@@ -37,37 +40,20 @@ internal sealed class Ec2BootstrapApplication(Ec2BootstrapSettings settings, Tim
         async Task ReportAsync(BootstrapRunnerObservation observation, CancellationToken token)
         {
             Console.WriteLine(observation.Exited ? "One-job runner exited." : "One-job runner connected.");
-            if (qualification is null)
+            if (reporter is not null &&
+                await reporter.ReportAsync(observation, token).ConfigureAwait(false) != LifecycleWriteOutcome.Committed)
             {
-                return;
+                Console.Error.WriteLine("Bootstrap status was not confirmed.");
             }
+        }
 
-            try
-            {
-                var current = await verifier.VerifyAsync(settings.Authority, token, qualification.ImageId).ConfigureAwait(false);
-                if (current.ResourceArn != identity.ResourceArn || current.AwsUserId != identity.AwsUserId)
-                {
-                    Console.Error.WriteLine("Bootstrap status identity changed.");
-                    return;
-                }
-                using var statusDynamoDb = CreateDynamoDb(current.Credentials, settings.Authority.Region);
-                var status = new DynamoDbEc2BootstrapStatusClient(statusDynamoDb, settings.TableName, current.AwsUserId,
-                    current.ResourceArn, clock);
-                var outcome = await status.PublishAsync(observation.Hello,
-                    new JitEc2BootstrapStatus(observation.OfferId, observation.RunnerId, observation.Exited ? 2 : 1,
-                        observation.Exited, clock.GetUtcNow())
-                    {
-                        QualificationSha256 = qualification.EvidenceSha256,
-                    }, token).ConfigureAwait(false);
-                if (outcome != LifecycleWriteOutcome.Committed)
-                {
-                    Console.Error.WriteLine("Bootstrap status was not confirmed.");
-                }
-            }
-            catch (Exception error) when (error is IOException or AmazonClientException or AmazonServiceException or HttpRequestException)
-            {
-                Console.Error.WriteLine("Bootstrap status was unavailable.");
-            }
+        async Task<LifecycleWriteOutcome> PublishStatusAsync(VerifiedEc2BootstrapIdentity current, JitHello hello,
+            JitEc2BootstrapStatus status, CancellationToken token)
+        {
+            using var statusDynamoDb = CreateDynamoDb(current.Credentials, settings.Authority.Region);
+            var client = new DynamoDbEc2BootstrapStatusClient(statusDynamoDb, settings.TableName, current.AwsUserId,
+                current.ResourceArn, clock);
+            return await client.PublishAsync(hello, status, token).ConfigureAwait(false);
         }
     }
 

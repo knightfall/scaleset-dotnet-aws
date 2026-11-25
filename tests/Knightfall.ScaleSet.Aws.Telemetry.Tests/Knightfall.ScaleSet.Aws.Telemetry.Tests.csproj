@@ -11,5 +11,6 @@
     <ProjectReference Include="../../src/Knightfall.ScaleSet.Aws.Controller/Knightfall.ScaleSet.Aws.Controller.csproj" />
     <PackageReference Include="xunit.v3" />
     <None Include="../../testdata/config/runtime/mixed-ec2-fargate.json" Link="mixed.json" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="../../testdata/telemetry/otlp-endpoints.json" Link="otlp-endpoints.json" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 </Project>

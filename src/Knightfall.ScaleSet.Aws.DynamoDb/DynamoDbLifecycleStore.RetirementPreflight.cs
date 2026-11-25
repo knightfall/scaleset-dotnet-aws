@@ -1,5 +1,7 @@
+using Amazon;
 using Knightfall.ScaleSet.Aws.Core.Catalog;
 using Knightfall.ScaleSet.Aws.Core.Configuration;
+using Knightfall.ScaleSet.Aws.Core.Lifecycle;
 
 namespace Knightfall.ScaleSet.Aws.DynamoDb;
 
@@ -9,6 +11,8 @@ public enum RetirementPreflightStatus
     BindingMismatch = 1,
     RetirementRequired = 2,
     Verified = 3,
+    HostingFenceBindingChanged = 4,
+    PredecessorCaptureBindingChanged = 5,
 }
 
 public sealed record RetirementPreflightResult(
@@ -16,7 +20,7 @@ public sealed record RetirementPreflightResult(
 
 public sealed partial class DynamoDbLifecycleStore
 {
-    /// <summary>Verifies that every profile losing its deployed permissions has a durable tombstone.</summary>
+    /// <summary>Preserves the predecessor lookup and requires a durable tombstone before changing live profile grants.</summary>
     public async Task<RetirementPreflightResult> VerifyRetirementAsync(
         RuntimeConfiguration current, long currentGeneration, RuntimeConfiguration candidate, long generation,
         CancellationToken cancellationToken)
@@ -44,6 +48,18 @@ public sealed partial class DynamoDbLifecycleStore
             (head is null && rows.Count != 0))
         {
             return new RetirementPreflightResult(RetirementPreflightStatus.CatalogUnavailable, []);
+        }
+        // A dry-run rollout can still have an active predecessor recorded in the retained table.
+        // Preserve the physical cluster and its ownership until the deployment can fence across clusters.
+        if (ClusterScope(current, current.Controller.Cluster) != ClusterScope(candidate, candidate.Controller.Cluster))
+        {
+            return new RetirementPreflightResult(RetirementPreflightStatus.HostingFenceBindingChanged, []);
+        }
+        if (current.Controller.PredecessorCapture != candidate.Controller.PredecessorCapture &&
+            (current.Mode == ControllerMode.Active ||
+                await ReadLeaseAsync(deployment, cancellationToken).ConfigureAwait(false) is { Mode: not ControllerLeaseMode.Released }))
+        {
+            return new RetirementPreflightResult(RetirementPreflightStatus.PredecessorCaptureBindingChanged, []);
         }
 
         var previouslyGranted = GrantedProfiles(current).ToDictionary(profile => profile.Id, StringComparer.Ordinal);
@@ -111,19 +127,21 @@ public sealed partial class DynamoDbLifecycleStore
         return (before, after) switch
         {
             (Ec2ProvisionerConfiguration ec2, Ec2ProvisionerConfiguration nextEc2) =>
-                ec2.LaunchTemplateId == nextEc2.LaunchTemplateId && ec2.InstanceProfileArn == nextEc2.InstanceProfileArn,
+                ec2.LaunchTemplateId == nextEc2.LaunchTemplateId && ec2.InstanceProfileArn == nextEc2.InstanceProfileArn &&
+                (ec2.StatusQualification is null || (ec2.StatusQualification == nextEc2.StatusQualification &&
+                    ec2.LaunchTemplateVersion == nextEc2.LaunchTemplateVersion)),
             (FargateProvisionerConfiguration fargate, FargateProvisionerConfiguration nextFargate) =>
                 fargate.TaskDefinitionArn == nextFargate.TaskDefinitionArn && fargate.ExecutionRoleArn == nextFargate.ExecutionRoleArn &&
-                ClusterScope(current, fargate) == ClusterScope(candidate, nextFargate),
+                ClusterScope(current, fargate.Cluster) == ClusterScope(candidate, nextFargate.Cluster),
             _ => false,
         };
     }
 
-    private static (string Arn, bool Created) ClusterScope(RuntimeConfiguration configuration, FargateProvisionerConfiguration profile) =>
-        configuration.EcsClusters[profile.Cluster] switch
+    private static (string Arn, bool Created) ClusterScope(RuntimeConfiguration configuration, string alias) =>
+        configuration.EcsClusters[alias] switch
         {
             ImportEcsClusterConfiguration imported => (imported.Arn, false),
-            CreateEcsClusterConfiguration created => ($"arn:{profile.BootstrapRoleArn.Split(':')[1]}:ecs:" +
+            CreateEcsClusterConfiguration created => ($"arn:{RegionEndpoint.GetBySystemName(configuration.Aws.Region).PartitionName}:ecs:" +
                 $"{configuration.Aws.Region}:{configuration.Aws.Account}:cluster/{created.Name}", true),
             _ => throw new InvalidOperationException("The configured ECS cluster type is unsupported."),
         };

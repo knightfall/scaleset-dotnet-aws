@@ -1,0 +1,98 @@
+[
+  {
+    "endpoint": "https://collector.example.invalid",
+    "path": "/"
+  },
+  {
+    "endpoint": "https://collector.example.invalid/otlp/version~2/v1/traces",
+    "path": "/otlp/version~2/v1/traces"
+  },
+  {
+    "endpoint": "https://collector.example.invalid/path%20with%20spaces/v1/traces",
+    "path": "/path%20with%20spaces/v1/traces"
+  },
+  {
+    "endpoint": "https://collector.example.invalid/tenant%5Bblue%5D/v1/traces",
+    "path": "/tenant%5Bblue%5D/v1/traces"
+  },
+  {
+    "endpoint": "https://collector.example.invalid/tenant%2fblue/v1/traces",
+    "path": "/tenant%2fblue/v1/traces"
+  },
+  {
+    "endpoint": "https://collector.example.invalid/café/📦/v1/traces",
+    "path": "/caf%C3%A9/%F0%9F%93%A6/v1/traces"
+  },
+  {
+    "endpoint": "https://collector.example.invalid/caf%C3%A9/v1/traces",
+    "path": "/caf%C3%A9/v1/traces"
+  },
+  {
+    "endpoint": "https://collector.example.invalid/caf%C3%A9/%F0%9F%93%A6/v1/traces",
+    "path": "/caf%C3%A9/%F0%9F%93%A6/v1/traces"
+  },
+  {
+    "endpoint": "https://collector.example.invalid/cafe\u0301/v1/traces",
+    "path": "/cafe%CC%81/v1/traces"
+  },
+  {
+    "endpoint": "http://[::1]:4318/tenant%5Bblue%5D/v1/traces",
+    "path": "/tenant%5Bblue%5D/v1/traces"
+  },
+  {
+    "endpoint": "https://collector.example.invalid/tenant[blue]/v1/traces",
+    "path": null
+  },
+  {
+    "endpoint": "https://collector.example.invalid/caf%C3%A9%/v1/traces",
+    "path": null
+  },
+  {
+    "endpoint": "https://collector.example.invalid/caf%C3%a9/v1/traces",
+    "path": null
+  },
+  {
+    "endpoint": "https://collector.example.invalid/%41/v1/traces",
+    "path": null
+  },
+  {
+    "endpoint": "https://collector.example.invalid/tenant%2Eblue/v1/traces",
+    "path": null
+  },
+  {
+    "endpoint": "https://collector.example.invalid/first/%2e%2E/v1/traces",
+    "path": null
+  },
+  {
+    "endpoint": "https://collector.example.invalid/first/../v1/traces",
+    "path": null
+  },
+  {
+    "endpoint": "https://collector.example.invalid/path%00/v1/traces",
+    "path": null
+  },
+  {
+    "endpoint": "https://collector.example.invalid/first%5c/v1/traces",
+    "path": null
+  },
+  {
+    "endpoint": "https://collector.example.invalid/first\uFEFF/v1/traces",
+    "path": null
+  },
+  {
+    "endpoint": "https://@collector.example.invalid/v1/traces",
+    "path": null
+  },
+  {
+    "endpoint": "https://[fe80::1%25en0]:4318/v1/traces",
+    "path": null
+  },
+  {
+    "endpoint": "https://collector.example.invalid/v1/traces?token=fixture",
+    "path": null
+  },
+  {
+    "endpoint": "https://collector.example.invalid/v1/traces#fragment",
+    "path": null
+  }
+]

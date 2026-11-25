@@ -42,7 +42,12 @@ internal static class ActiveControllerRuntime
         using var clients = await ConnectAsync(configuration.Aws, context.AwsLoopbackEndpoint, clock, context.Stopping).ConfigureAwait(false);
         var store = new DynamoDbLifecycleStore(clients.DynamoDb(), configuration.TrackingTable.Name, clock);
         var ecs = clients.Ecs();
-        var tasks = new EcsControllerTaskFenceObserver(ecs, metadata.ClusterArn);
+        IControllerTaskFenceObserver tasks = new EcsControllerTaskFenceObserver(ecs, metadata.ClusterArn);
+        if (configuration.Controller.PredecessorCapture is { } capture)
+        {
+            tasks = new CapturedEcsControllerTaskFenceObserver(tasks, clients.ControllerCapture(), configuration.Aws,
+                metadata.ClusterArn, capture, clock, context.Telemetry.Logging.CreateLogger<CapturedEcsControllerTaskFenceObserver>());
+        }
         var adapter = new ControllerAuthorityAdapter(configuration, store, tasks, clock, LeaseDuration, EffectTiming.WriteReserve);
         var journal = new DynamoDbEffectJournal(store, clock);
         var dispatcher = new DynamoDbEffectDispatcher(store, clock, EffectTiming);
@@ -73,7 +78,7 @@ internal static class ActiveControllerRuntime
             else
             {
                 backends.Add(key, new FargateRunnerBackend(configuration, profile, key, fargateInspector!, fargateEvidence!,
-                    fargateQuota!, fargateKeys, fargateInventory, store, journal, dispatcher, clock, EffectTiming.ObservationFreshness));
+                    fargateQuota!, fargateKeys, fargateInventory, store, journal, dispatcher, clock, EffectTiming));
             }
         }
 
@@ -103,7 +108,8 @@ internal static class ActiveControllerRuntime
             var session = new ControllerProfileSession(configuration, profile, context.Generation, owner, store,
                 secrets, gitHub, registration, supervisor, rotation, cooldown, clock, context.Stopping);
             return new ControllerProfileReconciler(configuration, profile, key, context.Generation, backends[key], session,
-                owner, store, dispatcher, jit, handoff, retirement, metrics, clock, EffectTiming);
+                owner, store, dispatcher, jit, handoff, retirement, metrics, clock, EffectTiming,
+                context.Telemetry.Logging.CreateLogger<ControllerProfileReconciler>());
         }).ToArray();
         var queuePump = context.EventQueues is { Ec2: not null } or { Ecs: not null }
             ? new ControllerQueuePump(configuration, clients.Queue(), store, ec2Effects, fargateInspector, clock) : null;
@@ -162,11 +168,15 @@ internal static class ActiveControllerRuntime
     {
         if (owner.ReadAuthority() is not { } initial)
         {
-            return;
+            throw new InvalidOperationException("The controller lost authority before starting its workers.");
         }
         using var heartbeatsStop = new CancellationTokenSource();
         using var workStop = CancellationTokenSource.CreateLinkedTokenSource(owner.OwnershipLost, context.Stopping);
         var health = new ActiveHealth(context, owner, profiles, clock);
+        foreach (var profile in profiles)
+        {
+            profile.Session.ListenerHealthChanged = health.Pulse;
+        }
         var heartbeat = owner.RunHeartbeatsAsync(HeartbeatInterval, async token =>
         {
             var proof = await metadata.ReadClockAsync(taskArn, token).ConfigureAwait(false);
@@ -176,9 +186,11 @@ internal static class ActiveControllerRuntime
         var workers = RunProfilesAsync(context, owner, store, dispatcher, profiles, queuePump, metrics, health, clock, workStop.Token);
         using var stopSignal = CancellationTokenSource.CreateLinkedTokenSource(context.Stopping, owner.OwnershipLost);
         var quitting = Task.Delay(Timeout.InfiniteTimeSpan, stopSignal.Token);
+        bool supervisionFailed;
         try
         {
             var finished = await Task.WhenAny(heartbeat, workers, quitting).ConfigureAwait(false);
+            supervisionFailed = !context.Stopping.IsCancellationRequested;
             if (finished != quitting)
             {
                 await finished.ConfigureAwait(false);
@@ -186,39 +198,41 @@ internal static class ActiveControllerRuntime
         }
         catch (OperationCanceledException) when (stopSignal.IsCancellationRequested)
         {
+            supervisionFailed = !context.Stopping.IsCancellationRequested;
+        }
+        catch (Exception)
+        {
+            supervisionFailed = true;
+        }
+
+        context.RequestStop();
+        health.Stop();
+        using var localDeadline = new CancellationTokenSource(CleanupBudget, clock);
+        using var cleanup = CancellationTokenSource.CreateLinkedTokenSource(context.ShutdownDeadline, localDeadline.Token);
+        var work = new ActiveControllerShutdownWork(profiles, workers, workStop);
+        var stopping = shutdown.StopAsync(owner, profiles.Select(profile => profile.Key).ToArray(), work, cleanup.Token);
+        ControllerShutdownStatus? stopped = null;
+        try
+        {
+            stopped = await stopping.WaitAsync(cleanup.Token).ConfigureAwait(false);
+        }
+        catch (Exception)
+        {
+            supervisionFailed = true;
         }
         finally
         {
-            health.Stop();
-            using var localDeadline = new CancellationTokenSource(CleanupBudget, clock);
-            using var cleanup = CancellationTokenSource.CreateLinkedTokenSource(context.ShutdownDeadline, localDeadline.Token);
-            var work = new ActiveControllerShutdownWork(profiles, workers, workStop);
-            try
-            {
-                _ = await shutdown.StopAsync(owner, profiles.Select(profile => profile.Key).ToArray(), work, cleanup.Token)
-                    .WaitAsync(cleanup.Token).ConfigureAwait(false);
-            }
-            catch (Exception error) when (IsServiceOutage(error))
-            {
-                // An unconfirmed release leaves the durable lease in place for exact predecessor fencing.
-            }
-            finally
-            {
-                metrics.EndOwnership(initial.Lease.Fence);
-                await workStop.CancelAsync().ConfigureAwait(false);
-                await heartbeatsStop.CancelAsync().ConfigureAwait(false);
-                try
-                {
-                    await JoinCancelledAsync(heartbeat, cleanup.Token).ConfigureAwait(false);
-                }
-                finally
-                {
-                    foreach (var profile in profiles)
-                    {
-                        profile.Session.Dispose();
-                    }
-                }
-            }
+            metrics.EndOwnership(initial.Lease.Fence);
+            supervisionFailed |= !await ObserveCompletionAsync(Task.WhenAll(workStop.CancelAsync(), heartbeatsStop.CancelAsync()))
+                .ConfigureAwait(false);
+            // The host deadline can return a failed exit while the tasks are still unwinding. Keep their clients alive until they join.
+            supervisionFailed |= !await ObserveCompletionAsync(Task.WhenAll(stopping, workers, heartbeat)).ConfigureAwait(false);
+            supervisionFailed |= !await ObserveCompletionAsync(Task.WhenAll(profiles.Select(profile => profile.Session.DisposeAsync().AsTask())))
+                .ConfigureAwait(false);
+        }
+        if (supervisionFailed || stopped != ControllerShutdownStatus.Released)
+        {
+            throw new InvalidOperationException("Controller supervision ended or shutdown could not be confirmed.");
         }
     }
 
@@ -313,8 +327,21 @@ internal static class ActiveControllerRuntime
         {
             await work.WaitAsync(cancellationToken).ConfigureAwait(false);
         }
-        catch (OperationCanceledException) when (work.IsCanceled || cancellationToken.IsCancellationRequested)
+        catch (OperationCanceledException) when (work.IsCanceled)
         {
+        }
+    }
+
+    private static async Task<bool> ObserveCompletionAsync(Task work)
+    {
+        try
+        {
+            await JoinCancelledAsync(work, CancellationToken.None).ConfigureAwait(false);
+            return true;
+        }
+        catch (Exception)
+        {
+            return false;
         }
     }
 
@@ -354,7 +381,8 @@ internal static class ActiveControllerRuntime
 
         private void Publish(DateTimeOffset now) => context.PublishHealth(new ControllerHealthSnapshot(true, true, true,
             !_stopped && owner.ReadAuthority() is not null, profiles.Select(entry => new ControllerProfileHealth(entry.Key.ProfileId,
-                !_stopped && _readyUntil.GetValueOrDefault(entry.Key.ProfileId) > now)).ToImmutableArray()));
+                !_stopped && _readyUntil.GetValueOrDefault(entry.Key.ProfileId) > now &&
+                (!entry.Session.RequiresListenerHealth || entry.Session.IsListenerAvailable))).ToImmutableArray()));
     }
 
     private sealed class ActiveControllerShutdownWork(ControllerProfileReconciler[] profiles, Task workers,
@@ -362,8 +390,8 @@ internal static class ActiveControllerRuntime
     {
         public async Task StopAdmissionsAsync(CancellationToken cancellationToken)
         {
-            await Task.WhenAll(profiles.Select(profile => profile.Session.StopAdmissionsAsync(cancellationToken))).ConfigureAwait(false);
-            await workerStop.CancelAsync().ConfigureAwait(false);
+            var admissions = Task.WhenAll(profiles.Select(profile => profile.Session.StopAdmissionsAsync(cancellationToken)));
+            await Task.WhenAll(admissions, workerStop.CancelAsync()).ConfigureAwait(false);
         }
 
         public Task CancelPollsAsync(CancellationToken cancellationToken) =>

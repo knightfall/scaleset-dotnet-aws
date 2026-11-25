@@ -24,11 +24,13 @@ internal static class FargateLinuxCheck
 
     internal static async Task<int> RunAsync()
     {
-        if (LinuxFiles.IsRoot())
+        if (LinuxFiles.IsRoot() || Environment.ProcessId != 1)
         {
-            throw new InvalidOperationException("The Fargate fixture must be non-root.");
+            throw new InvalidOperationException("The Fargate fixture must run as non-root PID 1.");
         }
         LinuxFiles.DisableCoreDumps();
+        VerifyReadOnlyMountEvidence();
+        VerifyReadOnlyCleanup();
         Environment.SetEnvironmentVariable("AWS_SESSION_TOKEN", "offline-parent-credential-sentinel");
         Environment.SetEnvironmentVariable("ACTIONS_RUNNER_INPUT_JITCONFIG", "offline-parent-jit-sentinel");
         using var budget = new CancellationTokenSource(TimeSpan.FromSeconds(25));
@@ -43,8 +45,57 @@ internal static class FargateLinuxCheck
         {
             throw new InvalidOperationException("The fixture job or SIGTERM was not observed in its separate work scratch.");
         }
-        Console.WriteLine("Fargate offline RAM, pinned launcher, thread-hop privilege guard, one-job and SIGTERM checks passed.");
+        Console.WriteLine("Fargate offline PID 1, read-only mount evidence, RAM cleanup, pinned launcher, thread-hop privilege guard, one-job and SIGTERM checks passed.");
         return 0;
+    }
+
+    private static void VerifyReadOnlyMountEvidence()
+    {
+        const string path = "/opt/scaleset/runner";
+        string[] mounts = ["21 10 0:1 / / ro,relatime - overlay overlay ro",
+            "31 21 0:2 / /opt/scaleset ro,relatime - overlay overlay ro"];
+        const string writable = "41 21 0:3 / /opt/scaleset rw,relatime - tmpfs data rw";
+        const string sameReadOnly = "42 21 0:4 / /opt/scaleset ro,relatime - overlay overlay ro";
+        if (!FargateMountLayout.IsReadOnly(path, mounts, effectiveMountId: 31) ||
+            FargateMountLayout.IsReadOnly(path, mounts, effectiveMountId: null) ||
+            FargateMountLayout.IsReadOnly(path, mounts, effectiveMountId: 21) ||
+            FargateMountLayout.IsReadOnly(path, [.. mounts, writable], effectiveMountId: 41) ||
+            FargateMountLayout.IsReadOnly(path, [writable, .. mounts], effectiveMountId: 31) ||
+            FargateMountLayout.IsReadOnly(path, [.. mounts, sameReadOnly], effectiveMountId: 42) ||
+            !FargateMountLayout.IsReadOnly(path, File.ReadAllLines("/proc/self/mountinfo"), LinuxFiles.GetMountId(path)))
+        {
+            throw new InvalidOperationException("The fixture did not require unambiguous effective read-only mount evidence.");
+        }
+    }
+
+    private static void VerifyReadOnlyCleanup()
+    {
+        const UnixFileMode readable = UnixFileMode.UserRead | UnixFileMode.UserExecute;
+        using var boundary = FargateRunnerBoundary.Create(Settings);
+        string root = boundary.StartInfo().WorkingDirectory;
+        string sentinel = Path.Combine(new DirectoryInfo(Path.Combine(root, "_work")).LinkTarget!, "outside-ram");
+        string nested = Path.Combine(root, "home", "nested");
+        Directory.CreateDirectory(sentinel);
+        Directory.CreateDirectory(nested);
+        File.WriteAllText(Path.Combine(sentinel, "marker"), "untouched");
+        File.WriteAllText(Path.Combine(nested, ".credentials"), "offline-cleanup-fixture");
+        Directory.CreateSymbolicLink(Path.Combine(nested, "outside"), sentinel);
+        Directory.CreateSymbolicLink(Path.Combine(nested, "cycle"), root);
+        File.CreateSymbolicLink(Path.Combine(nested, "dangling"), Path.Combine(root, "missing"));
+        File.SetUnixFileMode(sentinel, readable);
+        File.SetUnixFileMode(nested, UnixFileMode.None);
+        File.SetUnixFileMode(Path.Combine(root, "home"), readable);
+        File.SetUnixFileMode(root, readable);
+        boundary.Dispose();
+        boundary.Dispose();
+
+        if (Directory.Exists(root) || File.GetUnixFileMode(sentinel) != readable ||
+            File.ReadAllText(Path.Combine(sentinel, "marker")) != "untouched")
+        {
+            throw new InvalidOperationException("The fixture left its RAM root or modified a symlink target.");
+        }
+        File.SetUnixFileMode(sentinel, readable | UnixFileMode.UserWrite);
+        Directory.Delete(sentinel, recursive: true);
     }
 
     private static Task VerifySingleJobAfterThreadHopAsync(CancellationToken cancellationToken)

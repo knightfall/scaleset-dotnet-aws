@@ -15,6 +15,12 @@ internal static class FargateBootstrapCommand
 {
     internal static async Task<int> RunAsync(string settingsPath)
     {
+        if (Environment.ProcessId != 1)
+        {
+            Console.Error.WriteLine("Fargate bootstrap must run as PID 1.");
+            return 1;
+        }
+
         using var stopping = new CancellationTokenSource();
         using var stop = PosixSignalRegistration.Create(PosixSignal.SIGTERM, context =>
         {

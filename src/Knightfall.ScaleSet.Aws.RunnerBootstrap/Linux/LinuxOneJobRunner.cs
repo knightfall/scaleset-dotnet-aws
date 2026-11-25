@@ -9,6 +9,8 @@ namespace Knightfall.ScaleSet.Aws.RunnerBootstrap.Linux;
 [SupportedOSPlatform("linux")]
 internal interface ILinuxOneJobBoundary
 {
+    bool IsolatedProcessTree => false;
+
     void WriteConfigFile(string name, ReadOnlySpan<byte> contents);
 
     void PrepareHome();
@@ -21,6 +23,8 @@ internal interface ILinuxOneJobBoundary
 [SupportedOSPlatform("linux")]
 internal sealed partial class LinuxOneJobRunner(ILinuxOneJobBoundary boundary, TimeSpan? stopGrace = null) : IOneJobRunner
 {
+    private static readonly TimeSpan TeardownBudget = TimeSpan.FromSeconds(5);
+
     public async Task<OneJobCompletion> RunAsync(JitPlaintext configuration, string expectedName,
         Func<long, CancellationToken, Task> ready, CancellationToken cancellationToken)
     {
@@ -42,14 +46,19 @@ internal sealed partial class LinuxOneJobRunner(ILinuxOneJobBoundary boundary, T
             boundary.PrepareHome();
             using var process = boundary.StartRunner() ?? throw new IOException("The one-job runner could not start.");
             process.StandardInput.Close();
-            using var output = stopGrace.HasValue ? new CancellationTokenSource() :
-                CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            using var output = new CancellationTokenSource();
             Task stdout = ReadReadyAsync(process.StandardOutput, runnerId, ready, output.Token);
             Task stderr = process.StandardError.BaseStream.CopyToAsync(Stream.Null, output.Token);
+            Task drain = Task.WhenAll(stdout, stderr);
             try
             {
                 await process.WaitForExitAsync(cancellationToken).ConfigureAwait(false);
-                await Task.WhenAll(stdout, stderr).WaitAsync(TimeSpan.FromSeconds(5), cancellationToken).ConfigureAwait(false);
+                await WaitForTeardownAsync(drain, cancellationToken).ConfigureAwait(false);
+                if (boundary.IsolatedProcessTree && process.ExitCode >= 128)
+                {
+                    // A signaled launcher cannot attest that it waited for namespace teardown.
+                    throw new RunnerCleanupIncompleteException();
+                }
                 return new OneJobCompletion(runnerId, process.ExitCode);
             }
             catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested && stopGrace is { } grace)
@@ -61,7 +70,7 @@ internal sealed partial class LinuxOneJobRunner(ILinuxOneJobBoundary boundary, T
                 }
                 try
                 {
-                    await Task.WhenAll(process.WaitForExitAsync(CancellationToken.None), stdout, stderr)
+                    await Task.WhenAll(process.WaitForExitAsync(CancellationToken.None), drain)
                         .WaitAsync(grace, CancellationToken.None).ConfigureAwait(false);
                 }
                 catch (TimeoutException)
@@ -72,17 +81,46 @@ internal sealed partial class LinuxOneJobRunner(ILinuxOneJobBoundary boundary, T
             }
             finally
             {
-                await output.CancelAsync().ConfigureAwait(false);
-                if (!process.HasExited)
+                try
                 {
-                    process.Kill(entireProcessTree: true);
-                    await process.WaitForExitAsync(CancellationToken.None).ConfigureAwait(false);
+                    if (!process.HasExited)
+                    {
+                        // The trusted namespace launcher kills PID 1 on parent death. The kernel
+                        // then shuts down that namespace, including reparented and detached children.
+                        process.Kill(entireProcessTree: !boundary.IsolatedProcessTree);
+                        await WaitForTeardownAsync(process.WaitForExitAsync(CancellationToken.None), CancellationToken.None)
+                            .ConfigureAwait(false);
+                    }
+                    if (cancellationToken.IsCancellationRequested)
+                    {
+                        await WaitForTeardownAsync(drain, CancellationToken.None).ConfigureAwait(false);
+                    }
+                }
+                finally
+                {
+                    output.Cancel();
+                    process.StandardOutput.Dispose();
+                    process.StandardError.Dispose();
+                    _ = drain.ContinueWith(static task => _ = task.Exception, CancellationToken.None,
+                        TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
                 }
             }
         }
         finally
         {
             boundary.RemoveConfigFiles();
+        }
+    }
+
+    private static async Task WaitForTeardownAsync(Task operation, CancellationToken cancellationToken)
+    {
+        try
+        {
+            await operation.WaitAsync(TeardownBudget, cancellationToken).ConfigureAwait(false);
+        }
+        catch (TimeoutException)
+        {
+            throw new RunnerCleanupIncompleteException();
         }
     }
 
@@ -132,3 +170,6 @@ internal sealed partial class LinuxOneJobRunner(ILinuxOneJobBoundary boundary, T
                 DateTimeStyles.AssumeUniversal, out _);
     }
 }
+
+internal sealed class RunnerCleanupIncompleteException() :
+    IOException("The one-job runner process or credential cleanup could not be confirmed.");

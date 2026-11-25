@@ -13,6 +13,15 @@ internal static partial class LinuxFiles
 
     internal static bool IsRoot() => GetEffectiveUserId() == 0;
 
+    internal static ulong? GetMountId(string path)
+    {
+        const int atCurrentDirectory = -100;
+        const int noFollow = 0x100;
+        const uint mountId = 0x1000;
+        return Statx(atCurrentDirectory, path, noFollow, mountId, out var stat) == 0 && (stat.Mask & mountId) != 0
+            ? stat.MountId : null;
+    }
+
     internal static void DisableCoreDumps()
     {
         const int coreLimit = 4;
@@ -122,16 +131,14 @@ internal static partial class LinuxFiles
             (stat.Mask & modeOwnerGroup) == modeOwnerGroup ? stat : default;
     }
 
-    [StructLayout(LayoutKind.Sequential, Size = 256)]
+    [StructLayout(LayoutKind.Explicit, Size = 256)]
     private struct LinuxStatx
     {
-        public uint Mask;
-        public uint BlockSize;
-        public ulong Attributes;
-        public uint LinkCount;
-        public uint User;
-        public uint Group;
-        public ushort Mode;
+        [FieldOffset(0)] public uint Mask;
+        [FieldOffset(20)] public uint User;
+        [FieldOffset(24)] public uint Group;
+        [FieldOffset(28)] public ushort Mode;
+        [FieldOffset(144)] public ulong MountId;
     }
 
     [LibraryImport("libc", EntryPoint = "statx", StringMarshalling = StringMarshalling.Utf8)]

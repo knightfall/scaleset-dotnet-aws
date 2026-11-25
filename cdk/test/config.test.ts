@@ -327,6 +327,41 @@ test("a draining profile can use the Default alias and the maximum idle reserve"
   );
 });
 
+test("role validation preserves same-purpose sharing and checks a disabled binding when enabled", () => {
+  const source = parseYaml(fixture("mixed-ec2-fargate.yaml"));
+  const roleEdits = [
+    {
+      path: "/spec/profiles/1/provisioner/bootstrapRoleArn",
+      value: "arn:aws:iam::111122223333:role/runner-linux-bootstrap",
+    },
+    {
+      path: "/spec/profiles/3/provisioner/executionRoleArn",
+      value: "arn:aws:iam::111122223333:role/fargate-shell-execution",
+    },
+  ];
+  const shared = compileConfig(JSON.stringify(edited(source, roleEdits)));
+  assert.equal(shared.runtime.spec.profiles.length, 4);
+  const isolatedEdit = {
+    path: "/spec/profiles/3/provisioner/executionRoleArn",
+    value: "arn:aws:iam::111122223333:role/fargate-shell-bootstrap",
+  };
+  const disabled = edited(source, [
+    isolatedEdit,
+    { path: "/spec/profiles/2/state", value: "disabled" },
+  ]);
+  assert.equal(
+    compileConfig(JSON.stringify(disabled)).runtime.spec.profiles[2].state,
+    "disabled",
+  );
+  assert.throws(
+    () => compileConfig(JSON.stringify(edited(source, [isolatedEdit]))),
+    {
+      code: "semantic",
+      path: isolatedEdit.path,
+    },
+  );
+});
+
 test("enterprise PATs and labels reused across separate GitHub scopes remain valid", () => {
   const source = edited(parseYaml(fixture("mixed-ec2-fargate.yaml")), [
     {
@@ -408,14 +443,15 @@ test("Copilot and ordinary profiles need distinct groups within a canonical GitH
   }
 });
 
-test("local replay and versioned S3 snapshots retain their exact demand options", () => {
+test("local demand and versioned S3 snapshots retain their exact options", () => {
   const base = parseYaml(fixture("ec2-only-latest.yaml"));
   const demands = [
     { type: "replay", path: "/input/replay.json" },
+    { type: "snapshot", path: "/input/local demand.json" },
     {
       type: "snapshot",
-      s3Uri: "s3://config-fixtures/demand.json",
-      versionId: "recorded-version",
+      s3Uri: "s3://snapshot-fixture/profile-blue/v1/Runner_demand.json",
+      versionId: "specific+version/=",
       sha256: "a".repeat(64),
     },
   ];
@@ -423,8 +459,10 @@ test("local replay and versioned S3 snapshots retain their exact demand options"
     const source = edited(base, [
       { path: "/spec/dryRun/demand", value: demand },
     ]);
+    const compiled = compileConfig(JSON.stringify(source));
+    assert.deepEqual(compiled.runtime.spec.dryRun.demand, demand);
     assert.deepEqual(
-      compileConfig(JSON.stringify(source)).runtime.spec.dryRun.demand,
+      validateRuntime(JSON.parse(compiled.json)).spec.dryRun.demand,
       demand,
     );
   }

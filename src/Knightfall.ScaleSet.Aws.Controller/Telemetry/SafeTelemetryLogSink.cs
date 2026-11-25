@@ -1,4 +1,5 @@
 using System.Globalization;
+using Knightfall.ScaleSet.Aws.Controller.Lifecycle;
 using Serilog;
 using Serilog.Configuration;
 using Serilog.Core;
@@ -77,6 +78,13 @@ internal sealed class SafeTelemetryLogSink(TelemetryPrivacy privacy, TelemetryEx
             if (TelemetryPrivacy.Scalar(log, "reason") is { } reason)
             {
                 properties.Add(Property("reason", TelemetryNames.Reasons.Contains(reason) ? reason : "other"));
+                if (category == typeof(CapturedEcsControllerTaskFenceObserver).FullName && operation == "reconcile" && outcome == "success" &&
+                    reason == "predecessor_capture_verified" &&
+                    TelemetryPrivacy.Scalar(log, "evidence_reference") is { Length: 16 } reference &&
+                    reference.All(static character => character is >= '0' and <= '9' or >= 'a' and <= 'f'))
+                {
+                    properties.Add(Property("evidence_reference", reference));
+                }
             }
         }
 

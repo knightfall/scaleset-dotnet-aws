@@ -71,7 +71,13 @@ public sealed record ControllerHostingConfiguration(
     string Cluster,
     RunnerArchitecture CpuArchitecture,
     int Cpu,
-    int MemoryMiB);
+    int MemoryMiB)
+{
+    public ControllerPredecessorCapture? PredecessorCapture { get; init; }
+}
+
+public sealed record ControllerPredecessorCapture(
+    string LogGroupArn, string EventRuleArn, DateTimeOffset QualifiedFrom, DateTimeOffset QualifiedUntil);
 
 public abstract record TrackingTableConfiguration(string Name);
 

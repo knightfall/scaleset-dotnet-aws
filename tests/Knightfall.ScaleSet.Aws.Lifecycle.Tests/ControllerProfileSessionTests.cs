@@ -2,6 +2,7 @@ using System.Globalization;
 using System.Net;
 using System.Text.Json;
 using System.Text.Json.Nodes;
+using Amazon.Runtime;
 using Amazon.SecretsManager;
 using Knightfall.ScaleSet.Aws.Controller.Runtime;
 using Knightfall.ScaleSet.Aws.Core.Catalog;
@@ -28,12 +29,18 @@ public sealed class ControllerProfileSessionTests
     private static readonly Guid SecondSession = Guid.Parse("51688c9f-f017-4a9a-b59f-77ed34074c1c");
     private static readonly string[] CurrentStage = ["AWSCURRENT"];
     private static readonly GitHubListenerTiming Timing = new(TimeSpan.FromSeconds(5), TimeSpan.FromSeconds(25), TimeSpan.FromSeconds(15));
+    private static readonly TimeSpan PollObservationBudget = TimeSpan.FromSeconds(30);
 
-    [Fact]
-    public async Task IndependentLanesPersistTheirBindingsAndExplicitShutdownClosesOnlyExactSessions()
+    [Theory]
+    [InlineData(null)]
+    [InlineData("AccessDeniedException")]
+    [InlineData("ExpiredTokenException")]
+    [InlineData("ClientFailure")]
+    public async Task IndependentLanesReportStorageFaultsAndExplicitShutdownClosesOnlyExactSessions(string? storageFailure)
     {
         using var budget = CancellationTokenSource.CreateLinkedTokenSource(TestContext.Current.CancellationToken);
-        budget.CancelAfter(TimeSpan.FromSeconds(15));
+        // Table setup and earlier requests can consume most of the budget on a shared CI runner.
+        budget.CancelAfter(TimeSpan.FromMinutes(2));
         var token = budget.Token;
         using var table = await MiniStackTable.CreateAsync(token);
         var clock = new ContractClock();
@@ -47,6 +54,9 @@ public sealed class ControllerProfileSessionTests
         var secondKey = new LifecycleProfile(deployment, SecondProfile);
         var firstPoll = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var secondPoll = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var firstRecovered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var firstFault = new TaskCompletionSource<GitHubListenerLaneStatus>(TaskCreationOptions.RunContinuationsAsynchronously);
+        int firstPolls = 0;
 
         using var wire = new GitHubWire(async (request, cancellation) =>
         {
@@ -65,9 +75,9 @@ public sealed class ControllerProfileSessionTests
                     request.Uri.Query.Contains(SecondProfile, StringComparison.Ordinal) ? secondProfile : firstProfile;
                 return GitHubWire.Json(HttpStatusCode.OK, JsonSerializer.Serialize(new { count = 1, value = new[] { SetBody(set) } }));
             }
-            if (request.Method == HttpMethod.Get && path == SetPath(firstProfile))
+            if (request.Method == HttpMethod.Get && (path == SetPath(firstProfile) || path == SetPath(secondProfile)))
             {
-                return GitHubWire.Json(HttpStatusCode.OK, JsonSerializer.Serialize(SetBody(firstProfile)));
+                return GitHubWire.Json(HttpStatusCode.OK, JsonSerializer.Serialize(SetBody(path == SetPath(firstProfile) ? firstProfile : secondProfile)));
             }
             if (request.Method == HttpMethod.Post && (path == SessionPath(firstProfile) || path == SessionPath(secondProfile)))
             {
@@ -88,7 +98,29 @@ public sealed class ControllerProfileSessionTests
             }
             if (request.Method == HttpMethod.Get && (path == "/" + FirstProfile || path == "/" + SecondProfile))
             {
-                (path == "/" + FirstProfile ? firstPoll : secondPoll).TrySetResult();
+                if (path == "/" + FirstProfile)
+                {
+                    if (Interlocked.Increment(ref firstPolls) == 1 && storageFailure is not null)
+                    {
+                        var checkpoint = LifecycleKey.Checkpoint(firstKey, GitHubWire.SessionId);
+                        if (storageFailure == "ClientFailure")
+                        {
+                            table.Wire.FailNextGetItem(checkpoint, new AmazonClientException("Synthetic SDK client fault."));
+                        }
+                        else
+                        {
+                            table.Wire.FailNextGetItem(checkpoint, HttpStatusCode.Forbidden, storageFailure);
+                        }
+                        firstPoll.TrySetResult();
+                        return new HttpResponseMessage(HttpStatusCode.Accepted);
+                    }
+                    firstPoll.TrySetResult();
+                    firstRecovered.TrySetResult();
+                }
+                else
+                {
+                    secondPoll.TrySetResult();
+                }
                 await Task.Delay(Timeout.InfiniteTimeSpan, cancellation);
             }
             if (request.Method == HttpMethod.Delete && (path == SessionPath(firstProfile) + $"/{GitHubWire.SessionId:D}" ||
@@ -107,13 +139,40 @@ public sealed class ControllerProfileSessionTests
         var supervisor = new GitHubListenerSupervisor(store, clock, Timing, rotation);
         var registration = new GitHubScaleSetRegistration(store, clock, Timing.WriteReserve, Timing.SessionSendWindow);
         var cooldown = new GitHubCredentialCooldown(clock, Timing.UnauthorizedCooldown);
-        using var first = new ControllerProfileSession(config, firstProfile, 1, ownership, store, secrets, clients, registration, supervisor, rotation, cooldown, clock);
-        using var second = new ControllerProfileSession(config, secondProfile, 1, ownership, store, secrets, clients, registration, supervisor, rotation, cooldown, clock);
+        await using var first = new ControllerProfileSession(config, firstProfile, 1, ownership, store, secrets, clients, registration, supervisor, rotation, cooldown, clock);
+        await using var second = new ControllerProfileSession(config, secondProfile, 1, ownership, store, secrets, clients, registration, supervisor, rotation, cooldown, clock);
+        first.ListenerHealthChanged = () =>
+        {
+            if (first.ListenerResult?.Status is GitHubListenerLaneStatus.StorageRejected or GitHubListenerLaneStatus.StorageUnavailable)
+            {
+                firstFault.TrySetResult(first.ListenerResult.Status);
+            }
+        };
 
         var firstBinding = Assert.IsType<GitHubScaleSetBinding>(await first.EnsureRegisteredAsync(token));
-        await firstPoll.Task.WaitAsync(token);
+        await ObservePollAsync(firstPoll.Task, FirstProfile, first);
         Assert.Equal(SecondSet, (await second.EnsureRegisteredAsync(token))?.ScaleSetId);
-        await secondPoll.Task.WaitAsync(token);
+        await ObservePollAsync(secondPoll.Task, SecondProfile, second);
+        if (storageFailure is not null)
+        {
+            bool rejected = storageFailure == "AccessDeniedException";
+            Assert.Equal(rejected ? GitHubListenerLaneStatus.StorageRejected : GitHubListenerLaneStatus.StorageUnavailable,
+                await firstFault.Task.WaitAsync(PollObservationBudget, token));
+            if (rejected)
+            {
+                await first.JoinMutatorsAsync(token);
+                Assert.False(first.IsListenerAvailable);
+                Assert.Equal(1, Volatile.Read(ref firstPolls));
+                Assert.False(firstRecovered.Task.IsCompleted);
+            }
+            else
+            {
+                await ObservePollAsync(firstRecovered.Task, FirstProfile, first);
+                Assert.Equal(2, Volatile.Read(ref firstPolls));
+            }
+            Assert.True(second.IsListenerAvailable);
+            Assert.Equal(GitHubWire.SessionId, (await store.ReadSessionAsync(firstKey, token))?.SessionId);
+        }
         Assert.Equal(firstBinding, await first.EnsureRegisteredAsync(token));
         var reconciliation = Assert.IsType<GitHubScaleSetConnection>(await first.GetConnectionAsync(token));
         Assert.Equal(firstBinding, (await reconciliation.LookupAsync(firstProfile.GitHub, firstBinding, token)).Binding);
@@ -134,6 +193,19 @@ public sealed class ControllerProfileSessionTests
         Assert.Equal(2, deletes.Length);
         Assert.Contains(SessionPath(firstProfile) + $"/{GitHubWire.SessionId:D}", deletes);
         Assert.Contains(SessionPath(secondProfile) + $"/{SecondSession:D}", deletes);
+
+        async Task ObservePollAsync(Task observation, string profile, ControllerProfileSession session)
+        {
+            try
+            {
+                await observation.WaitAsync(PollObservationBudget, token);
+            }
+            catch (TimeoutException)
+            {
+                Assert.Fail($"No poll from {profile} within {PollObservationBudget}. Lane status is {session.ListenerResult?.Status}. " +
+                    string.Join(", ", wire.Requests.Select(request => request.Method + " " + request.Uri.AbsolutePath)));
+            }
+        }
     }
 
     [Theory]
@@ -165,7 +237,7 @@ public sealed class ControllerProfileSessionTests
         var secrets = new GitHubSecretLoader(sdk);
         var clients = new GitHubScaleSetClientFactory(httpClient: http, timeProvider: clock);
         var rotation = new GitHubCredentialRotator(secrets, clients);
-        using var session = new ControllerProfileSession(config, config.Profiles[0], replaceEpoch ? 1 : 2, ownership, store, secrets, clients,
+        await using var session = new ControllerProfileSession(config, config.Profiles[0], replaceEpoch ? 1 : 2, ownership, store, secrets, clients,
             new GitHubScaleSetRegistration(store, clock, Timing.WriteReserve, Timing.SessionSendWindow),
             new GitHubListenerSupervisor(store, clock, Timing, rotation), rotation,
             new GitHubCredentialCooldown(clock, Timing.UnauthorizedCooldown), clock);

@@ -205,7 +205,8 @@ export function validateFargatePreflight(
   );
   if (
     enabled.size === 0 ||
-    (spec.mode !== "active" && !spec.dryRun.inspectAws) ||
+    (spec.mode !== "active" &&
+      (!spec.dryRun.inspectAws || spec.dryRun.demand.type !== "none")) ||
     Buffer.byteLength(input, "utf8") > maximumBytes ||
     !input.isWellFormed() ||
     Token.isUnresolved(input) ||
