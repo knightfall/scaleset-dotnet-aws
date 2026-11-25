@@ -180,7 +180,12 @@ internal static class RuntimeConfigurationTranslation
                     "round-robin" => Ec2SubnetStrategy.RoundRobin,
                     "failure-weighted" => Ec2SubnetStrategy.FailureWeighted,
                     _ => throw UnknownVariant(),
-                }),
+                })
+            {
+                StatusQualification = value.TryGetProperty("statusQualification", out var qualification)
+                    ? new Ec2StatusQualification(Text(qualification, "imageId"), Text(qualification, "roleId"), Text(qualification, "evidenceSha256"))
+                    : null,
+            },
             "fargate" => new FargateProvisionerConfiguration(
                 network,
                 role,

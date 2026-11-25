@@ -79,4 +79,4 @@ Implement Direct EC2 mode in `Knightfall.ScaleSet.Aws.RunnerBootstrap` and docum
 ### Acceptance
 
 1. Fixtures test wrong instance/role/account metadata, reboot after spent marker, expired/tampered offers, lost consume response failing closed, and zero plaintext JIT in disk files, args, or logs.
-2. `T23` emulated verification (MiniStack / AWS Emulator + loopback IMDSv2) proves the instance handshake, `STATUS#` flow, and cross-instance `OFFER#` isolation contract; operator AMI deployment follows the `T26` OS/IMDS isolation checklist before enabling active `STATUS#` writes.
+2. `T23` emulated verification (MiniStack + loopback IMDSv2) proves the instance handshake, `STATUS#` flow, and cross-instance `OFFER#` isolation contract; operator AMI deployment follows the `T26` OS/IMDS isolation checklist before enabling active `STATUS#` writes.

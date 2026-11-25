@@ -17,6 +17,7 @@ internal sealed class DirectEc2Fixture(
     string instanceProfileArn, string vpc, string subnetA, string subnetB, string securityGroup, string templateId) : IDisposable
 {
     internal const string LinuxImage = "ami-0abcdef1234567890";
+    internal static readonly string StatusQualificationDigest = new('a', 64);
     internal static string RoleName() => "t23-ec2-" + Guid.NewGuid().ToString("N");
     internal const string ProfileId = "linux-ec2-build";
 
@@ -82,7 +83,7 @@ internal sealed class DirectEc2Fixture(
     }
 
     internal async Task<RuntimeConfiguration> ConfigurationAsync(string table, string selector, CancellationToken cancellationToken,
-        string? patSecretArn = null)
+        string? patSecretArn = null, string? statusRoleId = null, string? statusImageId = null)
     {
         string document = await File.ReadAllTextAsync(Path.Combine(AppContext.BaseDirectory, "ec2-only-pinned.json"), cancellationToken);
         var tree = JsonNode.Parse(document)!;
@@ -116,6 +117,15 @@ internal sealed class DirectEc2Fixture(
         provisioner["launchTemplateVersion"] = selector.StartsWith('$') ?
             new JsonObject { ["type"] = "alias", ["name"] = selector } :
             new JsonObject { ["type"] = "pinned", ["version"] = selector };
+        if (statusRoleId is not null)
+        {
+            provisioner["statusQualification"] = new JsonObject
+            {
+                ["imageId"] = statusImageId ?? LinuxImage,
+                ["roleId"] = statusRoleId,
+                ["evidenceSha256"] = StatusQualificationDigest,
+            };
+        }
         return RuntimeConfigurationLoader.Load(System.Text.Encoding.UTF8.GetBytes(tree.ToJsonString()));
     }
 

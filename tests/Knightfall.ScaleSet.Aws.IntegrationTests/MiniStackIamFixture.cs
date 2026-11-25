@@ -220,7 +220,6 @@ internal sealed partial class MiniStackIamFixture : IDisposable
     {
         var permissions = new List<(string Action, string Partition)>
         {
-            ("dynamodb:PutItem", "HELLO#"),
             ("dynamodb:DeleteItem", "OFFER#"),
         };
         if (includeStatus)

@@ -108,7 +108,10 @@ public sealed record ExecutorInventorySnapshot(
     long? Revision, ExecutorInventoryObservation? Coverage, ImmutableArray<ExecutorSnapshot> Executors, bool IsConsistent);
 
 public sealed record ExecutorClassification(
-    bool Occupied, bool Recovering, bool CompletedCleanupCandidate, RunnerSlotState SlotState);
+    bool Occupied, bool Recovering, bool CompletedCleanupCandidate, RunnerSlotState SlotState)
+{
+    public bool CoversIdleReserve { get; init; }
+}
 
 /// <summary>Current-session demand with the original queue observation identity.</summary>
 public sealed record SessionDemandObservation(Guid SessionId, DateTimeOffset ObservedAt, long? MessageId, int TotalAssignedJobs);

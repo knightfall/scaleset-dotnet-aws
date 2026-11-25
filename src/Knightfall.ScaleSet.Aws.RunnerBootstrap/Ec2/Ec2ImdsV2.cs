@@ -67,7 +67,8 @@ internal sealed class Ec2ImdsV2(HttpClient client, Uri endpoint, TimeProvider cl
         using var document = JsonDocument.Parse(bytes);
         var root = document.RootElement;
         EnsureUniqueObject(root);
-        return new Ec2InstanceDocument(Field(root, "accountId"), Field(root, "region"), Field(root, "instanceId"));
+        return new Ec2InstanceDocument(Field(root, "accountId"), Field(root, "region"), Field(root, "instanceId"),
+            root.TryGetProperty("imageId", out _) ? Field(root, "imageId") : null);
     }
 
     private async Task<SessionAWSCredentials> ReadRoleCredentialsAsync(string imdsToken, string roleName, CancellationToken cancellationToken)
@@ -177,7 +178,7 @@ internal sealed class Ec2ImdsV2(HttpClient client, Uri endpoint, TimeProvider cl
     private static IOException InvalidMetadata() => new("EC2 instance metadata was unavailable or invalid.");
 }
 
-internal sealed record Ec2InstanceDocument(string Account, string Region, string InstanceId);
+internal sealed record Ec2InstanceDocument(string Account, string Region, string InstanceId, string? ImageId = null);
 
 internal sealed record Ec2MetadataIdentity(Ec2InstanceDocument Document, SessionAWSCredentials Credentials)
 {

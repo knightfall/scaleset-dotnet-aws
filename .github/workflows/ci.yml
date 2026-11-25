@@ -25,4 +25,8 @@ jobs:
           node-version-file: .node-version
           cache: npm
           cache-dependency-path: cdk/package-lock.json
+      - name: Check documentation links and release verification
+        run: |
+          python3 scripts/check-doc-links.py
+          python3 -m unittest discover -s .github/release
       - run: make check

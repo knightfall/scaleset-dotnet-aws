@@ -4,6 +4,7 @@ using Amazon.ECS;
 using Amazon.IdentityManagement;
 using Amazon.Runtime;
 using Amazon.Runtime.Credentials;
+using Amazon.S3;
 using Amazon.SecretsManager;
 using Amazon.SecurityToken;
 using Amazon.SecurityToken.Model;
@@ -46,6 +47,13 @@ internal sealed class ControllerCloudClients(string region, AWSCredentials crede
         Own(new AmazonSecurityTokenServiceClient(credentials, Configure<AmazonSecurityTokenServiceConfig>()));
 
     internal AmazonSecretsManagerClient Secrets() => Own(new AmazonSecretsManagerClient(credentials, Configure<AmazonSecretsManagerConfig>()));
+
+    internal AmazonS3Client S3()
+    {
+        var options = Configure<AmazonS3Config>();
+        options.ForcePathStyle = endpoint is not null;
+        return Own(new AmazonS3Client(credentials, options));
+    }
 
     internal AmazonSQSClient Queue() => Own(new AmazonSQSClient(credentials, Configure<AmazonSQSConfig>()));
 

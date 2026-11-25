@@ -34,7 +34,7 @@ For example, set the following fields on the existing task definition. Populate 
 }
 ```
 
-The exact image, entrypoint, command, and scratch path must match the profile's Fargate preflight approval. T16 launches one task with no runtime overrides. ECS supplies the metadata and task credential endpoint variables. Do not set environment entries, environment files, or secrets on the runner container.
+The exact image, entrypoint, command, and scratch path must match the profile's Fargate preflight approval. Omit the task definition's runner `healthCheck` field because the approval covers the bootstrap command. T16 launches one task with no runtime overrides. ECS supplies the metadata and task credential endpoint variables. Do not set environment entries, environment files, or secrets on the runner container.
 
 The binding file contains only nonsecret deployment settings. This example uses an existing scale set. For an automatically created scale set, omit `scaleSetId`. The bootstrap then accepts the positive scale-set ID authenticated by the controller's scoped offer.
 
@@ -46,6 +46,7 @@ The binding file contains only nonsecret deployment settings. This example uses 
   "profileId": "linux-shell",
   "gitHubScope": "https://github.com/example/automation",
   "tableName": "scaleset-engineering-dev",
+  "helloEndpoint": "https://exampleid.lambda-url.ap-southeast-2.on.aws/",
   "clusterArn": "arn:aws:ecs:ap-southeast-2:111122223333:cluster/engineering-shell",
   "taskFamily": "linux-shell-runner",
   "containerName": "runner",
@@ -61,7 +62,7 @@ The binding file contains only nonsecret deployment settings. This example uses 
 
 The bootstrap reads the container and task metadata locally, compares both container identities, and checks the exact task ID and role against the caller identity obtained with ECS task credentials. It gets the assigned revision from the task metadata and verifies it through the incarnation in the controller's offer. The task definition can therefore use the same command after registering a new revision. Replacing an IAM task role requires updating the expected role ID and registering the corresponding image/task revision. [Metadata v4](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/task-metadata-endpoint-v4-fargate-response.html), [ECS task role credentials](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/task-iam-roles.html)
 
-Scope bootstrap storage to conditional `PutItem` for `HELLO#${aws:userid}` and conditional `DeleteItem` with `ALL_OLD` for `OFFER#${aws:userid}` on the configured table. Give this task role zero `STATUS#` writes, lifecycle-row access, Secrets Manager access, or GitHub administrative credentials. Workflow code may be able to use the same task identity. The controller gets resource death from verified ECS observations and job state from GitHub.
+Set `helloEndpoint` to the stack output for the configured task role. The bootstrap signs its registration to the role's AWS IAM Function URL. The broker validates the request and stores one conditional HELLO with a server-set expiry. The task role consumes its own `OFFER#${aws:userid}` using conditional `DeleteItem` with `ALL_OLD`. Give the task role zero direct HELLO or `STATUS#` writes, lifecycle-row access, Secrets Manager access, or GitHub administrative credentials. Workflow code may be able to use the same task identity. The controller gets resource death from verified ECS observations and job state from GitHub. See the [HELLO cutover](operator-runbook.md#cut-over-runner-hello-registration) for existing deployments.
 
 ## RAM-backed runner configuration
 

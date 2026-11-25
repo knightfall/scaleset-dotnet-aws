@@ -15,7 +15,10 @@ public sealed record RunnerSlot(
     string Id,
     RunnerSlotState State,
     bool OwnershipVerified,
-    DateTimeOffset? StartedAt = null);
+    DateTimeOffset? StartedAt = null)
+{
+    public bool CoversIdleReserve { get; init; }
+}
 
 public enum RunnerSlotState
 {

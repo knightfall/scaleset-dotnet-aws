@@ -15,6 +15,8 @@ namespace Knightfall.ScaleSet.Aws.DynamoDb;
 internal static partial class BootstrapItems
 {
     private const int MaximumPayloadCharacters = 380_000;
+    private const int MaximumHelloCharacters = 1024;
+    internal const string TrustedHelloIssuer = "iam-url-v1";
 
     private static readonly JsonSerializerOptions Json = new(JsonSerializerOptions.Strict)
     {
@@ -58,10 +60,19 @@ internal static partial class BootstrapItems
         return Convert.ToHexStringLower(SHA256.HashData(JsonSerializer.SerializeToUtf8Bytes(hello, Json)));
     }
 
-    internal static JitHello DecodeHello(LifecycleKey key, Dictionary<string, AttributeValue> item)
+    internal static JitHello DecodeHello(LifecycleKey key, Dictionary<string, AttributeValue> item, DateTimeOffset now)
     {
-        RequireKey(key, item);
-        var hello = Deserialize<JitHello>(Text(item, "payload"));
+        RequireKey(key, item, allowExpiration: true);
+        if (Text(item, "helloIssuer") != TrustedHelloIssuer || Integer(item, "expiresAt") <= now.ToUnixTimeSeconds())
+        {
+            throw InvalidItem();
+        }
+        string payload = Text(item, "payload");
+        if (payload.Length > MaximumHelloCharacters)
+        {
+            throw InvalidItem();
+        }
+        var hello = Deserialize<JitHello>(payload);
         if (key != LifecycleKey.Hello(Text(item, "awsUserId")) ||
             Text(item, "helloSha256") != HelloDigest(hello) || Integer(item, "protocolVersion") != hello.ProtocolVersion)
         {
@@ -163,9 +174,9 @@ internal static partial class BootstrapItems
         item.TryGetValue(field, out var attribute) &&
         long.TryParse(attribute.N, NumberStyles.None, CultureInfo.InvariantCulture, out long value) ? value : throw InvalidItem();
 
-    internal static void RequireKey(LifecycleKey key, Dictionary<string, AttributeValue> item)
+    internal static void RequireKey(LifecycleKey key, Dictionary<string, AttributeValue> item, bool allowExpiration = false)
     {
-        if (Text(item, "PK") != key.PartitionKey || Text(item, "SK") != key.SortKey || item.ContainsKey("expiresAt"))
+        if (Text(item, "PK") != key.PartitionKey || Text(item, "SK") != key.SortKey || (!allowExpiration && item.ContainsKey("expiresAt")))
         {
             throw InvalidItem();
         }

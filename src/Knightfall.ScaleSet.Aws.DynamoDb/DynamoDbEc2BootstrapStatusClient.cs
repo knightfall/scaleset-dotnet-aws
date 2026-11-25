@@ -1,3 +1,4 @@
+using System.Text.Json.Serialization;
 using Amazon.DynamoDBv2;
 using Amazon.DynamoDBv2.Model;
 using Knightfall.ScaleSet.Aws.Core.Lifecycle;
@@ -5,7 +6,11 @@ using Knightfall.ScaleSet.Aws.Handoff;
 
 namespace Knightfall.ScaleSet.Aws.DynamoDb;
 
-public sealed record JitEc2BootstrapStatus(string OfferId, long RunnerId, long Sequence, bool Exited, DateTimeOffset ObservedAt);
+public sealed record JitEc2BootstrapStatus(string OfferId, long RunnerId, long Sequence, bool Exited, DateTimeOffset ObservedAt)
+{
+    [JsonIgnore]
+    public string? QualificationSha256 { get; init; }
+}
 
 /// <summary>Writes the exact EC2 STATUS row for an isolated bootstrap identity.</summary>
 public sealed class DynamoDbEc2BootstrapStatusClient
@@ -48,6 +53,10 @@ public sealed class DynamoDbEc2BootstrapStatusClient
         item.Add("observedAt", BootstrapItems.Number(status.ObservedAt.ToUnixTimeMilliseconds()));
         item.Add("exited", new AttributeValue { BOOL = status.Exited });
         item.Add("payload", BootstrapItems.String(BootstrapItems.Serialize(status)));
+        if (status.QualificationSha256 is { } qualification)
+        {
+            item.Add("qualificationSha256", BootstrapItems.String(qualification));
+        }
         return BootstrapItems.PutAsync(_client, new PutItemRequest
         {
             TableName = _tableName,
@@ -72,7 +81,8 @@ public sealed class DynamoDbEc2BootstrapStatusClient
     {
         ArgumentNullException.ThrowIfNull(status);
         if (!JitHandoffSnapshot.IsLowercaseDigest(status.OfferId) || status.RunnerId <= 0 ||
-            status.Sequence <= 0 || status.ObservedAt <= DateTimeOffset.UnixEpoch)
+            status.Sequence <= 0 || status.ObservedAt <= DateTimeOffset.UnixEpoch ||
+            (status.QualificationSha256 is not null && !JitHandoffSnapshot.IsLowercaseDigest(status.QualificationSha256)))
         {
             throw new ArgumentException("An exact EC2 runner status is required.", nameof(status));
         }

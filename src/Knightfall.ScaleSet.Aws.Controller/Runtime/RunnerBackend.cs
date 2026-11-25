@@ -6,7 +6,10 @@ using Knightfall.ScaleSet.Aws.DynamoDb;
 namespace Knightfall.ScaleSet.Aws.Controller.Runtime;
 
 internal sealed record RunnerBackendResource(
-    string ResourceArn, ExecutorBinding? Binding, ExecutorResourceObservation? Observation, string? BootstrapCredentialArn);
+    string ResourceArn, ExecutorBinding? Binding, ExecutorResourceObservation? Observation, string? BootstrapCredentialArn)
+{
+    public string? Ec2StatusQualificationSha256 { get; init; }
+}
 
 internal sealed record RunnerBackendInventory(
     DateTimeOffset ObservedAt, bool IsComplete, int? LaunchHeadroom, int? DriftCount, ImmutableArray<RunnerBackendResource> Resources);

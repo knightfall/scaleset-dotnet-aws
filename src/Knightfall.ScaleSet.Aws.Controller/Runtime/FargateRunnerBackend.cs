@@ -11,7 +11,7 @@ namespace Knightfall.ScaleSet.Aws.Controller.Runtime;
 
 internal sealed class FargateRunnerBackend(
     RuntimeConfiguration configuration, RunnerProfile profile, LifecycleProfile key, FargateProfileInspector inspector,
-    FargateRuntimeEvidence evidence, IReadOnlyCollection<LifecycleProfile> deploymentProfiles,
+    FargateRuntimeEvidence evidence, FargateQuotaReader quota, IReadOnlyCollection<LifecycleProfile> deploymentProfiles,
     ConcurrentDictionary<string, FargateInventorySnapshot> deploymentInventory,
     DynamoDbLifecycleStore store, DynamoDbEffectJournal journal, DynamoDbEffectDispatcher dispatcher,
     TimeProvider clock, TimeSpan observationFreshness) : IRunnerBackend
@@ -27,7 +27,17 @@ internal sealed class FargateRunnerBackend(
     public async Task<RunnerBackendInventory> ReadAsync(ControllerLease lease, CancellationToken cancellationToken)
     {
         _launchTask = null;
-        var inventory = await inspector.ReadInventoryAsync(configuration, profile.Id, cancellationToken).ConfigureAwait(false);
+        deploymentInventory.TryGetValue(profile.Id, out var previous);
+        FargateInventorySnapshot inventory;
+        try
+        {
+            inventory = await inspector.ReadInventoryAsync(configuration, profile.Id, previous, cancellationToken).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            deploymentInventory.TryRemove(profile.Id, out _);
+            throw;
+        }
         deploymentInventory[profile.Id] = inventory;
         var launchHeadroom = (int?)null;
         FargateResolvedTask? verified = null;
@@ -38,13 +48,11 @@ internal sealed class FargateRunnerBackend(
             {
                 verified = approved;
                 var reservations = await ReadReservationsAsync(lease.Fence, cancellationToken).ConfigureAwait(false);
-                var headroom = inspector.EstimateHeadroom(approved, inventory, evidence.Quota, reservations,
+                var sample = await quota.ReadAsync(cancellationToken).ConfigureAwait(false);
+                var headroom = inspector.EstimateHeadroom(approved, inventory, sample, reservations,
                     deploymentInventory.Values.ToArray());
                 launchHeadroom = headroom.LaunchSlots;
-                if (launchHeadroom > 0)
-                {
-                    _launchTask = approved;
-                }
+                _launchTask = approved;
             }
         }
 
@@ -84,8 +92,7 @@ internal sealed class FargateRunnerBackend(
 
                 if (effect.Entry.State == EffectState.Planned)
                 {
-                    _ = await dispatcher.DispatchPlannedAsync(authority.Lease, authority.Clock, key, intentId,
-                        Effects, ownershipLost, cancellationToken).ConfigureAwait(false);
+                    await DispatchFirstLaunchAsync(authority, effect.Entry.Envelope, ownershipLost, cancellationToken).ConfigureAwait(false);
                 }
                 else
                 {
@@ -114,9 +121,27 @@ internal sealed class FargateRunnerBackend(
             earliest, earliest.AddMinutes(50));
         if (await journal.PlanAsync(authority.Lease, envelope, Guid.NewGuid(), cancellationToken).ConfigureAwait(false) == LifecycleWriteOutcome.Committed)
         {
-            _ = await dispatcher.DispatchPlannedAsync(authority.Lease, authority.Clock, key, envelope.IntentId,
-                Effects, ownershipLost, cancellationToken).ConfigureAwait(false);
+            await DispatchFirstLaunchAsync(authority, envelope, ownershipLost, cancellationToken).ConfigureAwait(false);
         }
+    }
+
+    private async Task DispatchFirstLaunchAsync(ActiveControllerAuthority authority, EffectEnvelope envelope,
+        CancellationToken ownershipLost, CancellationToken cancellationToken)
+    {
+        if (envelope.Request is not FargateLaunchEffectRequest launch || _launchTask is not { } task ||
+            !deploymentInventory.TryGetValue(profile.Id, out var inventory))
+        {
+            return;
+        }
+        var reservations = await ReadReservationsAsync(authority.Lease.Fence, cancellationToken).ConfigureAwait(false);
+        var sample = await quota.ReadAsync(cancellationToken).ConfigureAwait(false);
+        if (sample is null || inspector.EstimateReservedLaunchHeadroom(task, inventory, sample, reservations,
+                deploymentInventory.Values.ToArray(), launch).LaunchSlots is not > 0)
+        {
+            return;
+        }
+        _ = await dispatcher.DispatchPlannedAsync(authority.Lease, authority.Clock, key, envelope.IntentId,
+            Effects, sample.ValidUntil, ownershipLost, cancellationToken).ConfigureAwait(false);
     }
 
     public async Task CleanupAsync(ActiveControllerAuthority authority, CatalogProfile catalog, ExecutorSnapshot executor,
@@ -169,6 +194,10 @@ internal sealed class FargateRunnerBackend(
     private RunnerBackendResource? ProjectResource(FargateInventorySnapshot inventory, FargateTaskObservation task,
         FargateResolvedTask? preflight)
     {
+        if (task.IsForeign)
+        {
+            return null;
+        }
         if (!inventory.IsProfileComplete || task.AllocationId is not Guid allocation ||
             task.Incarnation is not Guid incarnation || task.TaskDefinitionArn != inventory.Scope.TaskDefinitionArn)
         {

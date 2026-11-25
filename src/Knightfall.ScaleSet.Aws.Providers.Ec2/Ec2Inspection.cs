@@ -1,5 +1,6 @@
 using System.Collections.Immutable;
 using Knightfall.ScaleSet.Aws.Core.Configuration;
+using Knightfall.ScaleSet.Aws.Core.Lifecycle;
 
 namespace Knightfall.ScaleSet.Aws.Providers.Ec2;
 
@@ -19,6 +20,7 @@ public enum Ec2PreflightStatus
     PlacementIncompatible = 11,
     AwsIdentityMismatch = 12,
     InstanceTypeIncompatible = 13,
+    StatusQualificationMismatch = 14,
 }
 
 public sealed record Ec2PreflightSubnet(string SubnetId, string AvailabilityZone, int? AvailableIpAddresses);
@@ -71,6 +73,18 @@ public sealed record Ec2InventoryEntry(
     public Ec2InstanceState State => IsAuthoritative && Incarnation.HasValue ? ReportedState : Ec2InstanceState.Unknown;
 
     public string? InstanceProfileArn { get; init; }
+    public string? ImageId { get; init; }
+    public bool HasPrimaryInterface { get; init; }
+
+    /// <summary>Corroborates a retained executor when a terminal instance has lost its primary interface.</summary>
+    public bool CorroboratesTerminal(ExecutorBinding binding, string account, string region, DateTimeOffset observedAt) =>
+        IsAuthoritative && ReportedState == Ec2InstanceState.Terminated && binding is { Provider: Ec2ExecutorIdentity identity } &&
+        ResourceArn == binding.ResourceArn && AllocationId?.ToString("D") == binding.AllocationId &&
+        LaunchTemplateId == identity.LaunchTemplateId && LaunchTemplateVersion == identity.LaunchTemplateVersion &&
+        identity.InstanceLaunchTime <= observedAt &&
+        (OriginalLaunchTime == identity.InstanceLaunchTime || (OriginalLaunchTime is null && !HasPrimaryInterface)) &&
+        binding.Incarnation == Ec2ExecutorIncarnation.Compute(account, region, InstanceId, identity.InstanceLaunchTime,
+            identity.LaunchTemplateVersion);
 }
 
 public sealed record Ec2InventorySnapshot(

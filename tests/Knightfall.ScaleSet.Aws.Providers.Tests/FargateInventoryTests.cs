@@ -325,16 +325,46 @@ public sealed class FargateInventoryTests
     }
 
     [Fact]
+    public async Task PlanningKeepsAmbiguousStandaloneTasksAndExcludesPositiveForeignIdentities()
+    {
+        var token = TestContext.Current.CancellationToken;
+        var knownService = TaskRow(SecondTask);
+        knownService["group"] = "service:unrelated";
+        var peerRunner = TaskRow(ThirdTask, OtherAllocation);
+        var profileTag = peerRunner["tags"]!.AsArray().Single(tag => tag!["key"]!.GetValue<string>() == RunnerOwnershipTags.Profile);
+        profileTag!["value"] = "another-profile";
+        using var aws = new FargateInspectionFixture
+        {
+            ListTasks = query => query.GetProperty("desiredStatus").GetString() == "STOPPED" ? ListReply([]) :
+                ListReply([FirstTask, SecondTask, ThirdTask]),
+            DescribeTasks = _ => TasksReply(TaskRow(FirstTask), knownService, peerRunner),
+        };
+
+        var configuration = await ConfigurationAsync(token);
+        var inventory = await aws.Inspector.ReadInventoryAsync(configuration, Profile, token);
+        Assert.True(inventory.IsProfileComplete);
+        Assert.Equal(3, inventory.ForeignSubnetOccupancy);
+        var planning = inventory.ToPlanningInventory(new FargateHeadroom(2, 1, 1));
+        var ambiguous = Assert.Single(planning.Slots);
+        Assert.Equal(FirstTask, ambiguous.Id);
+        Assert.False(ambiguous.OwnershipVerified);
+        Assert.Equal(2, planning.BackendCapacityCeiling);
+        Assert.All(inventory.Tasks.Where(task => task.ResourceArn != FirstTask), task => Assert.True(task.IsForeign));
+    }
+
+    [Fact]
     public async Task HeadroomSubtractsUnattachedPendingOnceAndLeavesForeignTasksOutsideProfileSlots()
     {
         var token = TestContext.Current.CancellationToken;
         var pending = Guid.Parse("10203040-5060-7080-90a0-b0c0d0e0f001");
+        var unrelatedService = TaskRow(ThirdTask);
+        unrelatedService["group"] = "service:unrelated";
         using var aws = new FargateInspectionFixture
         {
             ListTasks = query => query.GetProperty("desiredStatus").GetString() == "STOPPED" ? ListReply([]) :
                 ListReply([FirstTask, SecondTask, ThirdTask]),
             DescribeTasks = _ => TasksReply(TaskRow(FirstTask, FirstAllocation), TaskRow(SecondTask, pending, state: "PENDING", attachedSubnet: null),
-                TaskRow(ThirdTask)),
+                unrelatedService),
         };
         var config = await ConfigurationAsync(token);
         var inventory = await aws.Inspector.ReadInventoryAsync(config, Profile, token);
@@ -425,6 +455,127 @@ public sealed class FargateInventoryTests
     }
 
     [Fact]
+    public async Task UnchangedRunningAttachmentReusesQuotaSampleTakenBetweenFullPolls()
+    {
+        var token = TestContext.Current.CancellationToken;
+        using var aws = new FargateInspectionFixture
+        {
+            Ip1 = 1,
+            Ip2 = 0,
+            ListTasks = query => query.GetProperty("desiredStatus").GetString() == "STOPPED" ? ListReply([]) : ListReply([FirstTask]),
+            DescribeTasks = _ => TasksReply(TaskRow(FirstTask, FirstAllocation)),
+        };
+        var config = await ConfigurationAsync(token);
+        var first = await aws.Inspector.ReadInventoryAsync(config, Profile, token);
+        aws.UtcNow = Now.AddSeconds(1);
+        var quota = new FargateQuotaEvidence(Account, Region, aws.UtcNow, Now.AddMinutes(5), 1024, 0);
+        aws.UtcNow = Now.AddSeconds(2);
+        var second = await aws.Inspector.ReadInventoryAsync(config, Profile, first, token);
+        Assert.True(first.IsProfileComplete);
+        Assert.True(second.IsProfileComplete);
+        Assert.Equal(Now.AddSeconds(2), Assert.Single(second.Tasks).AttachmentObservedAt);
+
+        aws.UtcNow = Now.AddSeconds(3);
+        var task = Assert.IsType<FargateResolvedTask>((await aws.Inspector.ResolvePreflightAsync(config, Profile, Approval, token)).Task);
+        Assert.Equal(1024, task.CpuUnits);
+        var running = new FargateLaunchReservation(FirstAllocation, task.CpuUnits, [Subnet1], FirstTask) { Scope = task.Scope };
+        Assert.Equal(new FargateHeadroom(1, 1, 1), aws.Inspector.EstimateHeadroom(task, second, quota, [running]));
+        Assert.Equal(new FargateHeadroom(1, 0, 0), aws.Inspector.EstimateHeadroom(task, second,
+            quota with { ObservedAt = Now }, [running]));
+
+        var launch = FargateProfileInspector.CreateLaunchRequest(task, OtherAllocation, [Subnet1]);
+        var own = new FargateLaunchReservation(OtherAllocation, task.CpuUnits, [Subnet1]) { Scope = task.Scope };
+        var peer = new FargateLaunchReservation(Guid.Parse("20112233-4455-6677-8899-aabbccddeeff"), task.CpuUnits, [Subnet2])
+        {
+            Scope = task.Scope with { ProfileId = "peer-shell" },
+        };
+        Assert.Equal(new FargateHeadroom(1, 1, 1),
+            aws.Inspector.EstimateReservedLaunchHeadroom(task, second, quota, [running, own], [], launch));
+        Assert.Equal(new FargateHeadroom(1, 0, 0),
+            aws.Inspector.EstimateReservedLaunchHeadroom(task, second, quota, [running, own, peer], [], launch));
+    }
+
+    [Theory]
+    [InlineData("new")]
+    [InlineData("interface changed")]
+    [InlineData("attachment changed")]
+    [InlineData("ambiguous")]
+    [InlineData("still pending")]
+    [InlineData("version regressed")]
+    [InlineData("incomplete poll")]
+    [InlineData("restart")]
+    public async Task MissingOrDiscontinuousAttachmentEvidenceKeepsQuotaReserved(string interruption)
+    {
+        var token = TestContext.Current.CancellationToken;
+        var row = interruption switch
+        {
+            "new" => TaskRow(FirstTask, FirstAllocation, "PENDING", attachedSubnet: null),
+            "still pending" => TaskRow(FirstTask, FirstAllocation, "PENDING"),
+            _ => TaskRow(FirstTask, FirstAllocation),
+        };
+        if (interruption != "new")
+        {
+            row["attachments"]![0]!["id"] = "previous-attachment";
+            row["version"] = 2;
+        }
+        using var aws = new FargateInspectionFixture
+        {
+            Ip1 = 1,
+            Ip2 = 0,
+            ListTasks = query => query.GetProperty("desiredStatus").GetString() == "STOPPED" ? ListReply([]) : ListReply([FirstTask]),
+            DescribeTasks = _ => TasksReply(row),
+        };
+        var config = await ConfigurationAsync(token);
+        var first = await aws.Inspector.ReadInventoryAsync(config, Profile, token);
+        Assert.True(first.IsProfileComplete);
+        aws.UtcNow = Now.AddSeconds(1);
+        var quota = new FargateQuotaEvidence(Account, Region, aws.UtcNow, Now.AddMinutes(5), 1024, 0);
+        aws.UtcNow = Now.AddSeconds(2);
+        row = TaskRow(FirstTask, FirstAllocation, state: interruption == "still pending" ? "PENDING" : "RUNNING");
+        var attachment = row["attachments"]![0]!;
+        attachment["id"] = interruption == "attachment changed" ? "new-attachment" : "previous-attachment";
+        row["version"] = interruption == "version regressed" ? 1 : 2;
+        if (interruption == "interface changed")
+        {
+            attachment["details"]![1]!["value"] = "eni-0123456789abcdef1";
+        }
+        if (interruption == "ambiguous")
+        {
+            var duplicate = attachment.DeepClone();
+            duplicate["status"] = "ATTACHING";
+            row["attachments"]!.AsArray().Add(duplicate);
+        }
+        var previous = interruption switch
+        {
+            "restart" => null,
+            "incomplete poll" => first with { Status = FargateInventoryStatus.Incomplete },
+            _ => first,
+        };
+        var second = await aws.Inspector.ReadInventoryAsync(config, Profile, previous, token);
+        Assert.True(second.IsProfileComplete);
+        Assert.True(Assert.Single(second.Tasks).IsOwned);
+
+        aws.UtcNow = Now.AddSeconds(3);
+        var task = Assert.IsType<FargateResolvedTask>((await aws.Inspector.ResolvePreflightAsync(config, Profile, Approval, token)).Task);
+        var running = new FargateLaunchReservation(FirstAllocation, 1024, [Subnet1], FirstTask) { Scope = task.Scope };
+        var held = aws.Inspector.EstimateHeadroom(task, second, quota, [running]);
+        Assert.Equal(0, held.QuotaSlots);
+        Assert.Equal(0, held.LaunchSlots);
+        if (interruption is "ambiguous" or "version regressed")
+        {
+            // Even a later quota sample needs a proven attachment before returning reservations.
+            Assert.Equal(new FargateHeadroom(0, 0, 0),
+                aws.Inspector.EstimateHeadroom(task, second, quota with { ObservedAt = aws.UtcNow }, [running]));
+        }
+        if (interruption == "still pending")
+        {
+            // The current ENI proves IP use, and CPU remains reserved until the task is running.
+            Assert.Equal(new FargateHeadroom(1, 0, 0),
+                aws.Inspector.EstimateHeadroom(task, second, quota with { ObservedAt = aws.UtcNow }, [running]));
+        }
+    }
+
+    [Fact]
     public async Task QuotaAndSubnetHeadroomPreserveUnknownAndVerifiedZero()
     {
         var token = TestContext.Current.CancellationToken;
@@ -496,5 +647,31 @@ public sealed class FargateInventoryTests
         var outside = peerScope with { Deployment = "other-deployment" };
         Assert.Equal(held, aws.Inspector.EstimateHeadroom(approved, inventory, quota,
             [reservation with { Scope = outside }], [peer with { Scope = outside }]));
+    }
+
+    [Fact]
+    public async Task PlannedLaunchGetsOnlyItsOwnReservationBackAndHoldsKnownZeroOrExpiredQuota()
+    {
+        var token = TestContext.Current.CancellationToken;
+        using var aws = new FargateInspectionFixture { Ip1 = 1, Ip2 = 1 };
+        var configuration = await ConfigurationAsync(token);
+        var inventory = await aws.Inspector.ReadInventoryAsync(configuration, Profile, token);
+        var task = Assert.IsType<FargateResolvedTask>((await aws.Inspector.ResolvePreflightAsync(configuration, Profile, Approval, token)).Task);
+        var request = FargateProfileInspector.CreateLaunchRequest(task, FirstAllocation, [Subnet1]);
+        var own = new FargateLaunchReservation(FirstAllocation, task.CpuUnits, [Subnet1]) { Scope = task.Scope };
+        var peer = own with { AllocationId = OtherAllocation, Scope = task.Scope with { ProfileId = "other" } };
+        var quota = new FargateQuotaEvidence(Account, Region, Now, Now.AddMinutes(30), task.CpuUnits, 0);
+
+        Assert.Equal(0, aws.Inspector.EstimateHeadroom(task, inventory, quota, [own]).LaunchSlots);
+        Assert.Equal(1, Reserved(quota, [own]));
+        Assert.Equal(0, Reserved(quota with { RemainingCpuUnits = 0 }, [own]));
+        Assert.Equal(0, Reserved(quota, [own, peer]));
+        Assert.Null(Reserved(quota with { ObservedAt = Now.AddMinutes(-11) }, [own]));
+        Assert.Null(Reserved(quota, [own with { Scope = peer.Scope }]));
+        Assert.Equal(Now.AddMinutes(10), quota.ValidUntil);
+        Assert.Equal(Now.AddMinutes(1), (quota with { ExpiresAt = Now.AddMinutes(1) }).ValidUntil);
+
+        int? Reserved(FargateQuotaEvidence sample, IReadOnlyCollection<FargateLaunchReservation> reservations) =>
+            aws.Inspector.EstimateReservedLaunchHeadroom(task, inventory, sample, reservations, [], request).LaunchSlots;
     }
 }

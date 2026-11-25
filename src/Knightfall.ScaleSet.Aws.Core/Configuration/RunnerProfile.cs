@@ -77,7 +77,12 @@ public sealed record Ec2ProvisionerConfiguration(
     string? InstanceType,
     Ec2Tenancy? Tenancy,
     Ec2SubnetStrategy? SubnetStrategy)
-    : RunnerProvisionerConfiguration(RunnerProvisionerType.Ec2, Network, BootstrapRoleArn, BootstrapProtocol);
+    : RunnerProvisionerConfiguration(RunnerProvisionerType.Ec2, Network, BootstrapRoleArn, BootstrapProtocol)
+{
+    public Ec2StatusQualification? StatusQualification { get; init; }
+}
+
+public sealed record Ec2StatusQualification(string ImageId, string RoleId, string EvidenceSha256);
 
 public sealed record FargateProvisionerConfiguration(
     string Network,

@@ -6,7 +6,9 @@ using Knightfall.ScaleSet.Aws.Core.Configuration;
 using Knightfall.ScaleSet.Aws.Core.Lifecycle;
 using Knightfall.ScaleSet.Aws.DynamoDb;
 using Knightfall.ScaleSet.Aws.Handoff;
+using Knightfall.ScaleSet.Aws.Providers.Fargate;
 using Knightfall.ScaleSet.Aws.Telemetry.Tests;
+using Knightfall.ScaleSet.Aws.Lifecycle.Tests;
 using Xunit;
 
 namespace Knightfall.ScaleSet.Aws.IntegrationTests;
@@ -14,6 +16,188 @@ namespace Knightfall.ScaleSet.Aws.IntegrationTests;
 [Collection(nameof(GitHubLifecycleIntegrationTests))]
 public sealed class MixedControllerIntegrationTests(ITestOutputHelper output)
 {
+    [Fact]
+    public async Task FargateReserveStaysAtOneWithoutDemandAndReplacesAnExactStoppedTaskOnce()
+    {
+        using var deadline = CancellationTokenSource.CreateLinkedTokenSource(TestContext.Current.CancellationToken);
+        deadline.CancelAfter(TimeSpan.FromSeconds(55));
+        var token = deadline.Token;
+        await using var fixture = await MixedRuntimeFixture.CreateAsync("fargate", token, warmFargateMaximum: 24);
+        string taskArn = await fixture.StartControllerTaskAsync(token);
+        foreach (var profile in fixture.Profiles.Values)
+        {
+            profile.GitHub.TotalAssignedJobs = 0;
+        }
+        await using var worker = MixedControllerProcess.Start(fixture, taskArn, telemetryEndpoint: null);
+        string deployment = ControllerLeaseRecoveryCoordinator.DeploymentKey(fixture.Configuration);
+        var first = await WaitForRunnerAsync(fixture, deployment, fixture.Configuration.Profiles[0], token);
+        var unaffected = await WaitForRunnerAsync(fixture, deployment, fixture.Configuration.Profiles[1], token);
+        await WaitForFargateInventoryPassesAsync(fixture, token);
+        Assert.Equal(2, fixture.Cloud.Calls.Count(call => call is { Service: "ecs", Operation: "RunTask" }));
+        var provider = Assert.IsType<FargateExecutorIdentity>(first.Binding.Provider);
+        await fixture.Cloud.StopControllerTaskAsync(provider.ClusterArn, first.Binding.ResourceArn, token);
+
+        await WaitAsync(async () =>
+        {
+            var prior = await fixture.Store.ReadExecutorAsync(first.Binding.Profile, first.Binding.AllocationId, token);
+            var current = await fixture.Store.ReadExecutorInventoryAsync(first.Binding.Profile, token);
+            return prior?.State.Resource?.State == ExecutorResourceState.IrreversiblyTerminated &&
+                current.Executors is [{ State.Resource.State: ExecutorResourceState.Running } replacement] &&
+                replacement.Binding.AllocationId != first.Binding.AllocationId;
+        }, "one replacement for the exact stopped allocation", token);
+        await WaitForFargateInventoryPassesAsync(fixture, token);
+        Assert.Equal(3, fixture.Cloud.Calls.Count(call => call is { Service: "ecs", Operation: "RunTask" }));
+        var peer = await fixture.Store.ReadExecutorInventoryAsync(unaffected.Binding.Profile, token);
+        Assert.Equal(unaffected.Binding, Assert.Single(peer.Executors).Binding);
+    }
+
+    [Fact]
+    public async Task FullFargateWarmReserveAcquiresOneOfferAfterRestartAndHoldsUncorroboratedReadiness()
+    {
+        using var deadline = CancellationTokenSource.CreateLinkedTokenSource(TestContext.Current.CancellationToken);
+        deadline.CancelAfter(TimeSpan.FromSeconds(110));
+        var token = deadline.Token;
+        await using var fixture = await MixedRuntimeFixture.CreateAsync("fargate", token, warmFargateMaximum: 1);
+        string deployment = ControllerLeaseRecoveryCoordinator.DeploymentKey(fixture.Configuration);
+        string formerTask = await fixture.StartControllerTaskAsync(token);
+        string successorTask = await fixture.StartControllerTaskAsync(token);
+        var availableProfile = fixture.Configuration.Profiles[0];
+        var uncertainProfile = fixture.Configuration.Profiles[1];
+        var available = fixture.Profiles[availableProfile.Id].GitHub;
+        var uncertain = fixture.Profiles[uncertainProfile.Id].GitHub;
+
+        await using var former = MixedControllerProcess.Start(fixture, formerTask, telemetryEndpoint: null);
+        var warm = await WaitForRunnerAsync(fixture, deployment, availableProfile, token);
+        var other = await WaitForRunnerAsync(fixture, deployment, uncertainProfile, token);
+        long warmId = await RegisterSimulatedRunnerAsync(fixture, warm, token);
+        long uncertainId = await RegisterSimulatedRunnerAsync(fixture, other, token);
+        available.MarkRunnerListening(warmId);
+        var formerSession = Assert.IsType<Guid>(available.SessionId);
+        var formerLease = Assert.IsType<ControllerLease>(await fixture.Store.ReadLeaseAsync(deployment, token));
+        await former.KillAsync(token);
+        await fixture.Cloud.StopControllerTaskAsync(fixture.ControllerCluster, formerTask, token);
+
+        await using var successor = MixedControllerProcess.Start(fixture, successorTask, telemetryEndpoint: null);
+        await WaitAsync(async () => await fixture.Store.ReadLeaseAsync(deployment, token) is
+            { Mode: ControllerLeaseMode.Active } owner && owner.Epoch > formerLease.Epoch && owner.OwnerTaskArn == successorTask &&
+            available.SessionId is Guid session && session != formerSession &&
+            await successor.ReadyAsync(token) == HttpStatusCode.OK, "restarted controller and successor listener session", token);
+
+        // A registered local runner without a listening process supplies no idle evidence.
+        const long noIdle = 8_334_502_001;
+        await OfferAndWaitForAckAsync(uncertain, noIdle);
+        Assert.Null(await fixture.Store.ReadRecordAsync(LifecycleKey.Acquisition(other.Binding.Profile, noIdle), token));
+
+        // Even with the same positive idle aggregate, the remote runner must be the locally bound one.
+        uncertain.ReplaceWithUnownedIdleRunner(uncertainId);
+        const long foreignIdle = 8_334_502_002;
+        await OfferAndWaitForAckAsync(uncertain, foreignIdle);
+        Assert.Contains(uncertain.Requests, request => request.Method == "GET" &&
+            request.Path == FormattableString.Invariant($"{GitHubSimulator.Runners}/{uncertainId}"));
+        Assert.Null(await fixture.Store.ReadRecordAsync(LifecycleKey.Acquisition(other.Binding.Profile, foreignIdle), token));
+        Assert.Empty(uncertain.AcquiredRequests);
+
+        const long accepted = 8_334_502_003;
+        const long held = 8_334_502_004;
+        await OfferAndWaitForAckAsync(available, accepted);
+        Assert.NotNull(await fixture.Store.ReadRecordAsync(LifecycleKey.Acquisition(warm.Binding.Profile, accepted), token));
+        await OfferAndWaitForAckAsync(available, accepted, held);
+        Assert.Null(await fixture.Store.ReadRecordAsync(LifecycleKey.Acquisition(warm.Binding.Profile, held), token));
+        Assert.Equal([accepted], available.AcquiredRequests);
+        Assert.Single(available.Requests, request => request.Method == "POST" &&
+            request.Path.EndsWith("/acquirejobs", StringComparison.Ordinal));
+        Assert.DoesNotContain(uncertain.Requests, request => request.Method == "POST" &&
+            request.Path.EndsWith("/acquirejobs", StringComparison.Ordinal));
+
+        await WaitForFargateInventoryPassesAsync(fixture, token);
+        Assert.Equal(2, fixture.Cloud.Calls.Count(call => call is { Service: "ecs", Operation: "RunTask" }));
+        var retained = await fixture.Store.ReadExecutorInventoryAsync(warm.Binding.Profile, token);
+        Assert.Equal(warm.Binding, Assert.Single(retained.Executors).Binding);
+
+        async Task OfferAndWaitForAckAsync(GitHubSimulator github, params long[] requests)
+        {
+            var session = Assert.IsType<Guid>(github.SessionId);
+            long message = github.Offer(requests);
+            string path = FormattableString.Invariant($"/messages/{session:D}/{message}");
+            await WaitAsync(() => Task.FromResult(github.Requests.Any(request => request.Method == "DELETE" &&
+                request.Host == github.Address.QueueHost && request.Path == path)), $"listener ACK for {message}", token);
+        }
+    }
+
+    [Theory]
+    [InlineData(0, 0)]
+    [InlineData(1024, 1)]
+    [InlineData(32768, 2)]
+    public async Task SharedFargateClusterKeepsProfileCapsIndependentAndAccountsForRegionalHeadroom(int availableCpu, int expectedStarts)
+    {
+        using var deadline = CancellationTokenSource.CreateLinkedTokenSource(TestContext.Current.CancellationToken);
+        bool refresh = availableCpu == 1024;
+        deadline.CancelAfter(TimeSpan.FromSeconds(refresh ? 75 : 45));
+        var token = deadline.Token;
+        await using var fixture = await MixedRuntimeFixture.CreateAsync("fargate", token,
+            sharedFargateCluster: true, remainingFargateCpuUnits: availableCpu);
+        string taskArn = await fixture.StartControllerTaskAsync(token);
+        string unrelatedTaskArn = await fixture.StartUnrelatedServiceTaskAsync(token);
+        var profiles = fixture.Configuration.Profiles;
+        Assert.Equal(2, profiles.Length);
+        Assert.All(profiles, profile => Assert.Equal(1, profile.Capacity.MaxRunners));
+        Assert.Single(profiles.Select(profile => Assert.IsType<FargateProvisionerConfiguration>(profile.Provisioner).Cluster).Distinct());
+        Assert.Empty(profiles[0].GitHub.Labels.Intersect(profiles[1].GitHub.Labels, StringComparer.Ordinal));
+        foreach (var profile in fixture.Profiles.Values)
+        {
+            profile.GitHub.TotalAssignedJobs = 1;
+        }
+
+        if (refresh)
+        {
+            fixture.EnableRefreshableQuota();
+            var stale = TimeProvider.System.GetUtcNow().AddMinutes(-11);
+            fixture.Cloud.PublishQuota(new FargateQuotaEvidence(MixedControllerCloud.Account, MixedControllerCloud.Region,
+                stale, stale.AddMinutes(15), availableCpu, 0));
+        }
+        await using var worker = MixedControllerProcess.Start(fixture, taskArn, telemetryEndpoint: null);
+        if (refresh)
+        {
+            await WaitAsync(() => Task.FromResult(
+                fixture.Cloud.Calls.Any(call => call is { Service: "s3", Operation: "GetQuota" }) &&
+                fixture.Cloud.Calls.Count(call => call is { Service: "ecs", Operation: "ListTasks" }) >= 8),
+                "shared-cluster passes with expired quota", token);
+            Assert.Equal(HttpStatusCode.ServiceUnavailable, await worker.ReadyAsync(token));
+            Assert.DoesNotContain(fixture.Cloud.Calls, call => call is { Service: "ecs", Operation: "RunTask" });
+            var now = TimeProvider.System.GetUtcNow();
+            fixture.Cloud.PublishQuota(new FargateQuotaEvidence(MixedControllerCloud.Account, MixedControllerCloud.Region,
+                now, now.AddMinutes(10), availableCpu, 0));
+        }
+        await WaitAsync(async () => await worker.ReadyAsync(token) == HttpStatusCode.OK, "shared-cluster profiles ready", token);
+        string deployment = ControllerLeaseRecoveryCoordinator.DeploymentKey(fixture.Configuration);
+        var profileKeys = profiles.Select(profile => new LifecycleProfile(deployment, profile.Id)).ToArray();
+        await WaitAsync(async () =>
+        {
+            var samples = await Task.WhenAll(profileKeys.Select(key => fixture.Store.ReadExecutorInventoryAsync(key, token)));
+            return samples.Sum(sample => sample.Executors.Count(row => row.State.Resource?.State == ExecutorResourceState.Running)) == expectedStarts;
+        }, "expected number of shared-cluster runners", token);
+        await WaitForFargateInventoryPassesAsync(fixture, token);
+
+        Assert.Equal(expectedStarts, fixture.Cloud.Calls.Count(call => call is { Service: "ecs", Operation: "RunTask" }));
+        foreach (var key in profileKeys)
+        {
+            var inventory = await fixture.Store.ReadExecutorInventoryAsync(key, token);
+            Assert.InRange(inventory.Executors.Length, 0, 1);
+            Assert.All(inventory.Executors, row =>
+            {
+                Assert.NotEqual(taskArn, row.Binding.ResourceArn);
+                Assert.NotEqual(unrelatedTaskArn, row.Binding.ResourceArn);
+            });
+        }
+    }
+
+    private static Task WaitForFargateInventoryPassesAsync(MixedRuntimeFixture fixture, CancellationToken token)
+    {
+        int inventoryRequests = fixture.Cloud.Calls.Count(call => call is { Service: "ecs", Operation: "ListTasks" });
+        return WaitAsync(() => Task.FromResult(fixture.Cloud.Calls.Count(call =>
+            call is { Service: "ecs", Operation: "ListTasks" }) >= inventoryRequests + 8), "repeated Fargate reconciliation", token);
+    }
+
     [Theory]
     [InlineData("ec2")]
     [InlineData("fargate")]
@@ -238,11 +422,28 @@ public sealed class MixedControllerIntegrationTests(ITestOutputHelper output)
     {
         var running = await WaitForRunnerAsync(fixture, deployment, profile, token);
         var simulated = fixture.Profiles[profile.Id];
+        long runnerId = await RegisterSimulatedRunnerAsync(fixture, running, token);
+        long cursor = simulated.GitHub.StartJob(requestId, runnerId);
+        ExecutorSnapshot? started = null;
+        await WaitAsync(async () =>
+        {
+            started = await fixture.Store.ReadExecutorAsync(running.Binding.Profile, running.Binding.AllocationId, token);
+            return started?.State.Job is { Phase: ExecutorJobPhase.Started } job && job.RunnerId == runnerId && job.RequestId == requestId &&
+                simulated.GitHub.Requests.Any(request => request.Method == "DELETE" && request.Host == simulated.GitHub.Address.QueueHost &&
+                    request.Path.EndsWith(FormattableString.Invariant($"/{cursor}"), StringComparison.Ordinal));
+        }, "durable JobStarted and released listener ACK", token);
+        return started!;
+    }
+
+    private static async Task<long> RegisterSimulatedRunnerAsync(MixedRuntimeFixture fixture, ExecutorSnapshot running, CancellationToken token)
+    {
+        var simulated = fixture.Profiles[running.Binding.Profile.ProfileId];
         string resource = running.Binding.ResourceArn;
         string principal = simulated.BootstrapRoleId + ":" + resource[(resource.LastIndexOf('/') + 1)..];
         var bootstrap = new DynamoDbBootstrapOfferClient(fixture.Table.Client, fixture.Table.Name, principal, resource, TimeProvider.System);
         using var recipient = JitRecipientKey.Create();
-        Assert.Equal(LifecycleWriteOutcome.Committed, await bootstrap.RegisterHelloAsync(recipient.Hello, token));
+        Assert.Equal(LifecycleWriteOutcome.Committed, await BrokerHelloFixture.RegisterAsync(fixture.Table.Client,
+            fixture.Table.Name, principal, recipient.Hello, TimeProvider.System, token));
         BootstrapOfferReceipt? receipt = null;
         await WaitAsync(async () =>
         {
@@ -255,17 +456,7 @@ public sealed class MixedControllerIntegrationTests(ITestOutputHelper output)
         {
             Assert.True(jit.Bytes.SequenceEqual(Encoding.UTF8.GetBytes(GitHubSimulator.Jit)));
         }
-        long runnerId = Assert.IsType<long>(simulated.GitHub.RegisteredRunnerId);
-        long cursor = simulated.GitHub.StartJob(requestId, runnerId);
-        ExecutorSnapshot? started = null;
-        await WaitAsync(async () =>
-        {
-            started = await fixture.Store.ReadExecutorAsync(running.Binding.Profile, running.Binding.AllocationId, token);
-            return started?.State.Job is { Phase: ExecutorJobPhase.Started } job && job.RunnerId == runnerId && job.RequestId == requestId &&
-                simulated.GitHub.Requests.Any(request => request.Method == "DELETE" && request.Host == simulated.GitHub.Address.QueueHost &&
-                    request.Path.EndsWith(FormattableString.Invariant($"/{cursor}"), StringComparison.Ordinal));
-        }, "durable JobStarted and released listener ACK", token);
-        return started!;
+        return Assert.IsType<long>(simulated.GitHub.RegisteredRunnerId);
     }
 
     private static async Task<ExecutorSnapshot> WaitForRunnerAsync(MixedRuntimeFixture fixture, string deployment, RunnerProfile profile,

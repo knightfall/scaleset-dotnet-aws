@@ -1,5 +1,11 @@
 # scaleset-dotnet-aws
 
+[![CI](https://github.com/knightfall/scaleset-dotnet-aws/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/knightfall/scaleset-dotnet-aws/actions/workflows/ci.yml)
+[![Controller release candidate](https://github.com/knightfall/scaleset-dotnet-aws/actions/workflows/release-candidate.yml/badge.svg?branch=main)](https://github.com/knightfall/scaleset-dotnet-aws/actions/workflows/release-candidate.yml)
+[![GitHub release](https://img.shields.io/github/v/release/knightfall/scaleset-dotnet-aws?include_prereleases)](https://github.com/knightfall/scaleset-dotnet-aws/releases)
+[![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/knightfall/scaleset-dotnet-aws/badge)](https://scorecard.dev/viewer/?uri=github.com/knightfall/scaleset-dotnet-aws)
+[![Apache 2.0 license](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+
 A .NET 10 controller for GitHub Actions runner scale sets on AWS. The controller
 runs on ECS Fargate and provisions ephemeral runners on Direct EC2 or standalone
 Fargate tasks using the released `Knightfall.ScaleSet.Client` and
@@ -19,6 +25,15 @@ required in each target environment.
   dependencies, deliverables, and acceptance criteria.
 - [Agent instructions](AGENTS.md): repository layout and engineering conventions.
 
+## Get the controller
+
+[GitHub Releases](https://github.com/knightfall/scaleset-dotnet-aws/releases)
+is the distribution point for versioned Linux amd64 and arm64 controller OCI
+archives, image SBOMs, advisory reports, and verification evidence. For a source build, use the
+[local image instructions](docs/controller-local.md#build-the-oci-archives).
+See [verify a release](docs/releases/VERIFYING.md) before importing an image
+and [publish a release](docs/releases/PUBLISHING.md) for the maintainer process.
+
 ## Operate a deployment
 
 - Use the [operator runbook](docs/operator-runbook.md) to prepare, apply, roll back, and decommission a deployment.
@@ -37,8 +52,8 @@ make check
 
 CI uses the same command to restore locked dependencies, build and test the .NET
 solution in Release, check CDK linting, formatting, and types, run the CDK tests,
-and synthesize the CDK baseline offline. The lifecycle tests run against a pinned
-MiniStack process on loopback and require Python 3.11 or newer. To select a local
+and synthesize the CDK baseline and matrix offline. The lifecycle and integration
+tests start pinned MiniStack processes on loopback and require Python 3.11 or newer. To select a local
 interpreter, run `make check MINISTACK_PYTHON=python3.11`.
 
 The standalone `make check-integration` target also exercises the YAML emitter.
@@ -54,7 +69,8 @@ npm --prefix cdk run config:emit -- ../testdata/config/ec2-only-latest.yaml /tmp
 ```
 
 The compiler prints the SHA-256 of the exact UTF-8 file it writes. It applies
-`dry-run` mode and no demand source by default. Specify pinned GitHub
+`dry-run` mode and no demand source by default. This example configures a demand
+snapshot and requests AWS inspection when reconciled. Specify pinned GitHub
 scale-set IDs and EC2 launch-template versions as quoted positive decimal
 strings to preserve their precision.
 

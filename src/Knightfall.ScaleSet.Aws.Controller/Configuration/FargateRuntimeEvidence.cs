@@ -1,13 +1,15 @@
 using System.Collections.Frozen;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using System.Text.RegularExpressions;
 using Knightfall.ScaleSet.Aws.Core.Configuration;
 using Knightfall.ScaleSet.Aws.Providers.Fargate;
 
 namespace Knightfall.ScaleSet.Aws.Controller.Configuration;
 
-internal sealed class FargateRuntimeEvidence(
-    FrozenDictionary<string, FargateContainerApproval> profiles, FargateQuotaEvidence? quota)
+internal sealed partial class FargateRuntimeEvidence(
+    FrozenDictionary<string, FargateContainerApproval> profiles, FargateQuotaEvidence? quota,
+    FargateQuotaObject? quotaSource = null)
 {
     internal const string EnvironmentVariable = "SCALESET_FARGATE_PREFLIGHT";
     private static readonly JsonSerializerOptions Json = new(JsonSerializerDefaults.Web)
@@ -19,6 +21,8 @@ internal sealed class FargateRuntimeEvidence(
     };
 
     internal FargateQuotaEvidence? Quota { get; } = quota;
+
+    internal FargateQuotaObject? QuotaSource { get; } = quotaSource;
 
     internal FargateContainerApproval? ForProfile(string profileId) => profiles.GetValueOrDefault(profileId);
 
@@ -56,11 +60,33 @@ internal sealed class FargateRuntimeEvidence(
         {
             throw InvalidEvidence();
         }
+        if (evidence.QuotaSource is { } source && !IsValidSource(source))
+        {
+            throw InvalidEvidence();
+        }
 
-        return new FargateRuntimeEvidence(approvals.ToFrozenDictionary(StringComparer.Ordinal), evidence.Quota);
+        return new FargateRuntimeEvidence(approvals.ToFrozenDictionary(StringComparer.Ordinal), evidence.Quota,
+            evidence.QuotaSource);
     }
+
+    internal static FargateQuotaEvidence? ReadQuota(ReadOnlySpan<byte> sample) =>
+        JsonSerializer.Deserialize<FargateQuotaEvidence>(sample, Json);
 
     private static ArgumentException InvalidEvidence() => new("Fargate preflight evidence is invalid for the configured deployment.");
 
-    private sealed record Payload(Dictionary<string, FargateContainerApproval> Profiles, FargateQuotaEvidence? Quota);
+    private static bool IsValidSource(FargateQuotaObject source) =>
+        source.Bucket is not null && BucketName().IsMatch(source.Bucket) &&
+        source.Key is not null && ObjectKey().IsMatch(source.Key) &&
+        !source.Key.Split('/').Any(segment => segment is "" or "." or "..");
+
+    [GeneratedRegex(@"\A[a-z0-9][a-z0-9-]{1,61}[a-z0-9]\z", RegexOptions.CultureInvariant)]
+    private static partial Regex BucketName();
+
+    [GeneratedRegex(@"\A[A-Za-z0-9][A-Za-z0-9._/-]{0,511}\z", RegexOptions.CultureInvariant)]
+    private static partial Regex ObjectKey();
+
+    private sealed record Payload(Dictionary<string, FargateContainerApproval> Profiles, FargateQuotaEvidence? Quota,
+        FargateQuotaObject? QuotaSource);
 }
+
+internal sealed record FargateQuotaObject(string Bucket, string Key);

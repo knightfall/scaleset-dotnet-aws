@@ -343,7 +343,11 @@ function assertFargate(template: Template, ...profiles: RunnerProfile[]) {
     template.findResources("AWS::IAM::Policy"),
   )
     .filter(([id]) => id.startsWith("Bootstrap"))
-    .flatMap(([, item]) => item.Properties.Roles as string[])
+    .flatMap(([, item]) =>
+      (item.Properties.Roles as unknown[]).filter(
+        (role) => typeof role === "string",
+      ),
+    )
     .sort();
   assert.deepEqual(
     bootstrapRoles,
@@ -413,16 +417,7 @@ function assertFargate(template: Template, ...profiles: RunnerProfile[]) {
     template.hasResourceProperties("AWS::IAM::Policy", {
       Roles: [provisioner.bootstrapRoleArn.split("/").at(-1)],
       PolicyDocument: {
-        Statement: [
-          Match.objectLike({
-            Action: "dynamodb:PutItem",
-            Condition: {
-              "ForAllValues:StringEquals": {
-                "dynamodb:LeadingKeys": ["HELLO#${aws:userid}"],
-              },
-              Null: { "dynamodb:LeadingKeys": "false" },
-            },
-          }),
+        Statement: Match.arrayWith([
           Match.objectLike({
             Action: "dynamodb:DeleteItem",
             Condition: {
@@ -432,7 +427,16 @@ function assertFargate(template: Template, ...profiles: RunnerProfile[]) {
               Null: { "dynamodb:LeadingKeys": "false" },
             },
           }),
-        ],
+          Match.objectLike({
+            Action: "lambda:InvokeFunctionUrl",
+            Effect: "Allow",
+            Condition: {
+              StringEquals: {
+                "lambda:FunctionUrlAuthType": "AWS_IAM",
+              },
+            },
+          }),
+        ]),
       },
     });
     template.hasResourceProperties("AWS::Events::Rule", {

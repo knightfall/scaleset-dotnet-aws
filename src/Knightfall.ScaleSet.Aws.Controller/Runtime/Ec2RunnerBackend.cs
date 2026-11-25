@@ -31,18 +31,36 @@ internal sealed class Ec2RunnerBackend(
         }
 
         var inventory = await inspector.ReadInventoryAsync(configuration, profile.Id, cancellationToken).ConfigureAwait(false);
-        var resources = inventory.Instances.Select(entry => ProjectResource(entry, inventory.ObservedAt)).ToImmutableArray();
+        var preflight = inventory.IsComplete
+            ? await inspector.ResolvePreflightAsync(configuration, profile.Id, cancellationToken).ConfigureAwait(false) : null;
+        var projected = ImmutableArray.CreateBuilder<RunnerBackendResource>(inventory.Instances.Length);
+        foreach (var entry in inventory.Instances)
+        {
+            var resource = ProjectResource(entry, inventory.ObservedAt, preflight?.Template);
+            if (resource.Binding is null && entry is { IsAuthoritative: true, ReportedState: Ec2InstanceState.Terminated,
+                    OriginalLaunchTime: null } &&
+                await store.ReadExecutorBindingForResourceAsync(key.Deployment, entry.ResourceArn, cancellationToken).ConfigureAwait(false) is
+                    { Provider: Ec2ExecutorIdentity identity } retained && retained.Profile == key &&
+                identity.LaunchTemplateId == _provisioner.LaunchTemplateId &&
+                entry.CorroboratesTerminal(retained, configuration.Aws.Account, configuration.Aws.Region, inventory.ObservedAt))
+            {
+                var terminal = new ExecutorResourceObservation(ExecutorResourceState.IrreversiblyTerminated, inventory.ObservedAt,
+                    identity.InstanceLaunchTime, Guid.NewGuid());
+                resource = new RunnerBackendResource(entry.ResourceArn, retained, terminal, null);
+            }
+            projected.Add(resource);
+        }
+        var resources = projected.MoveToImmutable();
         if (!inventory.IsComplete)
         {
             return new RunnerBackendInventory(inventory.ObservedAt, false, null, null, resources);
         }
 
-        var preflight = await inspector.ResolvePreflightAsync(configuration, profile.Id, cancellationToken).ConfigureAwait(false);
         int? headroom = preflight is { IsReady: true, Template.Subnets: { IsDefaultOrEmpty: false } subnets } &&
             subnets.All(static subnet => subnet.AvailableIpAddresses is >= 0)
             ? (int)Math.Min(int.MaxValue, subnets.Sum(static subnet => (long)subnet.AvailableIpAddresses!.Value)) : null;
         var nonterminal = resources.Where(static item => item.Observation?.State != ExecutorResourceState.IrreversiblyTerminated).ToArray();
-        int? drift = preflight.Template is { } resolved && nonterminal.All(static item => item.Binding is not null)
+        int? drift = preflight?.Template is { } resolved && nonterminal.All(static item => item.Binding is not null)
             ? nonterminal.Count(item => item.Binding?.Provider is Ec2ExecutorIdentity identity && identity.LaunchTemplateVersion != resolved.VersionNumber)
             : null;
         return new RunnerBackendInventory(inventory.ObservedAt, true, headroom, drift, resources);
@@ -136,6 +154,10 @@ internal sealed class Ec2RunnerBackend(
         {
             return;
         }
+        if (!terminal && !await HasQualifiedExitAsync(executor, identity, token).ConfigureAwait(false))
+        {
+            return;
+        }
 
         var request = new Ec2TerminateEffectRequest(Guid.ParseExact(binding.AllocationId, "D"), binding.ResourceArn,
             identity.InstanceLaunchTime, identity.LaunchTemplateId, identity.LaunchTemplateVersion);
@@ -191,7 +213,23 @@ internal sealed class Ec2RunnerBackend(
             current.Revision == expected.Revision && current.TransitionId == expected.TransitionId;
     }
 
-    private RunnerBackendResource ProjectResource(Ec2InventoryEntry entry, DateTimeOffset observedAt)
+    private async Task<bool> HasQualifiedExitAsync(ExecutorSnapshot executor, Ec2ExecutorIdentity identity, CancellationToken cancellationToken)
+    {
+        if (_provisioner.StatusQualification is not { } qualification || executor.State.Process is not { State: ExecutorProcessState.Exited } exit ||
+            await store.ReadJitHandoffAsync(key, Guid.ParseExact(executor.Binding.AllocationId, "D"), cancellationToken).ConfigureAwait(false) is not { } handoff ||
+            handoff.Identity.ResourceArn != executor.Binding.ResourceArn || handoff.Identity.Incarnation != executor.Binding.Incarnation ||
+            !handoff.Identity.AwsUserId.StartsWith(qualification.RoleId + ":", StringComparison.Ordinal) ||
+            await store.ReadEc2BootstrapStatusAsync(handoff, cancellationToken).ConfigureAwait(false) is not { Exited: true } confirmed ||
+            confirmed.QualificationSha256 != qualification.EvidenceSha256 || confirmed.RunnerId != exit.RunnerId ||
+            confirmed.ObservedAt != exit.ObservedAt)
+        {
+            return false;
+        }
+        var preflight = await inspector.ResolvePreflightAsync(configuration, profile.Id, cancellationToken).ConfigureAwait(false);
+        return preflight is { IsReady: true, Template: { } template } && template.VersionNumber == identity.LaunchTemplateVersion;
+    }
+
+    private RunnerBackendResource ProjectResource(Ec2InventoryEntry entry, DateTimeOffset observedAt, Ec2ResolvedTemplate? template)
     {
         if (!entry.IsAuthoritative || entry.AllocationId is not Guid allocation || entry.Incarnation is not Guid incarnation ||
             entry.LaunchTemplateId != _provisioner.LaunchTemplateId || entry.LaunchTemplateVersion is not long version ||
@@ -210,6 +248,10 @@ internal sealed class Ec2RunnerBackend(
             new Ec2ExecutorIdentity(launchTime, _provisioner.LaunchTemplateId, version));
         var observation = new ExecutorResourceObservation(state, observedAt, launchTime, Guid.NewGuid());
         string? credential = entry.InstanceProfileArn == _provisioner.InstanceProfileArn ? entry.InstanceProfileArn : null;
-        return new RunnerBackendResource(entry.ResourceArn, binding, observation, credential);
+        return new RunnerBackendResource(entry.ResourceArn, binding, observation, credential)
+        {
+            Ec2StatusQualificationSha256 = _provisioner.StatusQualification is { } qualification && template?.VersionNumber == version &&
+                entry.ImageId == qualification.ImageId && credential is not null ? qualification.EvidenceSha256 : null,
+        };
     }
 }

@@ -1,4 +1,6 @@
+using System.Text.Json;
 using Knightfall.ScaleSet.Aws.Core.Configuration;
+using Knightfall.ScaleSet.Aws.Core.Lifecycle;
 using Knightfall.ScaleSet.Aws.Core.Planning;
 using Xunit;
 
@@ -42,6 +44,64 @@ public sealed class CapacityPlannerTests
         Assert.Equal(expectedTarget, plan.Deficit);
         Assert.Equal(backendHeadroom, plan.BackendLaunchHeadroom);
         Assert.Equal(expectedStarts, plan.ProposedStarts);
+    }
+
+    [Fact]
+    public void VerifiedWarmAllocationOffsetsReserveWithoutCoveringAssignedDemand()
+    {
+        var profile = Assert.Single(RuntimeConfigurationLoader.Load(ConfigurationFixtures.Runtime(ConfigurationFixtures.Fargate)).Profiles);
+        profile = profile with { Capacity = new RunnerCapacityConfiguration(1, 24, 600), State = RunnerProfileState.Active };
+        var key = new LifecycleProfile("111122223333:ap-southeast-2:example", profile.Id);
+        var binding = new ExecutorBinding(key, Guid.NewGuid().ToString("D"),
+            "arn:aws:ecs:ap-southeast-2:111122223333:task/runners/0123456789abcdef0123456789abcdef",
+            Guid.NewGuid(), new FargateExecutorIdentity("arn:aws:ecs:ap-southeast-2:111122223333:cluster/runners",
+                "arn:aws:ecs:ap-southeast-2:111122223333:task-definition/runner:1"));
+        var start = Now.AddMinutes(-1);
+        var pending = new ExecutorState(binding,
+            Resource: new ExecutorResourceObservation(ExecutorResourceState.Starting, Now, start, Guid.NewGuid()),
+            StartedAt: start);
+        var running = pending with { Resource = pending.Resource! with { State = ExecutorResourceState.Running } };
+        var registered = running with { RunnerId = 123 };
+        var restarted = JsonSerializer.Deserialize<ExecutorState>(JsonSerializer.SerializeToUtf8Bytes(registered));
+        Assert.NotNull(restarted);
+
+        Assert.Equal(0, Plan(pending).ProposedStarts);
+        Assert.Equal(1, Plan(pending).CrediblePending);
+        foreach (var executor in new[] { running, registered, restarted, restarted with { StartedAt = null } })
+        {
+            var reserved = Plan(executor);
+            Assert.Equal(0, reserved.ProposedStarts);
+            Assert.Equal(0, reserved.EligibleServing);
+            Assert.Equal(0, reserved.CrediblePending);
+            Assert.Equal(1, reserved.UncertainSlots);
+        }
+        var busy = registered with
+        {
+            Job = new ExecutorJobObservation(456, 123, ExecutorJobPhase.Started, Guid.NewGuid(), 7, Now),
+        };
+        Assert.Equal(1, Plan(busy, assigned: 1).EligibleServing);
+        Assert.Equal(1, Plan(busy, assigned: 1).ProposedStarts);
+        Assert.Equal(1, Plan(restarted, assigned: 1).ProposedStarts);
+        Assert.Equal(0, Plan(restarted, assigned: 2, headroom: 0).ProposedStarts);
+
+        var stopped = registered with { Resource = registered.Resource! with { State = ExecutorResourceState.IrreversiblyTerminated } };
+        Assert.Equal(1, Plan(stopped).ProposedStarts);
+        Assert.Equal(0, Plan(pending with { Binding = binding with { AllocationId = Guid.NewGuid().ToString("D") } }).ProposedStarts);
+        var held = Plan(restarted with { HasConflict = true });
+        Assert.Equal(0, held.EligibleServing);
+        Assert.Equal(1, held.UncertainSlots);
+        Assert.Equal(1, held.ProposedStarts);
+
+        CapacityPlan Plan(ExecutorState state, int assigned = 0, int headroom = 23)
+        {
+            var classification = ExecutorClassifier.Classify(state, Now, TimeSpan.FromMinutes(10), TimeSpan.FromSeconds(5));
+            RunnerSlot[] slots = classification.Occupied
+                ? [new(state.Binding.ResourceArn, classification.SlotState, true, state.StartedAt)
+                    { CoversIdleReserve = classification.CoversIdleReserve }]
+                : [];
+            return CapacityPlanner.Plan(profile, new DemandSample(Now, assigned),
+                new InventorySample(Now, true, null, headroom, [.. slots]), Clock);
+        }
     }
 
     [Fact]

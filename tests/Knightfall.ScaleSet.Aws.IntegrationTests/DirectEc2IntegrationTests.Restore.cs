@@ -7,6 +7,8 @@ using Knightfall.ScaleSet.Aws.Core.Catalog;
 using Knightfall.ScaleSet.Aws.Core.Configuration;
 using Knightfall.ScaleSet.Aws.Core.Lifecycle;
 using Knightfall.ScaleSet.Aws.DynamoDb;
+using Knightfall.ScaleSet.Aws.Handoff;
+using Knightfall.ScaleSet.Aws.Lifecycle.Tests;
 using Xunit;
 
 namespace Knightfall.ScaleSet.Aws.IntegrationTests;
@@ -38,10 +40,11 @@ public sealed partial class DirectEc2IntegrationTests
         var key = new LifecycleProfile(owner.Deployment, Assert.Single(configuration.Profiles).Id);
         var catalog = await BindCatalogAsync(source, key, owner, token);
         var discarded = RestoreBootstrapRows(bootstrap.AwsUserId);
-        await bootstrap.Clients.DynamoDb.PutItemAsync(cloud.TableName, discarded[0], token);
+        await sourceClient.PutItemAsync(cloud.TableName, discarded[0], token);
         await sourceClient.PutItemAsync(cloud.TableName, discarded[1], token);
         await bootstrap.Clients.DynamoDb.PutItemAsync(cloud.TableName, discarded[2], token);
         await sourceClient.PutItemAsync(cloud.TableName, discarded[3], token);
+        await sourceClient.PutItemAsync(cloud.TableName, discarded[4], token);
 
         using var nativeProvider = ec2.Provider(configuration, key, clock);
         var launch = Assert.IsType<Ec2LaunchEffectRequest>(await nativeProvider.CreateLaunchRequestAsync(Guid.NewGuid(),
@@ -138,7 +141,12 @@ public sealed partial class DirectEc2IntegrationTests
         await AssertBootstrapCannotAccessTargetAsync(bootstrap, targetName, token);
         using var reopened = await cloud.OpenRestoredAsync(targetName, role, token);
         using var freshBootstrap = await reopened.AssumeRunnerAsync(role, InstanceId(recovered.Binding), token);
-        await freshBootstrap.Clients.DynamoDb.PutItemAsync(targetName, RowKey(LifecycleKey.Hello(freshBootstrap.AwsUserId)), token);
+        var denied = await Assert.ThrowsAnyAsync<AmazonDynamoDBException>(() => freshBootstrap.Clients.DynamoDb.PutItemAsync(targetName,
+            RowKey(LifecycleKey.Hello(freshBootstrap.AwsUserId)), token));
+        Assert.Equal("AccessDeniedException", denied.ErrorCode);
+        using var receiver = JitRecipientKey.Create();
+        Assert.Equal(LifecycleWriteOutcome.Committed, await BrokerHelloFixture.RegisterAsync(targetClient, targetName,
+            freshBootstrap.AwsUserId, receiver.Hello, clock, token));
         Assert.Single(await ReadBootstrapKeysAsync(targetClient, targetName, token));
         await AssertBootstrapCannotAccessTargetAsync(bootstrap, targetName, token);
 
@@ -179,6 +187,7 @@ public sealed partial class DirectEc2IntegrationTests
         RowKey(LifecycleKey.Offer(awsUserId)),
         RowKey(LifecycleKey.Status(awsUserId)),
         RestoreKey("STATUS#untrusted-legacy"),
+        RestoreKey("HELLO#" + awsUserId),
     ];
 
     private static Dictionary<string, AttributeValue> RestoreKey(string partition) => new(StringComparer.Ordinal)

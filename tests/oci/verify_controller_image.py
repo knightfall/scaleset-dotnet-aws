@@ -11,8 +11,8 @@ import tarfile
 CONTROLLER_DLL = "Knightfall.ScaleSet.Aws.Controller.dll"
 OCI_MANIFEST = "application/vnd.oci.image.manifest.v1+json"
 BASE_DIGESTS = {
-    "amd64": "sha256:8489a9d9439265a2d8f794e71050389974d0b4652003d18a4690825c4d10f186",
-    "arm64": "sha256:21d1dfbcec52a501cc2c1e3cb6b2386d7be827a1a3aa762482a942782618440d",
+    "amd64": "sha256:42b64e9b137e1fe99f9158418cb4430a18922f8a2b404eeaa296b8d61f4782cb",
+    "arm64": "sha256:4b2bf3394d68b9ca2100cc3a31c66f6ae6d422fe4cbb795115c14acfe2f52cb0",
 }
 
 

@@ -153,7 +153,10 @@ internal sealed class ControllerProfileReconciler(
             {
                 // The sample's cut-off can precede a concurrent event update. Such a start adds no credible pending capacity.
                 var start = executor.State.StartedAt <= cloud.ObservedAt ? executor.State.StartedAt : null;
-                slots.Add(new RunnerSlot(executor.Binding.ResourceArn, classified.SlotState, OwnershipVerified: true, start));
+                slots.Add(new RunnerSlot(executor.Binding.ResourceArn, classified.SlotState, OwnershipVerified: true, start)
+                {
+                    CoversIdleReserve = classified.CoversIdleReserve,
+                });
             }
         }
         for (int index = 0; index < unowned; index++)
@@ -190,20 +193,25 @@ internal sealed class ControllerProfileReconciler(
                 complete = false;
                 continue;
             }
-            if (expected.Provider is Ec2ExecutorIdentity && existing.State.RunnerId is { } runnerId)
+            if (expected.Provider is Ec2ExecutorIdentity && existing.State.RunnerId is { } runnerId &&
+                resource.Ec2StatusQualificationSha256 is { } qualification)
             {
-                await ObserveEc2ProcessAsync(fence, expected, runnerId, cancellationToken).ConfigureAwait(false);
+                await ObserveEc2ProcessAsync(fence, expected, runnerId, qualification, cancellationToken).ConfigureAwait(false);
             }
         }
         return new ObservedResources(exact, unowned, complete);
     }
 
-    private async Task ObserveEc2ProcessAsync(DeploymentLeaseFence fence, ExecutorBinding binding, long runnerId, CancellationToken cancellationToken)
+    private async Task ObserveEc2ProcessAsync(DeploymentLeaseFence fence, ExecutorBinding binding, long runnerId, string qualification,
+        CancellationToken cancellationToken)
     {
         var current = await store.ReadJitHandoffAsync(Key, Guid.ParseExact(binding.AllocationId, "D"), cancellationToken).ConfigureAwait(false);
         if (current is { RunnerId: { } expected } && expected == runnerId && current.Identity.ResourceArn == binding.ResourceArn &&
             current.Identity.Incarnation == binding.Incarnation &&
-            await store.ReadEc2BootstrapStatusAsync(current, cancellationToken).ConfigureAwait(false) is { } status)
+            profile.Provisioner is Ec2ProvisionerConfiguration { StatusQualification: { } ec2 } &&
+            current.Identity.AwsUserId.StartsWith(ec2.RoleId + ":", StringComparison.Ordinal) &&
+            await store.ReadEc2BootstrapStatusAsync(current, cancellationToken).ConfigureAwait(false) is { } status &&
+            status.QualificationSha256 == qualification)
         {
             var observation = new ExecutorProcessObservation(status.RunnerId,
                 status.Exited ? ExecutorProcessState.Exited : ExecutorProcessState.Ready, status.ObservedAt, Guid.NewGuid());

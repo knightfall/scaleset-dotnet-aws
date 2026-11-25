@@ -89,7 +89,7 @@ public sealed class GitHubJitControllerTests
         using var ownership = new ControllerLeaseOwnership(fixture.Store, fixture.Lease, Proof(fixture.Clock), fixture.Clock,
             TimeSpan.FromMinutes(5), Timing.WriteReserve);
         using var recipient = JitRecipientKey.Create();
-        Assert.Equal(LifecycleWriteOutcome.Committed, await fixture.Bootstrap.RegisterHelloAsync(recipient.Hello, token));
+        Assert.Equal(LifecycleWriteOutcome.Committed, await fixture.RegisterHelloAsync(recipient.Hello, token));
         var service = new GitHubJitHandoff(fixture.Store, fixture.Clock, Timing);
         var coordinator = new ControllerJitCoordinator(fixture.Store, new AwsBootstrapPrincipalResolver(iam), service);
         var observation = new BootstrapProviderObservation(fixture.Executor.Binding, fixture.Catalog.Binding.BootstrapRoleArn, fixture.Clock.Now);
@@ -196,7 +196,7 @@ public sealed class GitHubJitControllerTests
         var configuration = await ControllerLifecycleTests.ConfigurationAsync(draining: false, token);
         var fixture = await JitHandoffStoreTests.CreateFixtureAsync(table, token, configuration);
         using var recipient = JitRecipientKey.Create();
-        Assert.Equal(LifecycleWriteOutcome.Committed, await fixture.Bootstrap.RegisterHelloAsync(recipient.Hello, token));
+        Assert.Equal(LifecycleWriteOutcome.Committed, await fixture.RegisterHelloAsync(recipient.Hello, token));
         string offerId = JitOfferBinding.GetOfferId(fixture.Identity);
         string runnerName = "ss-" + offerId[..48];
         string runnerJson = RunnerJson(fixture.Identity.ScaleSetId, runnerName);
@@ -266,7 +266,7 @@ public sealed class GitHubJitControllerTests
         var configuration = await ControllerLifecycleTests.ConfigurationAsync(draining: false, token);
         var fixture = await JitHandoffStoreTests.CreateFixtureAsync(table, token, configuration);
         using var recipient = JitRecipientKey.Create();
-        Assert.Equal(LifecycleWriteOutcome.Committed, await fixture.Bootstrap.RegisterHelloAsync(recipient.Hello, token));
+        Assert.Equal(LifecycleWriteOutcome.Committed, await fixture.RegisterHelloAsync(recipient.Hello, token));
         string offerId = JitOfferBinding.GetOfferId(fixture.Identity);
         string runnerName = "ss-" + offerId[..48];
         string runnerJson = RunnerJson(fixture.Identity.ScaleSetId, runnerName);
@@ -333,7 +333,7 @@ public sealed class GitHubJitControllerTests
         var configuration = await ControllerLifecycleTests.ConfigurationAsync(draining: false, token);
         var fixture = await JitHandoffStoreTests.CreateFixtureAsync(table, token, configuration);
         using var recipient = JitRecipientKey.Create();
-        Assert.Equal(LifecycleWriteOutcome.Committed, await fixture.Bootstrap.RegisterHelloAsync(recipient.Hello, token));
+        Assert.Equal(LifecycleWriteOutcome.Committed, await fixture.RegisterHelloAsync(recipient.Hello, token));
         var name = "ss-" + JitOfferBinding.GetOfferId(fixture.Identity)[..48];
         string runner = RunnerJson(fixture.Identity.ScaleSetId, name);
         var created = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -389,7 +389,7 @@ public sealed class GitHubJitControllerTests
         var configuration = await ControllerLifecycleTests.ConfigurationAsync(draining: false, token);
         var fixture = await JitHandoffStoreTests.CreateFixtureAsync(table, token, configuration);
         using var recipient = JitRecipientKey.Create();
-        Assert.Equal(LifecycleWriteOutcome.Committed, await fixture.Bootstrap.RegisterHelloAsync(recipient.Hello, token));
+        Assert.Equal(LifecycleWriteOutcome.Committed, await fixture.RegisterHelloAsync(recipient.Hello, token));
         var staged = await JitHandoffStoreTests.StageAsync(fixture, token);
         _ = await JitHandoffStoreTests.PlanAsync(fixture, staged, token);
         var write = table.Wire.PauseAfterNextSuccessfulTransactionWrite(LifecycleKey.Operation(fixture.Catalog.Profile, staged.IntentId));

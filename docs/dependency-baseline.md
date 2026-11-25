@@ -1,7 +1,8 @@
 # Released scaleset.NET dependency baseline
 
-Verified on 24 November 2026. This is the upstream SDK baseline for T01, T02,
-and T09; it does not claim that the AWS controller is implemented or qualified.
+The AWS controller consumes the released upstream SDK baseline below. The
+package identity was verified on 24 November 2026. See the
+[target qualification record](emulator-boundaries.md) for deployment evidence.
 
 ## Release identity
 
@@ -23,7 +24,7 @@ archives:
 | `Knightfall.ScaleSet.Client.0.1.0-alpha.1.nupkg` | `943d1acf4a2076d7b884e406ac3d576f9982027e1d34f3624692c1e1388b83c0` |
 | `Knightfall.ScaleSet.Listener.0.1.0-alpha.1.nupkg` | `01b8d686419a951c7b9b58918f8eaf56e39ee63e57502e594093dd76f8203066` |
 
-T01 consumes the published packages from NuGet.org with exact central versions,
+The controller consumes the published packages from NuGet.org with exact central versions,
 committed NuGet lock files, and locked CI restore. Do not use the earlier local
 candidate feed or a sibling project reference: candidate builds reused the same
 preview version. T02 verifies consumption in an isolated package cache and
@@ -35,14 +36,14 @@ hashes above. A package upgrade requires an explicit baseline change and rerun
 of the relevant SDK and integration contracts.
 
 Use the release's [central dependency versions](https://github.com/knightfall/scaleset.NET/blob/v0.1.0-alpha.1/Directory.Packages.props)
-when selecting compatible direct dependencies in T01. In particular, do not
+when selecting compatible direct dependencies. In particular, do not
 force all `Microsoft.Extensions.*` packages to `10.0.12`: the released SDK uses
 `Microsoft.Extensions.Logging.Abstractions` `11.0.0`. Keep the AWS controller
 independent of `Knightfall.ScaleSet.Hosting` and `Knightfall.ScaleSet.Providers.Docker`.
 
 ## Listener integration contract
 
-T09 composes `ScaleSet.Listener.ScaleSetListenerPump` through the GitHub adapter
+The controller composes `ScaleSet.Listener.ScaleSetListenerPump` through the GitHub adapter
 with these released interfaces:
 
 - `IScaleSetListenerCheckpointStore`: consistent reads and atomic writes that
@@ -75,10 +76,10 @@ Upstream [#58](https://github.com/knightfall/scaleset.NET/issues/58) and
 their recorded scopes. #64 includes live GitHub.com repository-scope tests
 using a personal-account credential and local Docker runners. Those observations
 do not establish cross-process reattachment, natural token-expiry recovery,
-or recovery guarantees for other target/authentication scopes. T09 can now
-implement confirmed retirement; T22 and T26 retain target-specific qualification
-boundaries and conservative handling of ambiguous outcomes. A local simulator
-does not expand the live service qualification.
+or recovery guarantees for other target/authentication scopes. The AWS
+controller uses confirmed exact-session retirement and retains ambiguous
+outcomes. The [qualification record](emulator-boundaries.md#github-scope-and-recovery-evidence)
+records the separate loopback and live evidence.
 
 Custom GHES hosts ([#20](https://github.com/knightfall/scaleset.NET/issues/20)) and
 custom root CA/mTLS helpers ([#21](https://github.com/knightfall/scaleset.NET/issues/21))

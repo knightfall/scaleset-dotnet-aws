@@ -24,8 +24,9 @@ public sealed partial class DynamoDbEffectJournal
         {
             return LifecycleWriteOutcome.LeaseRejected;
         }
-        if (!EffectJournalEntry.AllowsAbandonmentBeforeSend(envelope) ||
-            (authorization.HasStartedSending && envelope.Request is Ec2LaunchEffectRequest or FargateStopEffectRequest))
+        if ((!authorization.RestoresUnsentFargateLaunch && !EffectJournalEntry.AllowsAbandonmentBeforeSend(envelope)) ||
+            (authorization.HasStartedSending && (authorization.RestoresUnsentFargateLaunch ||
+                envelope.Request is Ec2LaunchEffectRequest or FargateStopEffectRequest)))
         {
             return LifecycleWriteOutcome.Conflict;
         }
@@ -91,7 +92,8 @@ public sealed partial class DynamoDbEffectJournal
         }
 
         var envelope = authorization.Envelope;
-        if (!EffectJournalEntry.AllowsAbandonmentBeforeSend(envelope) || authorization.TryDiscard() is not { } discard)
+        if ((!authorization.RestoresUnsentFargateLaunch && !EffectJournalEntry.AllowsAbandonmentBeforeSend(envelope)) ||
+            authorization.TryDiscard() is not { } discard)
         {
             return LifecycleWriteOutcome.Conflict;
         }
@@ -104,7 +106,7 @@ public sealed partial class DynamoDbEffectJournal
         }
 
         var current = await ReadAsync(envelope.Profile, envelope.IntentId, cancellationToken).ConfigureAwait(false);
-        if (MatchesAbandonment(current, authorization, discard))
+        if (MatchesDiscard(current, authorization, discard))
         {
             return LifecycleWriteOutcome.Committed;
         }
@@ -115,11 +117,13 @@ public sealed partial class DynamoDbEffectJournal
             return LifecycleWriteOutcome.Conflict;
         }
 
-        var settled = current.Entry.AbandonBeforeSend(authorization.Attempt, discard.ObservedAt);
-        var outcome = await _store.WriteExactEffectAsync(owner.Fence, discard.TransitionId, current, settled,
+        // A proven unsent initial Fargate attempt can reuse its exact plan once capacity is available again.
+        var replacement = authorization.RestoresUnsentFargateLaunch
+            ? EffectJournalEntry.Plan(envelope) : current.Entry.AbandonBeforeSend(authorization.Attempt, discard.ObservedAt);
+        var outcome = await _store.WriteExactEffectAsync(owner.Fence, discard.TransitionId, current, replacement,
             authorization.EstimateUtcNow(), cancellationToken).ConfigureAwait(false);
         if (outcome is LifecycleWriteOutcome.Conflict or LifecycleWriteOutcome.Indeterminate &&
-            MatchesAbandonment(await ReadAsync(envelope.Profile, envelope.IntentId, cancellationToken).ConfigureAwait(false), authorization, discard))
+            MatchesDiscard(await ReadAsync(envelope.Profile, envelope.IntentId, cancellationToken).ConfigureAwait(false), authorization, discard))
         {
             return LifecycleWriteOutcome.Committed;
         }
@@ -127,12 +131,14 @@ public sealed partial class DynamoDbEffectJournal
         return outcome;
     }
 
-    private static bool MatchesAbandonment(EffectJournalSnapshot? current, EffectSendAuthorization authorization,
+    private static bool MatchesDiscard(EffectJournalSnapshot? current, EffectSendAuthorization authorization,
         EffectSendAuthorization.DiscardWitness discard) =>
-        current is { Entry.State: EffectState.Settled, Entry.Resolution.Kind: EffectResolutionKind.AbandonedBeforeSend } &&
-        current.Revision == checked(authorization.Revision + 1) && current.TransitionId == discard.TransitionId &&
-        current.Entry.Attempt == authorization.Attempt && current.Entry.Envelope.Matches(authorization.Envelope) &&
-        current.Entry.Resolution.ObservedAt == discard.ObservedAt;
+        current is not null && current.Revision == checked(authorization.Revision + 1) &&
+        current.TransitionId == discard.TransitionId && current.Entry.Envelope.Matches(authorization.Envelope) &&
+        (authorization.RestoresUnsentFargateLaunch
+            ? current.Entry.State == EffectState.Planned
+            : current.Entry is { State: EffectState.Settled, Resolution.Kind: EffectResolutionKind.AbandonedBeforeSend } &&
+              current.Entry.Attempt == authorization.Attempt && current.Entry.Resolution.ObservedAt == discard.ObservedAt);
 
     /// <summary>Restores the exact runner removal to planned after durable proof that its attempt was never sent.</summary>
     public Task<LifecycleWriteOutcome> RearmAbandonedRunnerRemovalAsync(

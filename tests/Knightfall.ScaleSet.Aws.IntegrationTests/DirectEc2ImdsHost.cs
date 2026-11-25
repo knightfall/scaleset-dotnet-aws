@@ -60,6 +60,7 @@ internal sealed class DirectEc2ImdsHost : IAsyncDisposable
                 accountId = account,
                 region,
                 instanceId,
+                imageId = DirectEc2Fixture.LinuxImage,
             }, WireNames) : Results.Unauthorized());
             app.MapGet(CredentialsPrefix + "{role}", (HttpContext context, string role) =>
             {

@@ -166,8 +166,12 @@ public sealed partial class DynamoDbEffectDispatcher
         return new EffectReconciliationPass(status, rebuild.PagesRead, page.IntentIds.Length, settled, page.Continuation);
     }
 
-    private async Task<LifecycleWriteOutcome?> CancelPlannedAsync(
-        ControllerLease lease, EffectJournalSnapshot effect, CancellationToken cancellationToken)
+    private Task<LifecycleWriteOutcome?> CancelPlannedAsync(
+        ControllerLease lease, EffectJournalSnapshot effect, CancellationToken cancellationToken) =>
+        CancelPlannedAsync(lease, effect, leaseValidThrough: null, cancellationToken);
+
+    private async Task<LifecycleWriteOutcome?> CancelPlannedAsync(ControllerLease lease, EffectJournalSnapshot effect,
+        DateTimeOffset? leaseValidThrough, CancellationToken cancellationToken)
     {
         if (effect.Entry.State != EffectState.Planned)
         {
@@ -175,7 +179,29 @@ public sealed partial class DynamoDbEffectDispatcher
         }
         var envelope = effect.Entry.Envelope;
         var evidence = new EffectEvidence(EffectResolutionKind.CanceledBeforeSend, envelope.Sha256, envelope.Target, _clock.GetUtcNow());
-        return await _journal.ResolveAsync(lease, effect, Guid.NewGuid(), evidence, cancellationToken).ConfigureAwait(false);
+        return await _store.WriteExactEffectAsync(lease.Fence, Guid.NewGuid(), effect, effect.Entry.Resolve(evidence),
+            leaseValidThrough, cancellationToken).ConfigureAwait(false);
+    }
+
+    private async Task<LifecycleWriteOutcome?> ExpireFargatePlanAsync(ControllerLease lease, ControllerClockEvidence clockEvidence,
+        EffectJournalSnapshot effect, CancellationToken cancellationToken)
+    {
+        // Recovery-only ownership leaves never-started plans to active startup cancellation.
+        if (lease.Mode != ControllerLeaseMode.Active || effect.Entry.Envelope is not
+                { Request: FargateLaunchEffectRequest { OwnershipTags: not null }, ProviderReplayDeadline: { } cutoff } ||
+            _clock.GetUtcNow() < cutoff)
+        {
+            return null;
+        }
+        var current = await ReadCurrentLeaseAsync(lease, cancellationToken).ConfigureAwait(false);
+        if (current is null || Window(current, clockEvidence) is not { } window)
+        {
+            return LifecycleWriteOutcome.LeaseRejected;
+        }
+        var earliestNow = window.UpperUtcNow - clockEvidence.MaximumAbsoluteSkew - clockEvidence.MaximumAbsoluteSkew;
+        return earliestNow >= cutoff
+            ? await CancelPlannedAsync(current, effect, window.UpperUtcNow, cancellationToken).ConfigureAwait(false)
+            : null;
     }
 
     private async Task<LifecycleWriteOutcome?> RecoverAsync(
@@ -186,6 +212,10 @@ public sealed partial class DynamoDbEffectDispatcher
         EffectRecoveryAuthority? recovery,
         CancellationToken cancellationToken)
     {
+        if (effect.Entry.State == EffectState.Planned)
+        {
+            return await ExpireFargatePlanAsync(lease, clockEvidence, effect, cancellationToken).ConfigureAwait(false);
+        }
         if (effect.Entry.State is not (EffectState.Executing or EffectState.Uncertain) || effect.Entry.Attempt is not { } attempt)
         {
             return null;

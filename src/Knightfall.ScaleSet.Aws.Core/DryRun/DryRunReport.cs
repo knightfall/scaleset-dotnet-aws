@@ -1,4 +1,5 @@
 using System.Collections.Immutable;
+using System.Text.Json.Serialization;
 using Knightfall.ScaleSet.Aws.Core.Configuration;
 using Knightfall.ScaleSet.Aws.Core.Planning;
 
@@ -24,7 +25,11 @@ public sealed record DryRunProfileReport(
     RunnerProvisionerType Provisioner,
     DateTimeOffset? DemandObservedAt,
     DateTimeOffset? InventoryObservedAt,
-    CapacityPlan Capacity);
+    CapacityPlan Capacity)
+{
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? Ec2CleanupMode { get; init; }
+}
 
 public sealed record DryRunReplayFrame(DateTimeOffset ObservedAt, ImmutableArray<DryRunProfileReport> Profiles);
 

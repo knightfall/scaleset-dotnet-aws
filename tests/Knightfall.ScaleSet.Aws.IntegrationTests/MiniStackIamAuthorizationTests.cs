@@ -49,7 +49,11 @@ public sealed class MiniStackIamAuthorizationTests
         using var runner = await cloud.AssumeRunnerAsync(role, taskId, token);
         Assert.Equal($"{role.RoleId}:{taskId}", runner.AwsUserId);
         var hello = LifecycleKey.Hello(runner.AwsUserId);
-        await runner.Clients.DynamoDb.PutItemAsync(cloud.TableName, Item(hello, "hello"), token);
+        await AssertDeniedAsync(() => runner.Clients.DynamoDb.PutItemAsync(cloud.TableName, Item(hello, "direct hello"), token));
+        var lifecycle = Item(LifecycleKey.Lease(MiniStackIamFixture.Account + ":" + MiniStackIamFixture.Region + ":fixture"), "fixture lease");
+        lifecycle.Add("dueShard", new AttributeValue("fixture-index"));
+        lifecycle.Add("dueAtMillis", new AttributeValue { N = "1" });
+        await AssertDeniedAsync(() => runner.Clients.DynamoDb.PutItemAsync(cloud.TableName, lifecycle, token));
         await AssertDeniedAsync(() => runner.Clients.DynamoDb.PutItemAsync(other.TableName, Item(hello, "wrong table"), token));
         await AssertDeniedAsync(() => runner.Clients.DynamoDb.PutItemAsync(cloud.TableName,
             Item(LifecycleKey.Status(runner.AwsUserId), "unsupported status"), token));
@@ -61,7 +65,7 @@ public sealed class MiniStackIamAuthorizationTests
         var db = owner.Clients.DynamoDb;
         var hello = LifecycleKey.Hello(owner.AwsUserId);
         var status = LifecycleKey.Status(owner.AwsUserId);
-        await db.PutItemAsync(cloud.TableName, Item(hello, "hello"), cancellationToken);
+        await AssertDeniedAsync(() => db.PutItemAsync(cloud.TableName, Item(hello, "direct hello"), cancellationToken));
         await db.PutItemAsync(cloud.TableName, Item(status, "status"), cancellationToken);
         await AssertDeniedAsync(() => db.PutItemAsync(cloud.TableName,
             Item(LifecycleKey.Hello(peer.AwsUserId), "wrong hello"), cancellationToken));
@@ -70,8 +74,8 @@ public sealed class MiniStackIamAuthorizationTests
         await AssertDeniedAsync(() => db.DeleteItemAsync(DeleteOffer(cloud.TableName, peer.AwsUserId), cancellationToken));
         await AssertDeniedAsync(() => db.GetItemAsync(cloud.TableName, Key(LifecycleKey.Offer(owner.AwsUserId)),
             consistentRead: true, cancellationToken));
-        Assert.Equal("hello", (await cloud.Controller.DynamoDb.GetItemAsync(cloud.TableName, Key(hello),
-            consistentRead: true, cancellationToken)).Item["marker"].S);
+        Assert.Empty((await cloud.Controller.DynamoDb.GetItemAsync(cloud.TableName, Key(hello),
+            consistentRead: true, cancellationToken)).Item ?? []);
         Assert.Equal("status", (await cloud.Controller.DynamoDb.GetItemAsync(cloud.TableName, Key(status),
             consistentRead: true, cancellationToken)).Item["marker"].S);
     }

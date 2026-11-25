@@ -240,6 +240,7 @@ public sealed partial class FargateProfileInspector
     {
         if (definition.ContainerDefinitions is not [var container] || container is null || container.Name != runnerContainer ||
             container.Essential == false || container.Privileged == true || container.RestartPolicy?.Enabled == true ||
+            container.HealthCheck is not null ||
             container.ReadonlyRootFilesystem != true || container.Image != approval.Image ||
             !(container.EntryPoint ?? []).SequenceEqual(approval.EntryPoint, StringComparer.Ordinal) ||
             !(container.Command ?? []).SequenceEqual(approval.Command, StringComparer.Ordinal))

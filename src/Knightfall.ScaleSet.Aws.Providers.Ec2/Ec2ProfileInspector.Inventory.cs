@@ -130,6 +130,8 @@ public sealed partial class Ec2ProfileInspector
             allocation, nativeTemplate, version, original, incarnation)
         {
             InstanceProfileArn = instance.IamInstanceProfile?.Arn,
+            ImageId = instance.ImageId,
+            HasPrimaryInterface = instance.NetworkInterfaces?.Any(nic => nic.Attachment?.DeviceIndex == 0) == true,
         };
     }
 

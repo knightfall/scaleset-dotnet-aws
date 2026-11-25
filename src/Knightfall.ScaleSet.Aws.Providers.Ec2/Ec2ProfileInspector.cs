@@ -58,7 +58,9 @@ public sealed partial class Ec2ProfileInspector : IDisposable
             Ec2PreflightStatus.AwsUnavailable or Ec2PreflightStatus.TemplateUnavailable => "unknown",
             _ => "rejected",
         };
-        operation?.Complete(outcome, PreflightReason(result.Status));
+        string reason = result.IsReady && target.Provisioner.StatusQualification is null
+            ? "external_reclamation_required" : PreflightReason(result.Status);
+        operation?.Complete(outcome, reason);
         if (target.Provisioner.LaunchTemplateVersion is AliasLaunchTemplateVersion && result.ObservedVersionNumber.HasValue &&
             result.Status is not (Ec2PreflightStatus.Verified or Ec2PreflightStatus.AwsUnavailable))
         {
@@ -75,6 +77,7 @@ public sealed partial class Ec2ProfileInspector : IDisposable
         Ec2PreflightStatus.TemplateIdentityMismatch or Ec2PreflightStatus.AwsIdentityMismatch => "identity_mismatch",
         Ec2PreflightStatus.InstanceProfileMismatch or Ec2PreflightStatus.BootstrapRoleMismatch => "role_mismatch",
         Ec2PreflightStatus.NetworkIncompatible or Ec2PreflightStatus.PlacementIncompatible => "network_incompatible",
+        Ec2PreflightStatus.StatusQualificationMismatch => "status_qualification_mismatch",
         _ => "template_incompatible",
     };
 
@@ -153,6 +156,11 @@ public sealed partial class Ec2ProfileInspector : IDisposable
             if (roleStatus != Ec2PreflightStatus.Verified)
             {
                 return Failed(roleStatus, observedVersion);
+            }
+            if (provisioner.StatusQualification is { } qualification &&
+                (pinnedVersion is null || qualification.ImageId != image.ImageId || qualification.RoleId != roleId))
+            {
+                return Failed(Ec2PreflightStatus.StatusQualificationMismatch, observedVersion);
             }
             var subnets = await ReadNetworkAsync(target.Network, cancellationToken).ConfigureAwait(false);
             if (subnets.IsDefault || !await HasPrivateRoutesAsync(target, cancellationToken).ConfigureAwait(false))

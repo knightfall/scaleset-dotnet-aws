@@ -95,6 +95,71 @@ public sealed class TelemetrySettingsTests
     }
 
     [Theory]
+    [InlineData("TRACES", "grpc")]
+    [InlineData("METRICS", "grpc")]
+    [InlineData("LOGS", "grpc")]
+    [InlineData("TRACES", "http/protobuf")]
+    [InlineData("METRICS", "http/protobuf")]
+    [InlineData("LOGS", "http/protobuf")]
+    public void RemoteHttpRejectsInheritedAndDirectHeadersWithoutLoggingValues(string signal, string protocol)
+    {
+        const string endpoint = "http://collector.example.invalid";
+        const string credential = "authorization=private-fixture";
+        string endpointKey = $"OTEL_EXPORTER_OTLP_{signal}_ENDPOINT";
+        foreach (string headerKey in new[] { "OTEL_EXPORTER_OTLP_HEADERS", $"OTEL_EXPORTER_OTLP_{signal}_HEADERS" })
+        {
+            var values = new Dictionary<string, string>(StringComparer.Ordinal)
+            {
+                ["OTEL_EXPORTER_OTLP_ENDPOINT"] = "https://fallback.example.invalid",
+                [endpointKey] = endpoint,
+                [$"OTEL_EXPORTER_OTLP_{signal}_PROTOCOL"] = protocol,
+                [headerKey] = credential,
+            };
+            var error = Assert.Throws<TelemetrySettingsException>(() => TelemetrySettings.Load(readEnvironment: values.GetValueOrDefault));
+            Assert.Equal(endpointKey, error.Setting);
+            Assert.DoesNotContain("private-fixture", error.Message, StringComparison.Ordinal);
+            Assert.DoesNotContain(endpoint, error.Message, StringComparison.Ordinal);
+        }
+    }
+
+    [Theory]
+    [InlineData("https://collector.example.invalid")]
+    [InlineData("http://localhost:4317")]
+    [InlineData("http://127.0.0.2:4317")]
+    [InlineData("http://[::1]:4317")]
+    public void HttpsAndLoopbackPreserveHeaders(string endpoint)
+    {
+        var settings = TelemetrySettings.Load(endpoint, readEnvironment: key =>
+            key == "OTEL_EXPORTER_OTLP_HEADERS" ? "authorization=fixture" : null);
+        foreach (var signal in new[] { settings.Traces, settings.Metrics, settings.Logs })
+        {
+            Assert.Equal("fixture", Assert.IsType<TelemetryEndpoint>(signal).Headers["authorization"]);
+        }
+    }
+
+    [Fact]
+    public void CliOverrideAppliesTheHeaderTransportRuleAndEmptyOverridesClearInheritance()
+    {
+        const string endpoint = "http://collector.example.invalid";
+        var values = new Dictionary<string, string>(StringComparer.Ordinal)
+        {
+            ["OTEL_EXPORTER_OTLP_HEADERS"] = "authorization=fixture",
+            ["OTEL_EXPORTER_OTLP_ENDPOINT"] = "https://fallback.example.invalid",
+        };
+        var error = Assert.Throws<TelemetrySettingsException>(() => TelemetrySettings.Load(endpoint, readEnvironment: values.GetValueOrDefault));
+        Assert.Equal("--otlp-endpoint", error.Setting);
+
+        values["OTEL_EXPORTER_OTLP_TRACES_HEADERS"] = string.Empty;
+        values["OTEL_EXPORTER_OTLP_METRICS_HEADERS"] = string.Empty;
+        values["OTEL_EXPORTER_OTLP_LOGS_HEADERS"] = string.Empty;
+        var settings = TelemetrySettings.Load(endpoint, readEnvironment: values.GetValueOrDefault);
+        foreach (var signal in new[] { settings.Traces, settings.Metrics, settings.Logs })
+        {
+            Assert.Empty(Assert.IsType<TelemetryEndpoint>(signal).Headers);
+        }
+    }
+
+    [Theory]
     [InlineData("OTEL_EXPORTER_OTLP_ENDPOINT", "https://login:private-fixture@collector.example/")]
     [InlineData("OTEL_EXPORTER_OTLP_ENDPOINT", "https://collector.example/?secret=private-fixture")]
     [InlineData("OTEL_EXPORTER_OTLP_ENDPOINT", "https://collector.example/#private-fixture")]

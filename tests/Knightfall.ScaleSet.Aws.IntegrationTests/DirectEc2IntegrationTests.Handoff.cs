@@ -37,7 +37,7 @@ public sealed partial class DirectEc2IntegrationTests
             ClientRequestToken = Guid.NewGuid().ToString("N"),
             SecretString = JsonSerializer.Serialize(new { token = GitHubSimulator.FirstPat }),
         }, token);
-        var configuration = await fixture.ConfigurationAsync(cloud.TableName, "1", token, secret.ARN);
+        var configuration = await fixture.ConfigurationAsync(cloud.TableName, "1", token, secret.ARN, statusRoleId: role.RoleId);
         var clock = new FixtureClock();
         var store = new DynamoDbLifecycleStore(cloud.Controller.DynamoDb, cloud.TableName, clock);
         var active = await ActivateInitialAsync(store, configuration, clock, token);
@@ -70,6 +70,7 @@ public sealed partial class DirectEc2IntegrationTests
         Assert.True(inventory.IsComplete);
         var resources = inventory.Resources.OrderBy(resource => resource.ResourceArn, StringComparer.Ordinal).ToArray();
         Assert.Equal(2, resources.Length);
+        Assert.All(resources, resource => Assert.Equal(DirectEc2Fixture.StatusQualificationDigest, resource.Ec2StatusQualificationSha256));
         var first = Assert.IsType<ExecutorBinding>(resources[0].Binding);
         var second = Assert.IsType<ExecutorBinding>(resources[1].Binding);
 
@@ -133,6 +134,8 @@ public sealed partial class DirectEc2IntegrationTests
 
         simulator.Complete(requestId, firstRunner);
         Assert.Equal(ScaleSetListenerStepStatus.MessageAcknowledged, (await lane.StepAsync(token)).Step?.Status);
+        await backend.CleanupAsync(active, catalog, await ReadExecutorAsync(first, token), ownership.OwnershipLost, token);
+        Assert.Empty(fixture.Wire.Calls("TerminateInstances"));
         firstBootstrap.FinishJob();
         Assert.Equal(RunnerBootstrapOutcome.Completed, await firstBootstrap.Outcome.WaitAsync(token));
         await ObserveStatusAsync(first, firstRunner, exited: true, token);
@@ -141,7 +144,25 @@ public sealed partial class DirectEc2IntegrationTests
             (complete.State.Job?.RequestId, complete.State.Job?.RunnerId, complete.State.Job?.Phase));
         Assert.Equal(ExecutorProcessState.Exited, complete.State.Process?.State);
 
+        await backend.CleanupAsync(active, catalog, complete, ownership.OwnershipLost, token);
+        Assert.Empty(fixture.Wire.Calls("TerminateInstances"));
         clock.Set(clock.GetUtcNow().Add(Timing.LogFlushGrace).AddSeconds(1));
+        var unqualified = await fixture.ConfigurationAsync(cloud.TableName, "1", token, secret.ARN);
+        using var unqualifiedProvider = fixture.Provider(unqualified, key, clock);
+        var defaultBackend = Backend(unqualified, Assert.Single(unqualified.Profiles), key, inspector, unqualifiedProvider, store, clock);
+        var defaultReadback = await defaultBackend.ReadAsync(active.Lease, token);
+        Assert.All(defaultReadback.Resources, resource => Assert.Null(resource.Ec2StatusQualificationSha256));
+        await defaultBackend.CleanupAsync(active, catalog, complete, ownership.OwnershipLost, token);
+        Assert.Empty(fixture.Wire.Calls("TerminateInstances"));
+        var incorrect = await fixture.ConfigurationAsync(cloud.TableName, "1", token, secret.ARN, statusRoleId: role.RoleId,
+            statusImageId: "ami-0123456789abcdef0");
+        Assert.Equal(Ec2PreflightStatus.StatusQualificationMismatch,
+            (await inspector.ResolvePreflightAsync(incorrect, key.ProfileId, token)).Status);
+        using var incorrectProvider = fixture.Provider(incorrect, key, clock);
+        var incorrectBackend = Backend(incorrect, Assert.Single(incorrect.Profiles), key, inspector, incorrectProvider, store, clock);
+        await incorrectBackend.CleanupAsync(active, catalog, complete, ownership.OwnershipLost, token);
+        Assert.Empty(fixture.Wire.Calls("TerminateInstances"));
+
         await backend.CleanupAsync(active, catalog, complete, ownership.OwnershipLost, token);
         Assert.Equal(InstanceId(first), Assert.Single(fixture.Wire.Calls("TerminateInstances"))["InstanceId.1"]);
         var native = (await cloud.Controller.Ec2.DescribeInstancesAsync(new DescribeInstancesRequest
@@ -217,6 +238,7 @@ public sealed partial class DirectEc2IntegrationTests
             }
             while (status is null || status.Exited != exited);
             Assert.Equal((runnerId, exited ? 2L : 1L, row.OfferId), (status.RunnerId, status.Sequence, status.OfferId));
+            Assert.Equal(DirectEc2Fixture.StatusQualificationDigest, status.QualificationSha256);
             Assert.Equal(LifecycleWriteOutcome.Committed, await store.ObserveProcessAsync(active.Lease.Fence, binding,
                 new ExecutorProcessObservation(status.RunnerId, exited ? ExecutorProcessState.Exited : ExecutorProcessState.Ready,
                     status.ObservedAt, Guid.NewGuid()), cancellationToken));

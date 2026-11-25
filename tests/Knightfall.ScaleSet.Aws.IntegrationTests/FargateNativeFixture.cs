@@ -265,7 +265,8 @@ internal sealed class FargateNativeFixture : IDisposable
 
     internal Task<EffectDispatchStatus> DispatchAsync(ControllerLease lease, FargateLaunchEffectRequest launch,
         IFargateReplayEffectProvider provider, CancellationToken token) =>
-        Dispatcher.DispatchPlannedAsync(lease, Clock.Proof(), Profile, Intent(launch), provider, CancellationToken.None, token);
+        Dispatcher.DispatchPlannedAsync(lease, Clock.Proof(), Profile, Intent(launch), provider, Clock.GetUtcNow().AddMinutes(1),
+            CancellationToken.None, token);
 
     internal async Task<SessionAWSCredentials> AssumeTaskAsync(string taskArn, CancellationToken token)
     {

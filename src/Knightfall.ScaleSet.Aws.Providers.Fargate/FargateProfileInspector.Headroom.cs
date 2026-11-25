@@ -1,3 +1,6 @@
+using System.Collections.Immutable;
+using Knightfall.ScaleSet.Aws.Core.Lifecycle;
+
 namespace Knightfall.ScaleSet.Aws.Providers.Fargate;
 
 public sealed partial class FargateProfileInspector
@@ -60,13 +63,17 @@ public sealed partial class FargateProfileInspector
                 resource.Task.AttachedSubnetIds.All(launch.EligibleSubnetIds.Contains);
             DateTimeOffset? attachment = observedAttached && resource.Task.AttachmentObservedAt is { } observed &&
                 observed >= resource.InventoryAt && Fresh(observed, now) ? observed : null;
-            // Only an attachment observed before sampling is already represented in that sample.
+            // Subnet capacity uses the latest attachment observation.
             if (launch.EligibleSubnetIds.Any(scopeSubnets.Contains) &&
                 (attachment is not { } attachedForIp || attachedForIp >= task.SubnetSampleStartedAt))
             {
                 reservedIp++;
             }
-            if (attachment is not { } attachedForCpu || quota is null || attachedForCpu >= quota.ObservedAt)
+            // A running task with the same exact attachment across full inventories may already
+            // be included in a quota sample that was taken between those inventories.
+            var cpuAttachment = attachment.HasValue && resource.Task.State == FargateTaskState.Running
+                ? resource.Task.RunningAttachmentObservedSince ?? attachment : null;
+            if (cpuAttachment is not { } attachedForCpu || quota is null || attachedForCpu >= quota.ObservedAt)
             {
                 reservedCpu += launch.CpuUnits;
             }
@@ -74,12 +81,37 @@ public sealed partial class FargateProfileInspector
 
         int? ipSlots = Fresh(task.SubnetSampleStartedAt, now) && task.Subnets.All(subnet => subnet.AvailableIpAddresses is >= 0)
             ? ClampSlots(task.Subnets.Sum(subnet => (long)subnet.AvailableIpAddresses!.Value) - reservedIp) : null;
-        int? cpuSlots = quota is { RemainingCpuUnits: >= 0, ReservedCpuUnits: >= 0 } &&
-            quota.Account == task.Scope.Account && quota.Region == task.Scope.Region &&
-            Fresh(quota.ObservedAt, now) && quota.ExpiresAt > now
+        int? cpuSlots = quota?.IsCurrentFor(task.Scope.Account, task.Scope.Region, now) == true
             ? ClampSlots(Math.Max(0, Math.Max(0, quota.RemainingCpuUnits - quota.ReservedCpuUnits) - reservedCpu) / task.CpuUnits) : null;
         int? launchSlots = ipSlots.HasValue && cpuSlots.HasValue ? Math.Min(ipSlots.Value, cpuSlots.Value) : null;
         return new FargateHeadroom(ipSlots, cpuSlots, launchSlots);
+    }
+
+    public FargateHeadroom EstimateReservedLaunchHeadroom(FargateResolvedTask task, FargateInventorySnapshot inventory,
+        FargateQuotaEvidence? quota, IReadOnlyCollection<FargateLaunchReservation>? outstanding,
+        IReadOnlyCollection<FargateInventorySnapshot> otherProfiles, FargateLaunchEffectRequest launch)
+    {
+        ArgumentNullException.ThrowIfNull(task);
+        ArgumentNullException.ThrowIfNull(launch);
+        if (outstanding?.Any(static reservation => reservation is null) != false ||
+            task.Subnets.IsDefaultOrEmpty || launch.SubnetIds.IsDefaultOrEmpty || launch.ClusterArn != task.Scope.ClusterArn ||
+            launch.TaskDefinitionArn != task.Scope.TaskDefinitionArn || launch.CpuUnits != task.CpuUnits ||
+            outstanding.Where(reservation => reservation.AllocationId == launch.AllocationId).ToArray() is not
+                [{ TaskArn: null } reserved] ||
+            reserved.Scope != task.Scope || reserved.CpuUnits != task.CpuUnits ||
+            !reserved.EligibleSubnetIds.SequenceEqual(launch.SubnetIds))
+        {
+            return new FargateHeadroom(null, null, null);
+        }
+        var requestedSubnets = task.Subnets.Where(subnet => launch.SubnetIds.Contains(subnet.SubnetId)).ToImmutableArray();
+        if (requestedSubnets.Length != launch.SubnetIds.Length)
+        {
+            return new FargateHeadroom(null, null, null);
+        }
+
+        // The current request gets its own reservation back while peers keep their reservations.
+        return EstimateHeadroom(task with { Subnets = requestedSubnets }, inventory, quota,
+            outstanding.Where(reservation => reservation.AllocationId != launch.AllocationId).ToArray(), otherProfiles);
     }
 
     private static bool Fresh(DateTimeOffset observedAt, DateTimeOffset now) =>

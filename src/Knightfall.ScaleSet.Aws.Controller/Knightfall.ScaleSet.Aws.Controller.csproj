@@ -4,8 +4,8 @@
     <OutputType>Exe</OutputType>
     <UseAppHost>false</UseAppHost>
     <EnableSdkContainerSupport>true</EnableSdkContainerSupport>
-    <!-- Microsoft .NET 10.0.11 Noble chiseled-extra, multi-architecture digest. -->
-    <ContainerBaseImage>mcr.microsoft.com/dotnet/aspnet@sha256:f5b3b2e2e548828d50e349726f51a5de001286f02c4bbde77db0dd34eb9f55ff</ContainerBaseImage>
+    <!-- Microsoft .NET 10.0.15 Noble chiseled-extra, multi-architecture digest. -->
+    <ContainerBaseImage>mcr.microsoft.com/dotnet/aspnet@sha256:c8dd08a50d8ffd19bd8da72edee05a7ac15b486a5b1869cf46fdb370bf1fbc76</ContainerBaseImage>
     <ContainerImageFormat>OCI</ContainerImageFormat>
     <ContainerRepository>scaleset-aws-controller</ContainerRepository>
     <ContainerUser>1654</ContainerUser>

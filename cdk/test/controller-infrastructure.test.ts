@@ -90,6 +90,59 @@ const quota = {
   reservedCpuUnits: 1_024,
 };
 
+test("partitions without Function URLs preserve dry-run synthesis and hold active deployment", () => {
+  const yaml = readFileSync(
+    new URL("../../testdata/config/ec2-only-pinned.yaml", import.meta.url),
+    "utf8",
+  );
+  for (const [region, partition, dnsSuffix] of [
+    ["cn-north-1", "aws-cn", "amazonaws.com.cn"],
+    ["us-gov-west-1", "aws-us-gov", "amazonaws.com"],
+  ]) {
+    const config = compileConfig(
+      yaml
+        .replaceAll("ap-southeast-2", region)
+        .replaceAll("arn:aws:", `arn:${partition}:`)
+        .replaceAll("amazonaws.com", dnsSuffix),
+    );
+    synthesize(config).resourceCountIs("AWS::Lambda::Url", 0);
+    const active = rewrite(config, { ...config.runtime.spec, mode: "active" });
+    assert.throws(
+      () => synthesize(active),
+      /Active runner HELLO requires Lambda Function URLs/u,
+    );
+  }
+});
+
+test("active service waits for its HELLO brokers and runner invocation policies", () => {
+  const template = synthesize(fixture("mixed-ec2-fargate"));
+  const resources = template.toJSON().Resources as Record<
+    string,
+    { Type: string }
+  >;
+  const brokerResources = Object.entries(resources)
+    .filter(
+      ([id, resource]) =>
+        id.includes("HelloBroker") &&
+        ["AWS::Lambda::Function", "AWS::Lambda::Url"].includes(resource.Type),
+    )
+    .map(([id]) => id);
+  const runnerPolicies = Object.entries(resources)
+    .filter(
+      ([id, resource]) =>
+        /^Bootstrap[a-f0-9]{16}Policy/u.test(id) &&
+        resource.Type === "AWS::IAM::Policy",
+    )
+    .map(([id]) => id);
+  assert.equal(brokerResources.length, 8);
+  assert.equal(runnerPolicies.length, 4);
+  const [service] = Object.values(template.findResources("AWS::ECS::Service"));
+  const dependencies = service.DependsOn as string[];
+  for (const id of [...brokerResources, ...runnerPolicies]) {
+    assert.ok(dependencies.includes(id), id);
+  }
+});
+
 test("explicit Fargate preflight changes only the controller task definition environment", () => {
   const config = fixture("mixed-ec2-fargate");
   const raw = JSON.stringify(
@@ -124,6 +177,70 @@ test("explicit Fargate preflight changes only the controller task definition env
   };
   delete task.Properties.ContainerDefinitions[0].Environment;
   assert.deepEqual(wholeTemplate, defaultTemplate.toJSON());
+});
+
+test("refreshable Fargate quota grants the controller only one same-account S3 object", () => {
+  const config = fixture("mixed-ec2-fargate");
+  const quotaSource = {
+    bucket: "approved-quota-samples",
+    key: "usage/on-demand.json",
+  };
+  const raw = JSON.stringify({
+    profiles: { "linux-shell": shellApproval },
+    quotaSource,
+  });
+  const template = synthesize(config, raw);
+  template.hasResourceProperties("AWS::ECS::TaskDefinition", {
+    ContainerDefinitions: Match.arrayWith([
+      Match.objectLike({
+        Name: "Controller",
+        Environment: [{ Name: "SCALESET_FARGATE_PREFLIGHT", Value: raw }],
+      }),
+    ]),
+  });
+  assert.deepEqual(
+    rolePolicy(template).filter(({ Action }) =>
+      [Action].flat().includes("s3:GetObject"),
+    ),
+    [
+      {
+        Action: "s3:GetObject",
+        Condition: { StringEquals: { "s3:ResourceAccount": quota.account } },
+        Effect: "Allow",
+        Resource: {
+          "Fn::Join": [
+            "",
+            [
+              "arn:",
+              { Ref: "AWS::Partition" },
+              ":s3:::approved-quota-samples/usage/on-demand.json",
+            ],
+          ],
+        },
+      },
+    ],
+  );
+  assert.ok(!actions(template).has("s3:PutObject"));
+  assert.ok(!actions(template).has("s3:ListBucket"));
+  for (const source of [
+    { ...quotaSource, key: "usage/*" },
+    { ...quotaSource, key: "usage/../on-demand.json" },
+    { ...quotaSource, key: "usage/on-demand.json\n" },
+    { ...quotaSource, bucket: "Approved-Quota" },
+    { ...quotaSource, account: quota.account },
+  ]) {
+    assert.throws(
+      () =>
+        synthesize(
+          config,
+          JSON.stringify({ profiles: {}, quotaSource: source }),
+        ),
+      {
+        message:
+          "SCALESET_FARGATE_PREFLIGHT is invalid for the configured deployment.",
+      },
+    );
+  }
 });
 
 test("Fargate preflight is available in inspection mode and refuses unrelated profiles or modes", () => {
@@ -573,10 +690,114 @@ test("active profiles alone supply provider permissions, event rules and role-sc
       );
     }
     const policy = JSON.stringify(template.findResources("AWS::IAM::Policy"));
-    assert.ok(policy.includes("HELLO#${aws:userid}"));
+    assert.ok(!policy.includes("HELLO#${aws:userid}"));
     assert.ok(policy.includes("OFFER#${aws:userid}"));
     assert.ok(!policy.includes("STATUS#"));
+    assert.ok(policy.includes("ForAnyValue:StringLike"));
+    assert.ok(policy.includes("lambda:InvokedViaFunctionUrl"));
+    template.hasResourceProperties("AWS::Lambda::Url", {
+      AuthType: "AWS_IAM",
+    });
   }
+});
+
+test("only an active qualified EC2 role receives the supervisor STATUS policy", () => {
+  const config = fixture("mixed-ec2-fargate");
+  const { spec } = config.runtime;
+  const ec2 = spec.profiles.find(
+    (profile) => profile.provisioner.type === "ec2",
+  );
+  assert.ok(ec2?.provisioner.type === "ec2");
+  const fargate = spec.profiles.find(
+    (profile) => profile.provisioner.type === "fargate",
+  );
+  assert.ok(fargate?.provisioner.type === "fargate");
+  const qualified = {
+    ...ec2,
+    provisioner: {
+      ...ec2.provisioner,
+      launchTemplateVersion: { type: "pinned", version: "12" } as const,
+      statusQualification: {
+        imageId: "ami-0123456789abcdef0",
+        roleId: "AROAFIXTUREBOOTSTRAP01",
+        evidenceSha256: "b".repeat(64),
+      },
+    },
+  };
+  const compiled = rewrite(config, {
+    ...spec,
+    mode: "active",
+    profiles: [qualified, fargate],
+  });
+  const template = synthesize(compiled);
+  const policies = Object.values(template.findResources("AWS::IAM::Policy"));
+  const status = policies.filter((policy) =>
+    JSON.stringify(policy).includes("STATUS#${aws:userid}"),
+  );
+  assert.equal(status.length, 1);
+  assert.deepEqual(status[0].Properties.Roles, [
+    ec2.provisioner.bootstrapRoleArn.split("/").at(-1),
+  ]);
+  assert.equal(status[0].Properties.PolicyDocument.Statement.length, 1);
+  const [statement] = status[0].Properties.PolicyDocument.Statement;
+  assert.equal(statement.Action, "dynamodb:PutItem");
+  assert.deepEqual(statement.Condition["ForAllValues:StringEquals"], {
+    "dynamodb:LeadingKeys": ["STATUS#${aws:userid}"],
+  });
+  assert.deepEqual(statement.Condition.NumericEquals, {
+    "ec2:RoleDelivery": "2.0",
+  });
+  assert.match(
+    JSON.stringify(statement.Condition.ArnLike["ec2:SourceInstanceARN"]),
+    /:ec2:ap-southeast-2:111122223333:instance\/\*/u,
+  );
+  assert.deepEqual(statement.Condition.Null, {
+    "dynamodb:LeadingKeys": "false",
+    "dynamodb:EnclosingOperation": "true",
+  });
+  assert.doesNotMatch(
+    JSON.stringify(
+      synthesize(
+        rewrite(compiled, { ...compiled.runtime.spec, mode: "dry-run" }),
+      ).toJSON(),
+    ),
+    /STATUS#/u,
+  );
+
+  assert.throws(
+    () =>
+      rewrite(config, {
+        ...spec,
+        profiles: [
+          {
+            ...qualified,
+            provisioner: {
+              ...qualified.provisioner,
+              launchTemplateVersion: { type: "alias", name: "$Latest" },
+            },
+          },
+          fargate,
+        ],
+      }),
+    /numeric pinned Launch Template/u,
+  );
+  assert.throws(
+    () =>
+      rewrite(config, {
+        ...spec,
+        profiles: [
+          qualified,
+          {
+            ...fargate,
+            provisioner: {
+              ...fargate.provisioner,
+              bootstrapRoleArn: ec2.provisioner.bootstrapRoleArn,
+            },
+          },
+        ],
+      }),
+    /dedicated EC2 bootstrap role/u,
+  );
 });
 
 test("dry run uses neither lifecycle mutations nor event consumers", () => {
@@ -601,6 +822,10 @@ test("dry run uses neither lifecycle mutations nor event consumers", () => {
     template.resourceCountIs("AWS::ECS::Service", 1);
     template.resourceCountIs("AWS::SQS::Queue", 0);
     template.resourceCountIs("AWS::Events::Rule", 0);
+    template.hasResourceProperties("AWS::Lambda::Function", {
+      ReservedConcurrentExecutions: 0,
+      Environment: { Variables: Match.objectLike({ HELLO_ENABLED: "false" }) },
+    });
     const [task] = Object.values(
       template.findResources("AWS::ECS::TaskDefinition"),
     );

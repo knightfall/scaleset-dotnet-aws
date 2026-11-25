@@ -220,6 +220,34 @@ function validateProfile(
       spec.aws,
       `${prefix}/instanceProfileArn`,
     );
+    if (provisioner.statusQualification !== undefined) {
+      if (
+        platform.os !== "linux" ||
+        provisioner.launchTemplateVersion.type !== "pinned" ||
+        BigInt(provisioner.launchTemplateVersion.version) > maximumScaleSetId
+      ) {
+        fail(
+          `${prefix}/statusQualification`,
+          "Supervisor STATUS requires a Linux profile and a numeric pinned Launch Template version.",
+        );
+      }
+      if (
+        spec.profiles.some(
+          (other) =>
+            other !== profile &&
+            (other.provisioner.bootstrapRoleArn ===
+              provisioner.bootstrapRoleArn ||
+              (other.provisioner.type === "fargate" &&
+                other.provisioner.executionRoleArn ===
+                  provisioner.bootstrapRoleArn)),
+        )
+      ) {
+        fail(
+          `${prefix}/bootstrapRoleArn`,
+          "Supervisor STATUS requires a dedicated EC2 bootstrap role.",
+        );
+      }
+    }
   } else {
     requireReference(
       spec.ecsClusters,

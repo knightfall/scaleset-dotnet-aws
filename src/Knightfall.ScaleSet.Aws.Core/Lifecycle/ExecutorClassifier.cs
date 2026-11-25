@@ -1,3 +1,4 @@
+using System.Collections.Immutable;
 using Knightfall.ScaleSet.Aws.Core.Planning;
 
 namespace Knightfall.ScaleSet.Aws.Core.Lifecycle;
@@ -10,6 +11,7 @@ public static class ExecutorClassifier
     private static readonly ExecutorClassification Idle = new(true, false, false, RunnerSlotState.Idle);
     private static readonly ExecutorClassification Busy = new(true, false, false, RunnerSlotState.Busy);
     private static readonly ExecutorClassification Completed = new(true, false, true, RunnerSlotState.Unknown);
+    private static readonly ExecutorClassification Warm = Unknown with { CoversIdleReserve = true };
 
     public static ExecutorClassification Classify(
         ExecutorState executor, DateTimeOffset now, TimeSpan freshness, TimeSpan logFlushGrace)
@@ -36,7 +38,16 @@ public static class ExecutorClassifier
         {
             return Starting;
         }
-        if (resource.State != ExecutorResourceState.Running || executor.RunnerId is not long runnerId)
+        if (resource.State != ExecutorResourceState.Running)
+        {
+            return Unknown;
+        }
+        // A fresh, exact Fargate allocation covers only the warm reserve, including before GitHub registration.
+        if (executor.Binding.Provider is FargateExecutorIdentity && executor.Job is null && executor.Process is null)
+        {
+            return Warm;
+        }
+        if (executor.RunnerId is not long runnerId)
         {
             return Unknown;
         }
@@ -77,6 +88,7 @@ public static class ExecutorClassifier
 
         long occupied = coverage.UnownedOccupied;
         var matched = new HashSet<long>();
+        var warm = ImmutableArray.CreateBuilder<WarmRunnerCandidate>();
         bool coherent = true;
         foreach (var executor in inventory.Executors)
         {
@@ -86,6 +98,13 @@ public static class ExecutorClassifier
                 continue;
             }
             occupied++;
+            if (classification.CoversIdleReserve && executor.State.RunnerId is > 0)
+            {
+                var observedAt = executor.State.Resource!.ObservedAt;
+                var earliest = (observedAt < coverage.ObservedAt ? observedAt : coverage.ObservedAt).ToUniversalTime();
+                var validThrough = DateTimeOffset.MaxValue - earliest < freshness ? DateTimeOffset.MaxValue : earliest + freshness;
+                warm.Add(new WarmRunnerCandidate(executor, validThrough));
+            }
             if (classification.SlotState == RunnerSlotState.Busy && demand.MessageId is long messageId &&
                 executor.State.Job is { } job && job.SessionId == demand.SessionId && job.MessageId == messageId &&
                 job.ObservedAt == demand.ObservedAt && !matched.Add(job.RequestId))
@@ -96,7 +115,10 @@ public static class ExecutorClassifier
 
         int insideAssigned = coherent && matched.Count <= demand.TotalAssignedJobs ? matched.Count : 0;
         return new ListenerCapacity(Math.Min(maximum, coverage.BackendCapacityCeiling.Value),
-            (int)Math.Min(int.MaxValue, occupied - insideAssigned));
+            (int)Math.Min(int.MaxValue, occupied - insideAssigned))
+        {
+            WarmCandidates = coherent ? warm.ToImmutable() : [],
+        };
     }
 
     private static bool IsFresh(DateTimeOffset observedAt, DateTimeOffset now, TimeSpan freshness) =>

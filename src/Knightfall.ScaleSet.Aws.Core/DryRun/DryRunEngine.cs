@@ -113,8 +113,16 @@ public static class DryRunEngine
                 var plan = CapacityPlanner.Plan(profile, observation.Demand, observation.Inventory, clock);
                 var (outcome, reason) = CapacityPlanner.TelemetryOutcome(profile, plan);
                 diagnostics?.Complete(outcome, reason);
+                string? cleanupMode = null;
+                if (profile.Provisioner is Ec2ProvisionerConfiguration ec2)
+                {
+                    cleanupMode = ec2.StatusQualification is null ? "external-reclamation-required" : "qualified-supervisor";
+                }
                 reports.Add(new DryRunProfileReport(profile.Id, profile.State, profile.Provisioner.Type,
-                    observation.Demand?.ObservedAt, observation.Inventory?.ObservedAt, plan));
+                    observation.Demand?.ObservedAt, observation.Inventory?.ObservedAt, plan)
+                {
+                    Ec2CleanupMode = cleanupMode,
+                });
             }
             catch (ArgumentException)
             {

@@ -53,14 +53,15 @@ internal sealed class MixedRuntimeFixture : IAsyncDisposable
     private string ControllerDefinition { get; set; } = null!;
     private string ControllerSubnet { get; set; } = null!;
 
-    internal static async Task<MixedRuntimeFixture> CreateAsync(string mode, CancellationToken token)
+    internal static async Task<MixedRuntimeFixture> CreateAsync(string mode, CancellationToken token,
+        bool sharedFargateCluster = false, long remainingFargateCpuUnits = 32_768, int? warmFargateMaximum = null)
     {
         var cloud = await MixedControllerCloud.StartAsync(token);
         MixedRuntimeFixture? fixture = null;
         try
         {
             fixture = new MixedRuntimeFixture(cloud, await MiniStackTable.CreateAsync(token));
-            await fixture.SeedAsync(mode, token);
+            await fixture.SeedAsync(mode, sharedFargateCluster, remainingFargateCpuUnits, warmFargateMaximum, token);
             return fixture;
         }
         catch
@@ -77,7 +78,8 @@ internal sealed class MixedRuntimeFixture : IAsyncDisposable
         }
     }
 
-    private async Task SeedAsync(string mode, CancellationToken token)
+    private async Task SeedAsync(string mode, bool sharedFargateCluster, long remainingFargateCpuUnits, int? warmFargateMaximum,
+        CancellationToken token)
     {
         string raw = await File.ReadAllTextAsync(Path.Combine(AppContext.BaseDirectory, "mixed-ec2-fargate.json"), token);
         var root = JsonNode.Parse(raw.Replace("111122223333", MixedControllerCloud.Account, StringComparison.Ordinal)
@@ -128,8 +130,9 @@ internal sealed class MixedRuntimeFixture : IAsyncDisposable
             var provisioner = profile["provisioner"]!;
             provisioner["network"] = networkName;
             profile["platform"]!["arch"] = "x64";
-            profile["capacity"]!["idleReserve"] = 0;
-            profile["capacity"]!["maxRunners"] = 1;
+            int? warmMaximum = kind == "fargate" ? warmFargateMaximum : null;
+            profile["capacity"]!["idleReserve"] = warmMaximum is null ? 0 : 1;
+            profile["capacity"]!["maxRunners"] = warmMaximum ?? 1;
 
             if (kind == "ec2")
             {
@@ -152,8 +155,15 @@ internal sealed class MixedRuntimeFixture : IAsyncDisposable
                 var source = await FargateNativeFixture.CreateAsync(token);
                 _seedFixtures.Add(source);
                 var fargateProfile = Assert.IsType<FargateProvisionerConfiguration>(source.Configuration.Profiles[0].Provisioner);
-                string cluster = provisioner["cluster"]!.GetValue<string>();
-                clusters[cluster] = new JsonObject { ["type"] = "import", ["arn"] = source.ClusterArn };
+                if (sharedFargateCluster)
+                {
+                    provisioner["cluster"] = "control-plane";
+                }
+                else
+                {
+                    string cluster = provisioner["cluster"]!.GetValue<string>();
+                    clusters[cluster] = new JsonObject { ["type"] = "import", ["arn"] = source.ClusterArn };
+                }
                 networks[networkName] = Network(source.Configuration.Networks[fargateProfile.Network]);
                 provisioner["taskDefinitionArn"] = source.DefinitionArn;
                 provisioner["bootstrapRoleArn"] = fargateProfile.BootstrapRoleArn;
@@ -194,13 +204,27 @@ internal sealed class MixedRuntimeFixture : IAsyncDisposable
         {
             profiles = approvals,
             quota = new FargateQuotaEvidence(MixedControllerCloud.Account, MixedControllerCloud.Region,
-                now, now.AddMinutes(10), 32_768, 0),
+                now, now.AddMinutes(10), remainingFargateCpuUnits, 0),
         }, JsonSerializerOptions.Web);
         GitHub = await GitHubProtocolHost.StartAsync(Profiles.Values.Select(value => value.GitHub).ToArray(), token, PacePollsAsync);
     }
 
     internal Task<string> StartControllerTaskAsync(CancellationToken token) =>
         Cloud.StartControllerTaskAsync(ControllerCluster, ControllerDefinition, ControllerSubnet, token);
+
+    internal Task<string> StartUnrelatedServiceTaskAsync(CancellationToken token) =>
+        Cloud.StartControllerTaskAsync(ControllerCluster, ControllerDefinition, ControllerSubnet, token, "service:unrelated-fixture");
+
+    internal void EnableRefreshableQuota()
+    {
+        var input = JsonNode.Parse(FargateEvidence)!.AsObject();
+        input["quotaSource"] = new JsonObject
+        {
+            ["bucket"] = MixedControllerCloud.QuotaBucket,
+            ["key"] = MixedControllerCloud.QuotaKey,
+        };
+        FargateEvidence = input.ToJsonString();
+    }
 
     private T Native<T>() where T : ClientConfig, new() =>
         ControllerAwsClientConfiguration.Create<T>(MixedControllerCloud.Region, Cloud.NativeEndpoint);

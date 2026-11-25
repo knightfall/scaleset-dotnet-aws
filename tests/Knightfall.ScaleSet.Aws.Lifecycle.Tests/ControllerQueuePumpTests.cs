@@ -23,10 +23,13 @@ public sealed class ControllerQueuePumpTests
 {
     private const string Queue = "https://aws.fixture.invalid/111122223333/events";
     private const string OtherAllocation = "12345678-0000-0000-0000-000000000002";
+    private const string MissingAllocation = "12345678-0000-0000-0000-000000000003";
     private const string SuccessorTask = "arn:aws:ecs:us-east-1:000000000000:task/controller/00000000000000000000000000000002";
 
-    [Fact(Timeout = 10_000)]
-    public async Task Ec2HintsRefreshOnlyTheExactDurableBindingAndDoNotProveTermination()
+    [Theory(Timeout = 10_000)]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task Ec2HintsRequireExactReadbackAndHandleDetachedTerminalDuplicates(bool terminal)
     {
         var token = TestContext.Current.CancellationToken;
         using var stop = CancellationTokenSource.CreateLinkedTokenSource(token);
@@ -38,12 +41,24 @@ public sealed class ControllerQueuePumpTests
         var profile = new LifecycleProfile(Deployment, ProfileId);
         var valid = Binding(profile, Instance1, Allocation);
         var mismatched = Binding(profile, Instance2, OtherAllocation);
+        var missing = Binding(profile, Instance4, MissingAllocation);
         var lease = Assert.IsType<ActiveControllerAuthority>(ownership.ReadAuthority()).Lease;
         Assert.Equal(LifecycleWriteOutcome.Committed, await store.BindExecutorAsync(lease.Fence, valid, token));
         Assert.Equal(LifecycleWriteOutcome.Committed, await store.BindExecutorAsync(lease.Fence, mismatched, token));
+        Assert.Equal(LifecycleWriteOutcome.Committed, await store.BindExecutorAsync(lease.Fence, missing, token));
         using var ec2 = new Ec2InspectionFixture(clock: clock)
         {
-            InventoryResponse = query => AwsWireTransport.Xml(InventoryPage(Instance(query["Filter.4.Value.1"]!))),
+            InventoryResponse = query =>
+            {
+                string instance = query["Filter.4.Value.1"]!;
+                if (instance == Instance4)
+                {
+                    return AwsWireTransport.Xml(InventoryPage());
+                }
+                string readback = terminal
+                    ? Instance(instance, "terminated", 48, originalLaunch: null) : Instance(instance);
+                return AwsWireTransport.Xml(InventoryPage(readback));
+            },
         };
         using var provider = ec2.CreateProvider(configuration);
         var providers = new Dictionary<string, Ec2EffectProvider>(StringComparer.Ordinal) { [ProfileId] = provider };
@@ -65,7 +80,9 @@ public sealed class ControllerQueuePumpTests
                     {
                         Message("unowned", Event(Instance3)),
                         Message("confirmed", Event(Instance1)),
+                        Message("duplicate", Event(Instance1)),
                         Message("mismatch", Event(Instance2)),
+                        Message("missing", Event(Instance4)),
                     },
                 }));
             }
@@ -77,11 +94,13 @@ public sealed class ControllerQueuePumpTests
 
         await pump.RunEc2Async(Queue, ownership, stop.Token);
 
-        Assert.Equal(["unowned", "confirmed"], receipts);
-        Assert.Equal(ExecutorResourceState.Running, (await store.ReadExecutorAsync(profile, Allocation, token))?.State.Resource?.State);
+        Assert.Equal(["unowned", "confirmed", "duplicate"], receipts);
+        Assert.Equal(terminal ? ExecutorResourceState.IrreversiblyTerminated : ExecutorResourceState.Running,
+            (await store.ReadExecutorAsync(profile, Allocation, token))?.State.Resource?.State);
         Assert.Null((await store.ReadExecutorAsync(profile, OtherAllocation, token))?.State.Resource);
+        Assert.Null((await store.ReadExecutorAsync(profile, MissingAllocation, token))?.State.Resource);
         var targeted = ec2.Requests.Where(request => request["Action"] == "DescribeInstances");
-        Assert.Equal([Instance1, Instance2], targeted.Select(request => request["Filter.4.Value.1"]));
+        Assert.Equal([Instance1, Instance1, Instance2, Instance4], targeted.Select(request => request["Filter.4.Value.1"]));
     }
 
     [Fact(Timeout = 10_000)]

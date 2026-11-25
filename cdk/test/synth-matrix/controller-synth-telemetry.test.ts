@@ -344,6 +344,66 @@ test("typed telemetry rejects unknown fields, plaintext headers and malformed ho
   );
 });
 
+test("credentialed remote OTLP requires TLS for each resolved signal", () => {
+  const secure = "https://collector.example.invalid";
+  const unsecured = "http://collector.example.invalid";
+  const secret = { secretArn: commonSecret };
+
+  for (const signal of ["traces", "metrics", "logs"]) {
+    for (const protocol of ["grpc", "http/protobuf"]) {
+      for (const inherited of [false, true]) {
+        const exporters = {
+          common: {
+            endpoint: secure,
+            ...(inherited ? { headersSecret: secret } : {}),
+          },
+          [signal]: {
+            endpoint: unsecured,
+            protocol,
+            ...(inherited ? {} : { headersSecret: secret }),
+          },
+        };
+        assert.throws(() => resolveControllerTelemetry({ exporters }, aws), {
+          message: `Invalid controller telemetry setting exporters.${signal}.endpoint.`,
+        });
+      }
+    }
+  }
+
+  for (const endpoint of [
+    secure,
+    "http://localhost:4317",
+    "http://127.0.0.2:4317",
+    "http://[::1]:4317",
+  ]) {
+    const resolved = resolveControllerTelemetry(
+      { exporters: { common: { endpoint, headersSecret: secret } } },
+      aws,
+    );
+    assert.equal(resolved.environment.OTEL_EXPORTER_OTLP_ENDPOINT, endpoint);
+    assert.deepEqual(resolved.headers, [
+      { name: "OTEL_EXPORTER_OTLP_HEADERS", ...secret, kmsKeyArn: undefined },
+    ]);
+  }
+
+  assert.throws(
+    () =>
+      resolveControllerTelemetry(
+        {
+          exporters: {
+            common: { endpoint: unsecured },
+            metrics: { headersSecret: secret },
+          },
+        },
+        aws,
+      ),
+    {
+      message:
+        "Invalid controller telemetry setting exporters.common.endpoint.",
+    },
+  );
+});
+
 test("telemetry and explicit Fargate preflight coexist in the same controller container", () => {
   const configuration = compileConfig(
     readFileSync(

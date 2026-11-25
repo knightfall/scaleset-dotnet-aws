@@ -109,7 +109,7 @@ export function deployController(
   const fargatePreflight = validateFargatePreflight(
     runtime,
     target.fargatePreflight,
-  );
+  )?.environment;
   resolveControllerTelemetry(target.telemetry, runtime.spec.aws);
   const aws = (...args: string[]) =>
     run("aws", [

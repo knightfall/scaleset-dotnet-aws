@@ -4,6 +4,16 @@ Use one AWS account and Region per deployment. Start with the [profile binding t
 
 ## Prepare the artifacts
 
+The default Direct EC2 mode holds a still-running host after GitHub reports job
+completion. Verify process exit and log collection before reclaiming it through
+your approved external procedure. For automatic cleanup, bind the qualified AMI
+and Launch Template to the supervisor's status grant and boot proof. [EC2 cleanup qualification](profile-bindings.md#qualify-ec2-supervisor-cleanup)
+
+Start with a [verified release archive](releases/VERIFYING.md) or build an
+archive from the reviewed source as shown below.
+The [maintainer release process](releases/PUBLISHING.md) records how the
+archives, image SBOMs and provenance are generated.
+
 1. Check out the reviewed commit. Use the pinned .NET 10 SDK, Node, and npm versions, then install the locked dependencies. Keep the authored YAML, runtime JSON, image archive, and CDK assembly together in the deployment record. Store GitHub credentials and collector headers in the approved Secrets Manager secrets.
 2. Copy the binding template into your operator workspace and fill in the AWS and GitHub bindings. Use a dry-run configuration for the first qualification pass. Emit the preliminary runtime and check its schema and digest. Repeat these commands with the final image digest after registry publication.
 
@@ -28,6 +38,7 @@ Run the same Release build and package the CPU architecture selected in the YAML
 rid=linux-arm64
 arch=arm64
 image_tag="controller-$(git rev-parse --short=12 HEAD)-$rid"
+local_image="scaleset-aws-controller:$image_tag"
 archive="$PWD/operator-staging/controller-$rid.tar.gz"
 
 dotnet publish "$controller_project" --configuration Release /t:PublishContainer \
@@ -36,6 +47,17 @@ dotnet publish "$controller_project" --configuration Release /t:PublishContainer
 
 python3 tests/oci/verify_controller_image.py "$archive" "$arch" --assembly \
   src/Knightfall.ScaleSet.Aws.Controller/bin/Release/net10.0/Knightfall.ScaleSet.Aws.Controller.dll
+```
+
+For a downloaded release, complete the [attested manifest and payload checks](releases/VERIFYING.md#verify-the-published-manifest-and-payloads)
+before importing any image. Use `download_dir` and `commit` from that verified
+release. Select the architecture configured in your YAML.
+
+```sh
+rid=linux-arm64
+archive="$download_dir/scaleset-aws-controller-$rid.tar.gz"
+local_image="scaleset-aws-controller:git-$commit-$rid"
+image_tag="controller-$commit-$rid"
 ```
 
 ## Pin the registry manifest
@@ -51,7 +73,7 @@ registry="$account.dkr.ecr.$region.amazonaws.com"
 test "$(aws sts get-caller-identity --region "$region" --query Account --output text)" = "$account" || exit 1
 aws ecr get-login-password --region "$region" | docker login --username AWS --password-stdin "$registry"
 docker image load --input "$archive"
-docker image tag "scaleset-aws-controller:$image_tag" "$registry/$repository:$image_tag"
+docker image tag "$local_image" "$registry/$repository:$image_tag"
 docker image push "$registry/$repository:$image_tag"
 
 registry_digest=$(aws ecr describe-images --region "$region" --registry-id "$account" \
@@ -64,7 +86,7 @@ Compare the published manifest with the qualified archive. If registry transport
 
 ## Review synth and diff
 
-Select a positive generation greater than the deployed generation. Use the same candidate YAML, Fargate preflight JSON, and optional host telemetry settings for both review and apply. The examples assume paths without single quotes. Omit `--telemetry` and its argument to use the defaults. Keep the Fargate approval and fresh quota evidence in the invoking environment when the enabled Fargate profiles require them. [Fargate preflight input](controller-local.md#controller-preflights) · [Telemetry deployment settings](operator-telemetry.md)
+Select a positive generation greater than the deployed generation. Use the same candidate YAML, Fargate preflight JSON, and optional host telemetry settings for both review and apply. The examples assume paths without single quotes. Omit `--telemetry` and its argument to use the defaults. Include the Fargate approvals and the designated quota source when enabled Fargate profiles require them. Verify that the source has a current sample before activation. [Fargate preflight input](controller-local.md#controller-preflights) · [Telemetry deployment settings](operator-telemetry.md)
 
 ```sh
 generation=1
@@ -115,6 +137,33 @@ npm --prefix cdk run deploy:controller -- \
 2. Query `curl --fail-with-body --silent --show-error http://127.0.0.1:8080/readyz` from an approved probe in the controller's network namespace. It reports authority and per-profile readiness. ECS uses `/healthz` for process and supervision liveness. The stock service binds health to loopback and disables ECS Exec, so use fresh profile telemetry and lifecycle evidence for routine deployed readiness.
 3. Run the receiver smoke check from the intended network, then confirm queryable metrics, traces, and logs for the new `service.instance.id`. Confirm that enabled profiles have fresh readiness and that the resource and profile attributes match the artifact. Investigate zero readiness or absent data with the [telemetry playbook](operator-telemetry.md).
 4. Record activation time, exact owner task ARN and lease epoch, runtime version and generation, task definition ARN, image digest, and the qualification evidence for each profile. Retain the previous compatible YAML, runtime, image digest, and assembly.
+
+## Cut over runner HELLO registration
+
+The controller stack reports a `Bootstrap…HelloUrl` output for each enabled
+bootstrap role. The output description identifies the matching role ARN. A
+dry-run deployment provides stable URLs with the brokers disabled. The active
+stack grants each role its own AWS IAM Function URL invocation and
+principal-scoped OFFER consumption. Each role has four concurrent broker
+invocations. Profiles sharing a role also share its invocation budget.
+Active runner deployment requires a commercial AWS Region with Function URLs.
+GovCloud and China configurations remain available for dry-run without the broker.
+Runner subnets need an approved outbound Internet route for HTTPS to the role's exact endpoint.
+[Function URL regional availability and networking](https://docs.aws.amazon.com/lambda/latest/dg/urls-configuration.html) · [GovCloud service differences](https://docs.aws.amazon.com/govcloud-us/latest/UserGuide/govcloud-lambda.html) · [China service differences](https://docs.amazonaws.cn/en_us/aws/latest/userguide/lambda.html)
+
+The broker takes the principal from AWS authentication, validates up to 1 KiB
+of HELLO input, and conditionally creates one canonical `HELLO#BROKER#` item
+per principal. JIT staging and begin require that exact broker record. Legacy
+runner grants cannot address the broker's partition namespace.
+The broker sets a one-hour TTL. Exact retries keep the same item and expiry.
+The controller rejects expired registrations immediately, and DynamoDB removes
+the physical record asynchronously. The active bootstrap role denies direct
+HELLO changes on the lifecycle table. [Lambda Function URL authentication](https://docs.aws.amazon.com/lambda/latest/dg/urls-auth.html) · [DynamoDB TTL](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/TTL.html)
+
+1. For a deployment using direct HELLO writes, use the previous release to [drain and retire every granted profile](#add-drain-and-retire-a-profile). Settle staged or executing JIT operations, issued offers, and running jobs while their original grants remain. Old runners can finish consuming already issued offers during this phase. Keep the old generation through confirmed session retirement and durable catalog tombstones for all prior profiles. This is required because switching to dry-run removes their grants.
+2. Prepare a higher dry-run generation with fresh profile IDs for the new broker-backed bindings. Run `preflight retire` against the exact deployed runtime and confirm it authorizes the grant removal. Fence the old controller and use the protected deployment path for the dry-run generation. Revoke any remaining direct HELLO writers, including out-of-band role grants, and verify denial before continuing. Preserve the table and the lease, catalog, executor, effect and handoff records. The controller ignores any retained HELLO from the old partition namespace, even if it contains the broker's issuer field. Remove obsolete legacy rows with the operator recovery identity after accounting for all pre-cutover handoffs.
+3. Use the matching stack outputs in `helloEndpoint` for the rebuilt AMIs and Fargate runner images. Review the exact Launch Template and task-definition revisions with the new controller. Check the IAM policies, TLS network path, and expected invocation throughput for each role. Exclude untrusted principals from direct invocation of the broker function and its qualifiers. Apply the active generation with the updated bindings and verify that older runner binaries cannot start a direct registration.
+4. Use a compatible forward generation for rollback of unrelated settings. Preserve the broker URLs, runner revisions, and grants through the rollback. A controller from before this cutover cannot stage a broker-issued TTL record. Reverting the entire protocol requires a drained deployment and a separately reviewed migration.
 
 ## Add, drain, and retire a profile
 

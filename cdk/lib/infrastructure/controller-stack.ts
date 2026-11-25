@@ -2,7 +2,14 @@ import { createHash } from "node:crypto";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { App, CfnOutput, Duration, RemovalPolicy, Stack } from "aws-cdk-lib";
+import {
+  App,
+  ArnFormat,
+  CfnOutput,
+  Duration,
+  RemovalPolicy,
+  Stack,
+} from "aws-cdk-lib";
 import * as dynamodb from "aws-cdk-lib/aws-dynamodb";
 import * as ecs from "aws-cdk-lib/aws-ecs";
 import * as events from "aws-cdk-lib/aws-events";
@@ -12,6 +19,7 @@ import * as kms from "aws-cdk-lib/aws-kms";
 import * as sqs from "aws-cdk-lib/aws-sqs";
 import type { Construct } from "constructs";
 import type { compileConfig } from "../config/compiler.ts";
+import { awsPartition } from "../config/semantics.ts";
 import type {
   RunnerControllerRuntime,
   RunnerProfile,
@@ -29,9 +37,11 @@ import {
 } from "./deployment-input.ts";
 import type { ControllerDeploymentEnvironment } from "./deployment-input.ts";
 import { validateFargatePreflight } from "./fargate-preflight.ts";
+import { helloIngress } from "./hello-ingress.ts";
 import {
   bootstrapPolicy,
   ec2Profiles,
+  ec2SupervisorStatusPolicy,
   fargateProfiles,
   grantEc2,
   grantFargate,
@@ -77,6 +87,12 @@ export class ControllerInfrastructure extends Stack {
     const enabled = spec.profiles
       .filter(({ state }) => state !== "disabled")
       .toSorted((a, b) => (a.id < b.id ? -1 : Number(a.id > b.id)));
+    const supportsHelloIngress = awsPartition(spec.aws.region) === "aws";
+    if (active && enabled.length > 0 && !supportsHelloIngress) {
+      throw new Error(
+        "Active runner HELLO requires Lambda Function URLs, which are unavailable in this AWS partition.",
+      );
+    }
     const selected = active || inspect ? enabled : [];
     const ec2 = ec2Profiles(selected);
     const fargate = fargateProfiles(selected);
@@ -111,12 +127,34 @@ export class ControllerInfrastructure extends Stack {
         conditions: { StringEquals: { "s3:VersionId": artifact.versionId } },
       }),
     );
+    if (fargatePreflight?.quotaSource) {
+      const { bucket, key } = fargatePreflight.quotaSource;
+      this.controllerRole.addToPolicy(
+        new iam.PolicyStatement({
+          actions: ["s3:GetObject"],
+          resources: [
+            this.formatArn({
+              service: "s3",
+              account: "",
+              region: "",
+              resource: bucket,
+              resourceName: key,
+              arnFormat: ArnFormat.SLASH_RESOURCE_NAME,
+            }),
+          ],
+          conditions: { StringEquals: { "s3:ResourceAccount": this.account } },
+        }),
+      );
+    }
     if (!active) {
       this.grantSnapshot(runtime);
     }
     grantTableAccess(this.controllerRole, this.trackingTable, active, inspect);
     grantEc2(this.controllerRole, runtime, ec2, active);
     grantFargate(this.controllerRole, runtime, fargate, clusters, active);
+    const runnerPolicyDependencies = supportsHelloIngress
+      ? this.configureBootstrapRoles(enabled, active)
+      : [];
 
     const args = [
       "run",
@@ -134,7 +172,22 @@ export class ControllerInfrastructure extends Stack {
     if (active) {
       grantHostFence(this.controllerRole, this.hostingCluster);
       grantGitHubCredentials(this.controllerRole, runtime, enabled);
-      this.attachBootstrapPolicies(enabled);
+      const statusRoles = new Set(
+        ec2
+          .filter(
+            ({ provisioner }) => provisioner.statusQualification !== undefined,
+          )
+          .map(({ provisioner }) => provisioner.bootstrapRoleArn),
+      );
+      for (const arn of statusRoles) {
+        const id = stableId("Ec2SupervisorStatus", arn);
+        const role = iam.Role.fromRoleArn(this, id, arn);
+        const policy = new iam.Policy(this, `${id}Policy`, {
+          roles: [role],
+          statements: [ec2SupervisorStatusPolicy(this.trackingTable)],
+        });
+        runnerPolicyDependencies.push(policy);
+      }
       if (ec2.length > 0) {
         const { queue, dlq } = this.observationQueues("Ec2");
         this.addEventRule(
@@ -176,14 +229,15 @@ export class ControllerInfrastructure extends Stack {
     }
 
     this.runtimeArguments = args;
-    createControllerService(this, {
+    const service = createControllerService(this, {
       spec,
       clusterArn: this.hostingCluster.arn,
       taskRole: this.controllerRole,
       command: this.runtimeArguments,
-      fargatePreflight,
+      fargatePreflight: fargatePreflight?.environment,
       telemetry,
     });
+    service.node.addDependency(...runnerPolicyDependencies);
     new CfnOutput(this, "DeploymentIdentity", {
       value: deploymentIdentity(runtime),
     });
@@ -255,7 +309,11 @@ export class ControllerInfrastructure extends Stack {
     return aliases;
   }
 
-  private attachBootstrapPolicies(profiles: readonly RunnerProfile[]) {
+  private configureBootstrapRoles(
+    profiles: readonly RunnerProfile[],
+    active: boolean,
+  ) {
+    const dependencies: Construct[] = [];
     const roleArns = [
       ...new Set(
         profiles.map(({ provisioner }) => provisioner.bootstrapRoleArn),
@@ -264,11 +322,19 @@ export class ControllerInfrastructure extends Stack {
     for (const arn of roleArns) {
       const id = stableId("Bootstrap", arn);
       const role = iam.Role.fromRoleArn(this, id, arn);
-      new iam.Policy(this, `${id}Policy`, {
-        roles: [role],
-        statements: bootstrapPolicy(this.trackingTable),
-      });
+      const ingress = helloIngress(this, id, this.trackingTable, role, active);
+      if (active) {
+        const policy = new iam.Policy(this, `${id}Policy`, {
+          roles: [role],
+          statements: [
+            ...bootstrapPolicy(this.trackingTable),
+            ...ingress.statements,
+          ],
+        });
+        dependencies.push(...ingress.dependencies, policy);
+      }
     }
+    return dependencies;
   }
 
   private grantSnapshot(runtime: RunnerControllerRuntime) {

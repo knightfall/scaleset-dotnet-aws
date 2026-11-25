@@ -277,9 +277,50 @@ export function grantFargate(
 
 export function bootstrapPolicy(table: ITable) {
   return [
-    bootstrapStatement(table, "dynamodb:PutItem", "HELLO#${aws:userid}"),
     bootstrapStatement(table, "dynamodb:DeleteItem", "OFFER#${aws:userid}"),
+    new iam.PolicyStatement({
+      effect: iam.Effect.DENY,
+      actions: [
+        "dynamodb:PutItem",
+        "dynamodb:UpdateItem",
+        "dynamodb:DeleteItem",
+        "dynamodb:BatchWriteItem",
+        "dynamodb:PartiQLInsert",
+        "dynamodb:PartiQLUpdate",
+        "dynamodb:PartiQLDelete",
+      ],
+      resources: [table.tableArn],
+      conditions: {
+        "ForAnyValue:StringLike": { "dynamodb:LeadingKeys": ["HELLO#*"] },
+      },
+    }),
   ];
+}
+
+export function ec2SupervisorStatusPolicy(table: ITable) {
+  const stack = Stack.of(table);
+  return new iam.PolicyStatement({
+    actions: ["dynamodb:PutItem"],
+    resources: [table.tableArn],
+    conditions: {
+      "ForAllValues:StringEquals": {
+        "dynamodb:LeadingKeys": ["STATUS#${aws:userid}"],
+      },
+      ArnLike: {
+        "ec2:SourceInstanceARN": stack.formatArn({
+          service: "ec2",
+          resource: "instance",
+          resourceName: "*",
+          arnFormat: ArnFormat.SLASH_RESOURCE_NAME,
+        }),
+      },
+      NumericEquals: { "ec2:RoleDelivery": "2.0" },
+      Null: {
+        "dynamodb:LeadingKeys": "false",
+        "dynamodb:EnclosingOperation": "true",
+      },
+    },
+  });
 }
 
 function bootstrapStatement(table: ITable, action: string, leadingKey: string) {

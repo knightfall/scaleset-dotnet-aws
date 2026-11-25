@@ -22,7 +22,7 @@ internal sealed class LinuxRunnerBoundary : ILinuxOneJobBoundary
         _listener = listener;
     }
 
-    internal static LinuxRunnerBoundary Verify(LinuxRunnerSettings settings)
+    internal static LinuxRunnerBoundary Verify(LinuxRunnerSettings settings, string? statusQualificationSha256 = null)
     {
         if (!LinuxFiles.IsRoot() || settings.UserId < 1000 || settings.GroupId < 1000 ||
             !LinuxFiles.IsTrustedFile(DropPrivileges, ownerOnly: false) ||
@@ -44,7 +44,8 @@ internal sealed class LinuxRunnerBoundary : ILinuxOneJobBoundary
         if (proof is null || proof.ProtocolVersion != 1 || proof.BootId != bootId || !Guid.TryParseExact(bootId, "D", out _) ||
             proof.RuntimeRoot != settings.RuntimeRoot || proof.UserId != settings.UserId || proof.GroupId != settings.GroupId ||
             proof.ListenerSha256 != settings.ListenerSha256 || !proof.ProcessIsolationVerified ||
-            !proof.Ipv4MetadataDenied || !proof.Ipv6MetadataDenied || !proof.DockerBoundaryVerified)
+            !proof.Ipv4MetadataDenied || !proof.Ipv6MetadataDenied || !proof.DockerBoundaryVerified ||
+            (statusQualificationSha256 is not null && proof.StatusQualificationSha256 != statusQualificationSha256))
         {
             throw Unverified();
         }
@@ -158,4 +159,5 @@ internal sealed record LinuxRunnerSettings(
 
 internal sealed record LinuxRunnerBoundaryProof(
     int ProtocolVersion, string BootId, string RuntimeRoot, string ListenerSha256, uint UserId, uint GroupId,
-    bool ProcessIsolationVerified, bool Ipv4MetadataDenied, bool Ipv6MetadataDenied, bool DockerBoundaryVerified);
+    bool ProcessIsolationVerified, bool Ipv4MetadataDenied, bool Ipv6MetadataDenied, bool DockerBoundaryVerified,
+    string? StatusQualificationSha256 = null);

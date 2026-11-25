@@ -1,3 +1,4 @@
+using System.Buffers;
 using System.Runtime.Versioning;
 using Amazon.DynamoDBv2;
 using Amazon.Runtime;
@@ -15,31 +16,35 @@ internal sealed class Ec2BootstrapApplication(Ec2BootstrapSettings settings, Tim
     {
         settings.Validate();
         Ec2SpentMarker.VerifyDirectory(settings.SpentDirectory);
-        var boundary = LinuxRunnerBoundary.Verify(settings.Runner);
+        var qualification = settings.StatusQualification;
+        var boundary = LinuxRunnerBoundary.Verify(settings.Runner, qualification?.EvidenceSha256);
         using var http = Ec2ImdsV2.CreateHttpClient();
         var metadata = new Ec2ImdsV2(http, Ec2ImdsV2.InstanceEndpoint, clock);
         var verifier = new Ec2BootstrapIdentity(metadata, credentials => Ec2BootstrapIdentity.CreateSts(credentials, settings.Authority.Region));
-        var identity = await verifier.VerifyAsync(settings.Authority, cancellationToken).ConfigureAwait(false);
+        var identity = await verifier.VerifyAsync(settings.Authority, cancellationToken, qualification?.ImageId).ConfigureAwait(false);
 
         using var dynamodb = CreateDynamoDb(identity.Credentials, settings.Authority.Region);
+        using var helloTransport = HelloEndpointRegistration.CreateTransport();
+        var registration = new HelloEndpointRegistration(helloTransport, settings.HelloEndpoint, settings.Authority.Region,
+            identity.Credentials, clock);
         var offers = new DynamoDbBootstrapOfferClient(dynamodb, settings.TableName, identity.AwsUserId, identity.ResourceArn, clock);
         var spent = new Ec2SpentMarker(settings.SpentDirectory, identity.ResourceArn);
         var bootstrap = new RunnerBootstrap(offers, settings.Target, identity.ResourceArn, identity.AwsUserId, spent.TryReserve,
             new LinuxOneJobRunner(boundary), clock, TimeSpan.FromMinutes(5), TimeSpan.FromSeconds(2),
-            ReportAsync, telemetryProvider: RunnerProvisionerType.Ec2);
+            registration.RegisterAsync, ReportAsync, telemetryProvider: RunnerProvisionerType.Ec2);
         return await bootstrap.RunAsync(cancellationToken).ConfigureAwait(false);
 
         async Task ReportAsync(BootstrapRunnerObservation observation, CancellationToken token)
         {
             Console.WriteLine(observation.Exited ? "One-job runner exited." : "One-job runner connected.");
-            if (!settings.PublishStatus)
+            if (qualification is null)
             {
                 return;
             }
 
             try
             {
-                var current = await verifier.VerifyAsync(settings.Authority, token).ConfigureAwait(false);
+                var current = await verifier.VerifyAsync(settings.Authority, token, qualification.ImageId).ConfigureAwait(false);
                 if (current.ResourceArn != identity.ResourceArn || current.AwsUserId != identity.AwsUserId)
                 {
                     Console.Error.WriteLine("Bootstrap status identity changed.");
@@ -50,7 +55,10 @@ internal sealed class Ec2BootstrapApplication(Ec2BootstrapSettings settings, Tim
                     current.ResourceArn, clock);
                 var outcome = await status.PublishAsync(observation.Hello,
                     new JitEc2BootstrapStatus(observation.OfferId, observation.RunnerId, observation.Exited ? 2 : 1,
-                        observation.Exited, clock.GetUtcNow()), token).ConfigureAwait(false);
+                        observation.Exited, clock.GetUtcNow())
+                    {
+                        QualificationSha256 = qualification.EvidenceSha256,
+                    }, token).ConfigureAwait(false);
                 if (outcome != LifecycleWriteOutcome.Committed)
                 {
                     Console.Error.WriteLine("Bootstrap status was not confirmed.");
@@ -77,8 +85,11 @@ internal sealed class Ec2BootstrapApplication(Ec2BootstrapSettings settings, Tim
 
 internal sealed record Ec2BootstrapSettings(
     string TableName, Ec2BootstrapAuthority Authority, RunnerBootstrapTarget Target, string SpentDirectory,
-    LinuxRunnerSettings Runner, bool PublishStatus = false)
+    LinuxRunnerSettings Runner, bool PublishStatus = false, Ec2StatusQualification? StatusQualification = null,
+    string? HelloEndpoint = null)
 {
+    private static readonly SearchValues<char> LowercaseHex = SearchValues.Create("0123456789abcdef");
+
     internal void Validate()
     {
         if (string.IsNullOrWhiteSpace(TableName) || Authority is null || Target is null || Runner is null ||
@@ -92,5 +103,16 @@ internal sealed record Ec2BootstrapSettings(
             throw new ArgumentException("The EC2 bootstrap settings are incomplete.");
         }
         Authority.Validate();
+        if (PublishStatus != (StatusQualification is not null) ||
+            (StatusQualification is { } qualification &&
+             (qualification.RoleId != Authority.RoleId || !IsImageId(qualification.ImageId) ||
+              qualification.EvidenceSha256 is not { Length: 64 } ||
+              qualification.EvidenceSha256.AsSpan().IndexOfAnyExcept(LowercaseHex) >= 0)))
+        {
+            throw new ArgumentException("EC2 supervisor STATUS requires a matching image and role qualification.");
+        }
     }
+
+    private static bool IsImageId(string? id) => id is { Length: 12 or 21 } && id.StartsWith("ami-", StringComparison.Ordinal) &&
+        id.AsSpan(4).IndexOfAnyExcept(LowercaseHex) < 0;
 }

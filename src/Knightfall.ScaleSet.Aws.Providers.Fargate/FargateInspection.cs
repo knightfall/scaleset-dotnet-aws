@@ -1,4 +1,5 @@
 using System.Collections.Immutable;
+using System.Text.Json.Serialization;
 using Knightfall.ScaleSet.Aws.Core.Planning;
 
 namespace Knightfall.ScaleSet.Aws.Providers.Fargate;
@@ -77,7 +78,17 @@ public sealed record FargateTaskObservation(
     long? ProviderVersion = null)
 {
     public bool IsOwned => Incarnation.HasValue;
+
+    public bool IsForeign { get; init; }
+
+    public bool OccupiesProfile => !IsForeign && State != FargateTaskState.Stopped;
+
+    internal FargateNetworkAttachment? Attachment { get; init; }
+
+    internal DateTimeOffset? RunningAttachmentObservedSince { get; init; }
 }
+
+internal sealed record FargateNetworkAttachment(string? AttachmentId, string NetworkInterfaceId, string SubnetId, string PrivateAddress);
 
 public sealed record FargateInventorySnapshot(
     FargateProfileScope Scope,
@@ -98,9 +109,10 @@ public sealed record FargateInventorySnapshot(
     public InventorySample ToPlanningInventory(FargateHeadroom headroom)
     {
         ArgumentNullException.ThrowIfNull(headroom);
-        var slots = Tasks.Where(task => task.IsOwned && task.State != FargateTaskState.Stopped)
-            .Select(task => new RunnerSlot(task.ResourceArn, task.State == FargateTaskState.Pending && task.CreatedAt.HasValue
-                ? RunnerSlotState.Starting : RunnerSlotState.Unknown, OwnershipVerified: true, task.CreatedAt))
+        var slots = Tasks.Where(task => task.OccupiesProfile)
+            .Select(task => new RunnerSlot(task.ResourceArn,
+                task.IsOwned && task.State == FargateTaskState.Pending && task.CreatedAt.HasValue
+                    ? RunnerSlotState.Starting : RunnerSlotState.Unknown, task.IsOwned, task.CreatedAt))
             .ToImmutableArray();
         int? launchHeadroom = IsProfileComplete ? headroom.LaunchSlots : null;
         int? ceiling = launchHeadroom is int launchSlots
@@ -112,7 +124,18 @@ public sealed record FargateInventorySnapshot(
 /// <summary>The remaining on-demand CPU units after usage represented in the operator's sample.</summary>
 public sealed record FargateQuotaEvidence(
     string Account, string Region, DateTimeOffset ObservedAt, DateTimeOffset ExpiresAt,
-    long RemainingCpuUnits, long ReservedCpuUnits);
+    [property: JsonRequired] long RemainingCpuUnits, [property: JsonRequired] long ReservedCpuUnits)
+{
+    private static readonly TimeSpan MaximumAge = TimeSpan.FromMinutes(10);
+
+    [JsonIgnore]
+    public DateTimeOffset ValidUntil => ExpiresAt - ObservedAt < MaximumAge ? ExpiresAt : ObservedAt + MaximumAge;
+
+    public bool IsCurrentFor(string account, string region, DateTimeOffset now) =>
+        Account == account && Region == region && ObservedAt != default && ObservedAt <= now &&
+        now - ObservedAt <= MaximumAge && ExpiresAt > now &&
+        RemainingCpuUnits >= 0 && ReservedCpuUnits >= 0;
+}
 
 public sealed record FargateLaunchReservation(
     Guid AllocationId, int CpuUnits, ImmutableArray<string> EligibleSubnetIds, string? TaskArn = null)

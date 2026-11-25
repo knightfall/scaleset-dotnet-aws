@@ -1,4 +1,5 @@
 import { readFileSync } from "node:fs";
+import { isIPv4 } from "node:net";
 import { awsPartition } from "../config/semantics.ts";
 import type { RunnerControllerRuntime } from "../config/types.ts";
 import { parseYaml } from "../config/yaml.ts";
@@ -91,6 +92,16 @@ function endpoint(value: unknown): value is string {
   if (!authority || /[@%]/u.test(authority)) return false;
   const url = URL.parse(value);
   return url !== null && url.hostname.length > 0 && url.port !== "0";
+}
+
+function credentialTransportAllowed(endpoint: string): boolean {
+  const { protocol, hostname } = new URL(endpoint);
+  return (
+    protocol === "https:" ||
+    hostname === "localhost" ||
+    hostname === "[::1]" ||
+    (isIPv4(hostname) && hostname.startsWith("127."))
+  );
 }
 
 function scopedArn(
@@ -233,6 +244,27 @@ export function resolveControllerTelemetry(
         invalid(`${field}.headersSecret.kmsKeyArn`);
       }
       headers.push({ name: prefix + "HEADERS", secretArn, kmsKeyArn });
+    }
+  }
+  const commonEndpoint = environment.OTEL_EXPORTER_OTLP_ENDPOINT;
+  const commonHasHeaders = headers.some(
+    (header) => header.name === "OTEL_EXPORTER_OTLP_HEADERS",
+  );
+  for (const signal of exportSignals.slice(1)) {
+    const prefix = `OTEL_EXPORTER_OTLP_${signal.toUpperCase()}_`;
+    const signalEndpoint = environment[prefix + "ENDPOINT"];
+    const effectiveEndpoint = signalEndpoint ?? commonEndpoint;
+    const hasHeaders =
+      commonHasHeaders ||
+      headers.some((header) => header.name === prefix + "HEADERS");
+    if (
+      effectiveEndpoint &&
+      hasHeaders &&
+      !credentialTransportAllowed(effectiveEndpoint)
+    ) {
+      invalid(
+        `exporters.${signalEndpoint === undefined ? "common" : signal}.endpoint`,
+      );
     }
   }
   return { environment, headers };

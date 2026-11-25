@@ -59,6 +59,14 @@ public sealed class DryRunCommandTests
             var capacity = profile.GetProperty("capacity");
             Assert.Equal("unknown", capacity.GetProperty("demandStatus").GetString());
             Assert.Equal(0, capacity.GetProperty("proposedStarts").GetInt32());
+            if (profile.GetProperty("provisioner").GetString() == "ec2")
+            {
+                Assert.Equal("external-reclamation-required", profile.GetProperty("ec2CleanupMode").GetString());
+            }
+            else
+            {
+                Assert.False(profile.TryGetProperty("ec2CleanupMode", out _));
+            }
         });
     }
 

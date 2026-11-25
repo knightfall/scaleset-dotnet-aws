@@ -48,6 +48,8 @@ internal static class ReadOnlyRunnerInventory
         if (evidence is not null)
         {
             var inspector = new FargateProfileInspector(clients.Ecs(), clients.Iam(), new FargateNetworkReader(clients.Ec2Network()), clock);
+            var quota = new FargateQuotaReader(configuration.Aws, evidence,
+                evidence.QuotaSource is null ? null : clients.S3(), clock);
             foreach (var profile in fargate)
             {
                 var inventory = await inspector.ReadInventoryAsync(configuration, profile.Id, cancellationToken).ConfigureAwait(false);
@@ -58,7 +60,8 @@ internal static class ReadOnlyRunnerInventory
                     if (preflight is { IsReady: true, Task: { } approved })
                     {
                         // This graph does not attest pending launch reservations. Known exhaustion still bounds capacity.
-                        var sampled = inspector.EstimateHeadroom(approved, inventory, evidence.Quota, outstanding: []);
+                        var sample = await quota.ReadAsync(cancellationToken).ConfigureAwait(false);
+                        var sampled = inspector.EstimateHeadroom(approved, inventory, sample, outstanding: []);
                         headroom = sampled with { LaunchSlots = sampled.LaunchSlots is 0 ? 0 : null };
                     }
                 }

@@ -1,27 +1,30 @@
 # AWS GitHub Runner Scale Set Controller (.NET 10)
 
-Planning baseline · 24 November 2026
-
-Status: proposed for review in the baseline PR. T01–T26 describe future implementation and verification; the repository does not yet contain a runnable controller. Merge this baseline before creating the six milestones and 26 task issues in the [task index](tasks/README.md).
+The [approved baseline](https://github.com/knightfall/scaleset-dotnet-aws/pull/1)
+defines the architecture and delivery sequence. All 26 implementation tasks
+in the [task index](tasks/README.md) are complete. Follow the
+[operator runbook](operator-runbook.md) for deployment and recovery, the
+[target qualification record](emulator-boundaries.md) for verified scope, and
+the [release process](releases/PUBLISHING.md) for distributing controller images.
 
 ## 1. API and repository baseline
 
-`scaleset-dotnet-aws` starts greenfield on `.NET 10` (`net10.0`) with [AGENTS.md](../AGENTS.md) as the repository contract. Pin the published `Knightfall.ScaleSet.Client` and `Knightfall.ScaleSet.Listener` packages to exact version `0.1.0-alpha.1` from `scaleset.NET` release `v0.1.0-alpha.1`, source commit `a0bc2060715767bff0f1a22a9f328689ed363493`. The [released dependency baseline](dependency-baseline.md) records artifact identities, verification instructions, supported APIs, and qualification limits. Consume the release from NuGet.org with Central Package Management (`Directory.Packages.props`) and committed lock files; the earlier candidate-feed/project-reference bootstrap is retired. The SDK wire baseline tracks `actions/scaleset` at `716908e5`.
+`scaleset-dotnet-aws` targets `.NET 10` (`net10.0`) with [AGENTS.md](../AGENTS.md) as the repository contract. Pin the published `Knightfall.ScaleSet.Client` and `Knightfall.ScaleSet.Listener` packages to exact version `0.1.0-alpha.1` from `scaleset.NET` release `v0.1.0-alpha.1`, source commit `a0bc2060715767bff0f1a22a9f328689ed363493`. The [released dependency baseline](dependency-baseline.md) records artifact identities, verification instructions, supported APIs, and qualification limits. Consume the release from NuGet.org with Central Package Management (`Directory.Packages.props`) and committed lock files; the earlier candidate-feed/project-reference bootstrap is retired. The SDK wire baseline tracks `actions/scaleset` at `716908e5`.
 
 | Concern | Inspected API and design implication |
 | --- | --- |
-| GitHub authentication | `Knightfall.ScaleSet.Client` exposes `ScaleSetClient(GitHubTarget, ScaleSetCredentials, ...)` with mutually exclusive PAT and GitHub App factories (`FromPersonalAccessToken`, `FromGitHubApp` with PKCS#1/PKCS#8 PEM or async JWT signer). GitHub.com and GitHub Enterprise Cloud (`*.ghe.com` and `github.com/enterprises/{enterprise}`) are supported. Org/repo targets accept App or PAT; enterprise targets require a classic PAT with `manage_runners:enterprise`. Custom GHES hosts (`scaleset.NET` `#20`) and custom root CA / mTLS (`scaleset.NET` `#21`) are **deferred** and rejected cleanly at validation until implemented upstream. |
+| GitHub authentication | `Knightfall.ScaleSet.Client` exposes `ScaleSetClient(GitHubTarget, ScaleSetCredentials, ...)` with mutually exclusive PAT and GitHub App factories (`FromPersonalAccessToken`, `FromGitHubApp` with PKCS#1/PKCS#8 PEM or async JWT signer). GitHub.com and GitHub Enterprise Cloud (`*.ghe.com` and `github.com/enterprises/{enterprise}`) are supported. The AWS configuration uses GitHub App credentials for repository and organization targets and a classic PAT with `manage_runners:enterprise` for enterprise targets. Custom GHES hosts (`scaleset.NET` `#20`) and custom root CA / mTLS (`scaleset.NET` `#21`) are **deferred** and rejected cleanly at validation until implemented upstream. |
 | GitHub identity and provisioning | `ScaleSetClient` exposes `GetRunnerGroupByNameAsync`, `FindScaleSetAsync`, `ListScaleSetsAsync`, `GetScaleSetAsync`, `CreateScaleSetAsync`, `UpdateScaleSetAsync`, `GenerateJitConfigAsync`, `GetRunnerAsync`, `FindRunnerByNameAsync`, and `RemoveRunnerAsync`. Required admin/JIT calls reject JSON `null` and trailing garbage via `ScaleSetApiException`. Existence via `GetRunnerAsync` proves identity only, not online/idle readiness; `RemoveRunnerAsync` preserves domain error classification (such as job-still-running), whose scheduling-fence race is modeled in the local GitHub simulator (`T22`) while keeping automated idle termination disabled by default. |
 | GitHub sessions and listener extensibility | `CreateMessageSessionAsync` returns `MessageSessionClient` (`GetMessageAsync`, `AcquireJobsAsync`, `DeleteMessageAsync`, `CloseAsync`). The released `ScaleSetListenerPump.StepAsync` composes checkpoint storage, a replay-safe delivery handler, and per-operation authorization; T09 supplies these adapters and session supervision. Queue-token refresh preserves the session GUID. `ScaleSetClient.DeleteMessageSessionAsync` supports retirement by journaled scale-set ID and exact session GUID after process loss; ambiguous outcomes remain unresolved. See the [released dependency contract](dependency-baseline.md). |
 | Retry and rate-limit control | `ScaleSetClient` provides `ScaleSetRetryOptions` (`MaxElapsed`, `Deadline`, `OnRateLimit`, `ScaleSetRateLimitPolicies`), `ScaleSetRateLimitException`, `ScaleSetMaxElapsedExceededException`, and per-call `ScaleSetRequestRetry` scopes. For non-idempotent mutations (`GenerateJitConfigAsync`, `CreateScaleSetAsync`, `CreateMessageSessionAsync`), configure `ScaleSetRequestRetry` with a single wire attempt so the DynamoDB journal owns ambiguity resolution and retries. |
 | Direct EC2 runner compute | Use AWS SDK for .NET v4 `Amazon.EC2` (`RunInstances` with `MinCount=1, MaxCount=1`, `TerminateInstances`, `DescribeInstances`, `DescribeLaunchTemplateVersions`, `DescribeImages`, `DescribeSubnets`, `DescribeSecurityGroups`, `CreateTags`) and `Amazon.IdentityManagement` (`GetInstanceProfile`, `GetRole`). Support both pinned numeric Launch Template versions and safely preflight-resolved `$Latest` / `$Default` aliases pinned into every launch intent. Pin subnet/AZ per `ClientToken` because EC2 idempotency is AZ-scoped. |
 | Amazon ECS Fargate runner compute | Use AWS SDK for .NET v4 `Amazon.ECS` (`RunTask` with `count=1`, revision-qualified `TaskDefinition`, `LaunchType=FARGATE`, `awsvpc` networking, durable `ClientToken`, `StartedBy=ss-<32hex>`, and `Tags`; `ListTasks`, `DescribeTasks`, `DescribeClusters`, `DescribeTaskDefinition`, `ListAccountSettings`, `StopTask`). Always inspect both `Tasks` and `Failures` on HTTP 200 and handle eventual consistency. |
-| DynamoDB and supporting AWS services | Use AWS SDK for .NET v4 `Amazon.DynamoDBv2` (`TransactWriteItems`, strongly consistent `GetItem`/`Query`, conditional `PutItem`/`DeleteItem` with `ReturnValues=ALL_OLD`), `Amazon.SecretsManager`, `Amazon.S3`, `Amazon.SQS`, and `Amazon.SecurityToken`. Verify in T02 whether AWS SDK for .NET v4 auto-populates `TransactWriteItemsRequest.ClientRequestToken`; generate an explicit per-request UUID if absent, and set `MaxErrorRetry = 0` on non-idempotent / journal-owned writes so the journal owns recovery. |
-| Local AWS and GitHub emulation | Integration suites (`T22`–`T25`) run deterministically against a single unified local AWS endpoint (`AWS_ENDPOINT_URL` / `ServiceURL`) backed by either **MiniStack** (`ministackorg/ministack`, MIT, HTTP `http://127.0.0.1:4566`, `pip install ministack` with zero Docker daemon needed for API emulation) or **AWS Emulator** (`aws/aws-emulator`, CC0-1.0, Smithy-driven across 200+ services, HTTPS `https://127.0.0.1:9297`), paired with a loopback **GitHub Scale Set Protocol Simulator** and loopback **IMDSv2** / **ECS Task Metadata v4** stubs. |
+| DynamoDB and supporting AWS services | Use AWS SDK for .NET v4 `Amazon.DynamoDBv2` (`TransactWriteItems`, strongly consistent `GetItem`/`Query`, conditional `PutItem`/`DeleteItem` with `ReturnValues=ALL_OLD`), `Amazon.SecretsManager`, `Amazon.S3`, `Amazon.SQS`, and `Amazon.SecurityToken`. The lifecycle store sets `TransactWriteItemsRequest.ClientRequestToken` to the durable transition ID. Journal-owned AWS clients disable error retries and stale-connection retries. |
+| Local AWS and GitHub emulation | CI starts pinned MiniStack on dynamically allocated loopback endpoints, plus a GitHub Scale Set simulator and loopback IMDSv2 and ECS Task Metadata v4 stubs. The integration harness also starts a separate IAM-enforcing MiniStack endpoint. See the [test and target boundaries](emulator-boundaries.md). |
 
 ### Offline SDK contract tests
 
-In T02, implement `tests/Knightfall.ScaleSet.Aws.SdkContract.Tests` against the published Client/Listener baseline and pinned AWS SDK for .NET v4 packages using fake HTTP handlers, deterministic `TimeProvider` instances, and recorded wire fixtures:
+The [SDK contract suite](../tests/Knightfall.ScaleSet.Aws.SdkContract.Tests/) tests the published Client/Listener baseline and pinned AWS SDK for .NET v4 packages using fake HTTP handlers, deterministic `TimeProvider` instances, and recorded wire fixtures:
 
 - Verify `GitHubTarget` / `ScaleSetCredentials` rejection of enterprise Apps, GHES hosts, and `caBundlePath`.
 - Verify single-attempt `ScaleSetRequestRetry` budgets on JIT/scale-set/session creation, exact-session retirement, and conservative pump acknowledgement when a fake server commits then drops the HTTP response, alongside `ScaleSetRateLimitException` metadata extraction.
@@ -96,8 +99,8 @@ Keep canonical authored YAML under `cdk/config/*.yaml`, validated against versio
 Require disjoint managed labels within each GitHub scope, each label list containing its scale set name, and one active/draining profile per resolved GitHub host/scope/group/scale-set identity. CDK emits a deterministic canonical runtime JSON artifact (independent of YAML comments and key order), prints its SHA-256 digest, publishes it as a versioned S3 asset, and pins exact S3 URI + version ID + SHA-256 + monotonic `--generation` into the ECS controller task launch arguments.
 
 ```sh
-npm --prefix cdk run config:emit -- ../testdata/config/ec2-only-latest.yaml /tmp/runner-runtime.json
-dotnet run --project src/Knightfall.ScaleSet.Aws.Controller -- config verify --file /tmp/runner-runtime.json --sha256 <digest>
+runtime_sha=$(npm --prefix cdk --silent run config:emit -- ../testdata/config/ec2-only-latest.yaml /tmp/runner-runtime.json)
+dotnet run --project src/Knightfall.ScaleSet.Aws.Controller -- config verify --file /tmp/runner-runtime.json --sha256 "$runtime_sha"
 ```
 
 ### Direct EC2 example using `$Latest` Launch Template safe resolution
@@ -218,18 +221,18 @@ corporate:
     secretArn: arn:aws:secretsmanager:ap-southeast-2:111122223333:secret:github-enterprise-pat-a1b2c3
 ```
 
-`draining` keeps permissions and bindings, stops acquiring new jobs, advertises `0` capacity where verified, uses effective `idleReserve = 0`, and provisions only to cover already-assigned demand until two separated authoritative passes confirm zero assigned/busy/uncertain executors, zero pending deliveries/reservations/handoffs, zero unfinished effects, and a durable session closure hold. Removal/disablement requires passing the runtime retirement preflight gate (verified against MiniStack / AWS Emulator DynamoDB in `T25`) before CDK removes IAM or EventBridge bindings.
+`draining` keeps permissions and bindings, stops acquiring new jobs, advertises `0` capacity where verified, and stops launching new runners. Existing work and cleanup continue. Two separated authoritative passes must confirm zero assigned/busy/uncertain executors, zero pending deliveries/reservations/handoffs, zero unfinished effects, and a durable session closure hold. Removal/disablement requires passing the runtime retirement preflight gate (verified against MiniStack DynamoDB in `T25`) before CDK removes IAM or EventBridge bindings.
 
 ## 4. CDK composition and deployment ownership
 
-Implement a standalone TypeScript CDK v2 app under `cdk/` with offline synthesis (`cdk synth --strict --no-lookups`), stable order-independent logical IDs, and non-destructive imports of VPCs, subnets, security groups, Launch Templates, ECS task definitions, and imported tables/clusters.
+The standalone TypeScript CDK v2 app lives under `cdk/` with offline synthesis (`cdk synth --strict --no-lookups`), stable order-independent logical IDs, and non-destructive imports of VPCs, subnets, security groups, Launch Templates, ECS task definitions, and imported tables/clusters.
 
 | Selector | CDK creates or configures | Existing dependencies |
 | --- | --- | --- |
 | All environments | Retained encrypted DynamoDB table with `PK`/`SK`, `due` `KEYS_ONLY` GSI, TTL (`expiresAt`), and PITR when `create`, or reference when `import`. Versioned S3 runtime config asset, log group, baseline alarms, and Secrets Manager references (active only). | ECR controller image digest, GitHub secret ARNs, and imported table settings when `import`. |
 | Controller host (`ecs-fargate`) | Controller ECS task definition, task/execution IAM roles, 1-replica ECS Fargate service (`minHealthyPercent: 0`, `maxHealthyPercent: 100`), circuit breaker, read-only rootfs, ECS Exec disabled, `stopTimeout: 90s`, and `healthcheck` probe. Scoped `ecs:DescribeTasks` on the controller cluster to verify prior controller task termination during takeover. | Selected VPC/subnets/security groups and imported or created controller cluster. |
-| Active or draining `ec2` profiles | EventBridge rules for `EC2 Instance State-change Notification` scoped to the deployment account and Region, SQS target + DLQ, scoped `ec2:RunInstances`/`TerminateInstances`/`CreateTags` + `iam:PassRole` to selected bootstrap instance profiles/roles and Launch Templates, and item-scoped bootstrap policy (`HELLO#`, `OFFER#`, and proven `STATUS#`). | Imported Launch Template, subnets/security groups, and owner-prepared AMI/bootstrap installation. |
-| Active or draining `fargate` profiles | EventBridge ECS Task State Change rules scoped to runner clusters/definitions, SQS target + DLQ, scoped `ecs:RunTask`/`StopTask`/`TagResource` + `iam:PassRole` to runner task/execution roles, and item-scoped bootstrap policy (`HELLO#`, `OFFER#` only). | Imported revision-pinned task definition, roles, network, and selected cluster. |
+| Active or draining `ec2` profiles | Scoped EC2 EventBridge/SQS notifications, exact compute and pass-role permissions, IAM-authenticated HELLO registration, one-time `OFFER#` consumption, and an EC2-only `STATUS#` grant for qualified hosts. | Imported Launch Template, subnets/security groups, and owner-prepared AMI/bootstrap installation. |
+| Active or draining `fargate` profiles | Scoped ECS EventBridge/SQS notifications, exact task and pass-role permissions, IAM-authenticated HELLO registration, and one-time `OFFER#` consumption. | Imported revision-pinned task definition, roles, network, and selected cluster. |
 | `ecsClusters` entries | One `AWS::ECS::Cluster` per distinct referenced `create` entry (reused if shared by host and runners); reference only for `import`. | VPC/subnets placed on task launches. |
 
 Native EC2 state-change notifications carry an instance ID, state, and resource ARN. Scope the rule by account, Region, and event type. Match ownership tags after paginated `DescribeInstances`, and verify the pinned subnet and AZ when resolving a launch. [EC2 state-change notification format](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/monitoring-instance-state-changes.html)
@@ -295,7 +298,7 @@ Use one on-demand encrypted table with PITR, string `PK`/`SK`, `due` `KEYS_ONLY`
 | `ENV#<deployment>` | `LEASE`, `PROFILE#<id>` | Renewable lease (`epoch`, `ownerTaskArn`, `writerProtocol`, `previousOwnerTaskArn`, `validUntil`), applied generation, catalog bindings, and retired tombstones. Strong reads. |
 | `CLAIM#<canonical-remote-id>` | `OWNER` | Unique ownership fence for GitHub scope/group/set name, resolved set ID, or allocated EC2/ECS resource ID. |
 | `PROFILE#<deployment>#<profile>` | `SESSION`, `DEMAND`, `ADMISSION`, `EFFECTS`, `EFFECT-REBUILD`, `ACTIVE-OP#<gen>#<intent>`, `CHECKPOINT#<session>`, `MSG#<session>#<id>`, `ACQUIRE#<request>`, `JOB#<attempt>`, `RUNNER#<allocation>`, `RUNNER-ID#<runner-id>`, `OP#<intent>` | Session ownership/closure journal; per-session Listener checkpoint with exact scope/set/session identity, revision, transition ID, original observation, cursor and pending phase; demand freshness, admission reservations, transactional unfinished-effect count, bounded rebuild checkpoint (32 rows/page, 2 pages/pass), active-only index markers, deduplicated messages/jobs, immutable allocation provenance, and nonsecret effect envelopes. |
-| `HELLO#<aws:userid>`, `OFFER#<aws:userid>`, `STATUS#<aws:userid>` | `BOOTSTRAP` | Item-scoped runner hello/consume/status partitions (`STATUS#` granted only to EC2 after OS/IMDS isolation proof). |
+| `HELLO#<aws:userid>`, `OFFER#<aws:userid>`, `STATUS#<aws:userid>` | `BOOTSTRAP` | The authenticated HELLO broker owns registration writes. Each runner consumes its exact offer. Qualified EC2 supervisors can publish scoped STATUS. |
 
 Maintain `ACTIVE-OP#<gen>#<intent>` and `EFFECTS` atomically in the same revision-checked, lease-fenced `TransactWriteItems` call as `OP#<intent>`. On controller takeover after unclean loss, the successor remains in read-only recovery until it confirms via `ecs:DescribeTasks` on the controller cluster that the prior `ownerTaskArn` reached `STOPPED`, validates host clock-skew margin against the lease deadline, advances any `EFFECT-REBUILD`, and settles all ambiguous `executing`/`uncertain` effects.
 
@@ -304,8 +307,8 @@ Maintain `ACTIVE-OP#<gen>#<intent>` and `EFFECTS` atomically in the same revisio
 | Principal | Allowed access |
 | --- | --- |
 | Active controller (ECS task role) | S3 runtime config read, DynamoDB table/index operations, selected SQS receive/delete, `secretsmanager:GetSecretValue` for active GitHub secret ARNs + KMS decrypt, controller-cluster `ecs:DescribeTasks` for fencing, and strictly enabled backend rights (`ec2:RunInstances`/`TerminateInstances`/`CreateTags` + LT/network/IAM reads for `ec2`; `ecs:RunTask`/`StopTask`/`TagResource` + cluster/task-def/network/IAM reads for `fargate`, with scoped `iam:PassRole`). |
-| Dry-run controller (ECS task role) | S3 runtime config & optional snapshot reads, logs/OTLP, optional read-only AWS/DynamoDB inspection. Zero lifecycle writes, Secrets Manager reads, SQS reads, provisioning, or `iam:PassRole`. |
-| Bootstrap role (`ec2` / `fargate`) | `PutItem` on `HELLO#<aws:userid>` and conditional `DeleteItem(ReturnValues=ALL_OLD)` on `OFFER#<aws:userid>` via `dynamodb:LeadingKeys` using immutable `RoleId:ShortInstanceId` / `RoleId:ShortTaskId`. `STATUS#<aws:userid>` only on EC2 after OS/IMDS isolation proof. Zero lifecycle/admin secret access. |
+| Dry-run controller (ECS task role) | S3 runtime config & optional snapshot reads, logs/OTLP, optional read-only EC2/ECS inventory inspection. Zero lifecycle writes, Secrets Manager reads, SQS reads, provisioning, or `iam:PassRole`. |
+| Bootstrap role (`ec2` / `fargate`) | SigV4 HELLO registration through the role's IAM-authenticated endpoint and conditional `DeleteItem(ReturnValues=ALL_OLD)` on `OFFER#<aws:userid>` via `dynamodb:LeadingKeys`. The broker derives the principal from the AWS caller identity and applies record, expiry, and write limits. Qualified EC2 supervisors retain scoped `STATUS#` writes. Zero lifecycle/admin secret access. |
 | ECS execution roles | Separate controller vs Fargate runner execution roles to pull digest-pinned ECR images and emit CloudWatch/OTLP logs. |
 
 Use `.NET 10` BCL cryptography (`System.Security.Cryptography`) in `Knightfall.ScaleSet.Aws.Handoff`: ephemeral **ECDH P-256** (`ECDiffieHellman`) + **HKDF-SHA256** + **AES-256-GCM** (`AesGcm`), binding canonical version, deployment, profile, scale set, allocation, resource ARN, incarnation, `aws:userid`, boot nonce, offer ID, and expiry as authenticated associated data (AAD). Plaintext JIT and GitHub secrets never touch DynamoDB, S3, Launch Templates, task definitions, user data, container layers, or logs.
@@ -328,7 +331,7 @@ Dry-run is the default mode across CDK config and `Knightfall.ScaleSet.Aws.Contr
 
 ## 10. Test matrix and acceptance
 
-Run schema, planner, mocked SDK, Roslynator quality gates, CDK offline synthesis, and local emulated integration tests (`Knightfall.ScaleSet.Aws.IntegrationTests` backed by MiniStack or AWS Emulator via `AWS_ENDPOINT_URL`, loopback IMDSv2/Task Metadata v4 stubs, and the loopback GitHub Scale Set simulator) in CI (`make check`) with zero live cloud credentials.
+Run schema, planner, mocked SDK, Roslynator quality gates, CDK offline synthesis, and local emulated integration tests (`Knightfall.ScaleSet.Aws.IntegrationTests` backed by MiniStack via `AWS_ENDPOINT_URL`, loopback IMDSv2/Task Metadata v4 stubs, and the loopback GitHub Scale Set simulator) in CI (`make check`) with zero live cloud credentials.
 
 ### Implementation tasks
 
@@ -382,34 +385,31 @@ Run schema, planner, mocked SDK, Roslynator quality gates, CDK offline synthesis
 
 | Task | Depends on | Acceptance check |
 | --- | --- | --- |
-| T22: Verify GitHub contracts against local Scale Set simulator | T09, T11 | Run `Knightfall.ScaleSet.Aws.IntegrationTests` against loopback GitHub Scale Set simulator + MiniStack / AWS Emulator (Secrets Manager, DynamoDB) covering App/enterprise PAT auth, rotation, delivery/ack, assignment ordering races, drain `0` capacity, `RemoveRunnerAsync` race simulation, and single-attempt lost-response recovery. |
-| T23: Verify Direct EC2 flows against local AWS emulation | T13, T14, T21, T22 | Run end-to-end Direct EC2 suite against MiniStack / AWS Emulator (EC2, IAM, STS, EventBridge/SQS, DynamoDB) + loopback IMDSv2 + GitHub simulator: `pinned` & `$Latest` resolution + drift freeze, `RunInstances`, simulated `InsufficientInstanceCapacity` AZ failover, `HELLO#`/`OFFER#`/`STATUS#` handoff, `TerminateInstances` -> `terminated`, and controller restart preservation. |
-| T24: Verify Fargate flows against local AWS emulation | T16, T17, T21, T22 | Run end-to-end Fargate suite against MiniStack / AWS Emulator (ECS, IAM, STS, EventBridge/SQS, DynamoDB) + loopback Task Metadata v4 + GitHub simulator: preflight rejections, `RunTask` replay & `ListTasks(StartedBy=...)` recovery, `HELLO#`/`OFFER#` handoff with zero `STATUS#` writes, and `STOPPED` reconciliation across controller restart. |
-| T25: Verify mixed operation, dry-run, failover, restore, and rollback locally | T19, T23, T24 | Run full local integration matrix against MiniStack / AWS Emulator (including S3 versioned configs/snapshots): EC2-only, Fargate-only, mixed profiles; read-only dry-run audit via request-recording proxy; unclean controller takeover fenced by emulated `ecs:DescribeTasks` `STOPPED`; DynamoDB snapshot/restore sanitization drill; loopback OTLP log/trace/metric correlation without secret leaks; YAML add/drain/`preflight retire`/rollback. |
+| T22: Verify GitHub contracts against local Scale Set simulator | T09, T11 | Run `Knightfall.ScaleSet.Aws.IntegrationTests` against loopback GitHub Scale Set simulator + MiniStack (Secrets Manager, DynamoDB) covering App/enterprise PAT auth, rotation, delivery/ack, assignment ordering races, drain `0` capacity, `RemoveRunnerAsync` race simulation, and single-attempt lost-response recovery. |
+| T23: Verify Direct EC2 flows against local AWS emulation | T13, T14, T21, T22 | Run end-to-end Direct EC2 suite against MiniStack (EC2, IAM, STS, EventBridge/SQS, DynamoDB) + loopback IMDSv2 + GitHub simulator: `pinned` & `$Latest` resolution + drift freeze, `RunInstances`, simulated `InsufficientInstanceCapacity` AZ failover, `HELLO#`/`OFFER#`/`STATUS#` handoff, `TerminateInstances` -> `terminated`, and controller restart preservation. |
+| T24: Verify Fargate flows against local AWS emulation | T16, T17, T21, T22 | Run end-to-end Fargate suite against MiniStack (ECS, IAM, STS, EventBridge/SQS, DynamoDB) + loopback Task Metadata v4 + GitHub simulator: preflight rejections, `RunTask` replay & `ListTasks(StartedBy=...)` recovery, `HELLO#`/`OFFER#` handoff with zero `STATUS#` writes, and `STOPPED` reconciliation across controller restart. |
+| T25: Verify mixed operation, dry-run, failover, restore, and rollback locally | T19, T23, T24 | Run full local integration matrix against MiniStack (including S3 versioned configs/snapshots): EC2-only, Fargate-only, mixed profiles; read-only dry-run audit via request-recording proxy; unclean controller takeover fenced by emulated `ecs:DescribeTasks` `STOPPED`; DynamoDB snapshot/restore sanitization drill; loopback OTLP log/trace/metric correlation without secret leaks; YAML add/drain/`preflight retire`/rollback. |
 | T26: Prepare release readiness, operator runbook, and emulator-boundary record | T25 | Complete operator deployment/rollback runbook, binding template, AMI OS/IMDS isolation verification checklist, CDK deploy guide, and explicit emulator-boundary record preserving conservative defaults. |
 
-### Planned validation commands
+### Validation commands
 
-These commands become executable as T01 and later tasks add the solution, projects, and CDK app. They are acceptance targets, not checks already performed for this documentation baseline.
+Run the same checks as CI from the repository root. The integration target
+starts its own pinned services and needs the CDK dependencies already installed.
+Use the [local controller guide](controller-local.md) for packaged image checks
+and the [telemetry guide](operator-telemetry.md) for receiver probes.
 
 ```sh
-dotnet restore Knightfall.ScaleSet.Aws.slnx --locked-mode
-dotnet build Knightfall.ScaleSet.Aws.slnx --configuration Release --no-restore
-dotnet test --solution Knightfall.ScaleSet.Aws.slnx --configuration Release --no-build
-dotnet test --project tests/Knightfall.ScaleSet.Aws.IntegrationTests/Knightfall.ScaleSet.Aws.IntegrationTests.csproj --configuration Release --no-build
-dotnet run --project src/Knightfall.ScaleSet.Aws.Controller -- telemetry-smoke
-dotnet publish src/Knightfall.ScaleSet.Aws.Controller/Knightfall.ScaleSet.Aws.Controller.csproj --configuration Release /t:PublishContainer
-npm --prefix cdk ci
-npm --prefix cdk test
-npm --prefix cdk run test:synth-matrix
 make check
+# Standalone integration path
+npm --prefix cdk ci
+make check-integration
 ```
 
 ## 11. Local emulation stack, boundaries, and release constraints
 
 | Component | Local CI tool | Purpose and endpoint behavior |
 | --- | --- | --- |
-| AWS services (DynamoDB, EC2, ECS, IAM, STS, Secrets Manager, S3, SQS, EventBridge) | **MiniStack** (`ministackorg/ministack`) **or AWS Emulator** (`aws/aws-emulator`) | Single unified endpoint selected via `AWS_ENDPOINT_URL` / `ServiceURL` with zero paid licenses: **MiniStack** (MIT, 60+ services, HTTP `http://127.0.0.1:4566`, `pip install ministack` or container, DynamoDB transactions + TTL) or **AWS Emulator** (CC0-1.0, Smithy-driven across 200+ services, local HTTPS `https://127.0.0.1:9297` with test-harness TLS trust). Integration suites (`T22`–`T25`) validate service semantics against the active CI emulator and document any service-specific emulator gaps in `T26`. |
+| AWS services (DynamoDB, EC2, ECS, IAM, STS, Secrets Manager, S3, SQS, EventBridge) | Pinned [MiniStack](../tests/ministack/requirements.txt) | The [test launcher](../tests/ministack/run.py) assigns loopback ports and configures the SDK endpoint. The integration suite uses a separate IAM-enforcing instance for policy tests. |
 | GitHub Runner Scale Set API | **Loopback GitHub Scale Set Simulator** | Local HTTP/2-capable ASP.NET Core test server modeling `actions/scaleset` (`716908e5`) auth, scale sets, sessions, polls, rate limits (`429`/`403` + `Retry-After`), dropped responses, and delayed job-start races. |
 | Executor identity metadata | **Loopback IMDSv2 & Task Metadata v4 stubs** | Local HTTP stubs serving synthetic EC2 instance identity documents and ECS Task Metadata v4 responses for `T14`/`T17`/`T23`/`T24`. |
 
@@ -420,6 +420,6 @@ make check
 | Strict `dynamodb:LeadingKeys` IAM condition enforcement across concurrent EC2/Fargate roles | Verified statically via CDK IAM policy assertions (`T21`), `Knightfall.ScaleSet.Aws.DynamoDb` partition separation (`T11`), and operator IAM verification checklist (`T26`); never rely on unverified caller-supplied IDs. |
 | OS kernel IMDSv2 firewall & job-process boundary on Direct EC2 AMIs | Enforced by AMI build contract and documented pre-deploy operator checklist (`T26`); `STATUS#` remains restricted to `ec2` profiles. |
 | Real EC2 AZ-scoped `ClientToken` enforcement & real AWS Service Quota limits | Pinned `(subnetId, resolvedNumericVersion, clientToken)` per launch intent (`T13`) and operator-supplied verified vCPU headroom (`T15`) remain mandatory. |
-| Real GitHub service assignment-to-statistics request ordering & `RemoveRunnerAsync` scheduling fence | Conservative admission reservation holding (`T09a`) and disabled automatic connected-idle runner termination (`T10`/`T11`) remain enabled by default unless explicitly opted into for a verified target. |
+| Real GitHub service assignment-to-statistics request ordering & `RemoveRunnerAsync` scheduling fence | Conservative admission reservation holding (`T09a`) and disabled automatic connected-idle runner termination (`T10`/`T11`) remain conservative in the released configuration. See the [evidence required to change them](emulator-boundaries.md#conservative-defaults). |
 
-Initial v1 operating envelope: one AWS account and Region per controller deployment, single active ECS Fargate `.NET 10` controller replica, Direct EC2 (`pinned` or preflight-resolved `$Latest`/`$Default` Launch Templates) and on-demand Linux Fargate runner tasks, local CI verification via MiniStack or AWS Emulator (`AWS_ENDPOINT_URL`) + GitHub Scale Set simulator, and conservative fail-closed defaults retained for behaviors outside emulator fidelity.
+Initial v1 operating envelope: one AWS account and Region per controller deployment, single active ECS Fargate `.NET 10` controller replica, Direct EC2 (`pinned` or preflight-resolved `$Latest`/`$Default` Launch Templates) and on-demand Linux Fargate runner tasks, local CI verification via MiniStack (`AWS_ENDPOINT_URL`) + GitHub Scale Set simulator, and conservative fail-closed defaults retained for behaviors outside emulator fidelity.

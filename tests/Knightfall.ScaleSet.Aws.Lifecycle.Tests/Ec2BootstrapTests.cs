@@ -81,8 +81,8 @@ public sealed class Ec2BootstrapTests
             Assert.Equal(Principal, verified.AwsUserId);
             using var client = new AmazonDynamoDBClient(verified.Credentials, Configure(new AmazonDynamoDBConfig(), ddb));
             using var key = JitRecipientKey.Create();
-            Assert.Equal(LifecycleWriteOutcome.Committed, await new DynamoDbBootstrapOfferClient(client, "fixture", Principal, Arn, clock)
-                .RegisterHelloAsync(key.Hello, cancellation));
+            Assert.Equal(LifecycleWriteOutcome.Committed, await BrokerHelloFixture.RegisterAsync(client,
+                "fixture", Principal, key.Hello, clock, cancellation));
             Assert.Equal(1, ddb.Requests);
         }
         else
@@ -200,9 +200,14 @@ public sealed class Ec2BootstrapTests
             return true;
         }
         var runner = new FixtureRunner();
-        OneJobBootstrap Bootstrap() => new(new DynamoDbBootstrapOfferClient(table.Client, table.Name, Principal, Arn, clock),
-            Target, Arn, Principal, Reserve, runner, clock, TimeSpan.FromSeconds(15), TimeSpan.FromMilliseconds(30), ObserveAsync,
-            telemetryProvider: RunnerProvisionerType.Ec2);
+        OneJobBootstrap Bootstrap()
+        {
+            var fixtureOffers = new DynamoDbBootstrapOfferClient(table.Client, table.Name, Principal, Arn, clock);
+            return new OneJobBootstrap(fixtureOffers, Target, Arn, Principal, Reserve, runner, clock,
+                TimeSpan.FromSeconds(15), TimeSpan.FromMilliseconds(30),
+                (hello, token) => BrokerHelloFixture.RegisterAsync(table.Client, table.Name, Principal, hello, clock, token), ObserveAsync,
+                telemetryProvider: RunnerProvisionerType.Ec2);
+        }
         var observed = new List<bool>();
         var status = new DynamoDbEc2BootstrapStatusClient(table.Client, table.Name, Principal, Arn, clock);
         async Task ObserveAsync(BootstrapRunnerObservation observation, CancellationToken token)
@@ -225,7 +230,7 @@ public sealed class Ec2BootstrapTests
             }
         }
         while (helloRow.Count == 0 && !startup.IsCompleted);
-        var hello = BootstrapItems.DecodeHello(helloKey, helloRow);
+        var hello = BootstrapItems.DecodeHello(helloKey, helloRow, clock.GetUtcNow());
         await WaitForFirstConditionalDeleteAsync(table, cancellation);
         var binding = JitOfferBinding.Create(condition == "bad-target" ? identity with { ProfileId = "other" } : identity, hello.BootNonce,
             clock.GetUtcNow().AddSeconds(20));
@@ -324,7 +329,8 @@ public sealed class Ec2BootstrapTests
             Guid.NewGuid(), Arn, Guid.NewGuid(), Principal);
         using var recipient = JitRecipientKey.Create();
         var bootstrap = new DynamoDbBootstrapOfferClient(table.Client, table.Name, Principal, Arn, clock);
-        Assert.Equal(LifecycleWriteOutcome.Committed, await bootstrap.RegisterHelloAsync(recipient.Hello, cancellation));
+        Assert.Equal(LifecycleWriteOutcome.Committed, await BrokerHelloFixture.RegisterAsync(table.Client,
+            table.Name, Principal, recipient.Hello, clock, cancellation));
         var expiresAt = clock.Now.AddSeconds(20);
         var binding = JitOfferBinding.Create(identity, recipient.Hello.BootNonce, expiresAt);
         var offer = JitOfferCryptography.Seal(binding, recipient.Hello, FixtureJit("ss-" + binding.OfferId[..48]), clock);
