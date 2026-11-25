@@ -14,6 +14,7 @@ public enum ControllerHeartbeatStatus
 
 public sealed class ControllerLeaseOwnership : IDisposable
 {
+    private static readonly TimeSpan RetryInterval = TimeSpan.FromSeconds(1);
     private readonly DynamoDbLifecycleStore _store;
     private readonly TimeProvider _clock;
     private readonly TimeSpan _duration;
@@ -56,6 +57,7 @@ public sealed class ControllerLeaseOwnership : IDisposable
     public async Task<ControllerHeartbeatStatus> RenewAsync(ControllerClockEvidence? clockEvidence, CancellationToken cancellationToken)
     {
         await _serial.WaitAsync(cancellationToken).ConfigureAwait(false);
+        bool writeStarted = false;
         try
         {
             var current = _authority.Lease;
@@ -68,6 +70,11 @@ public sealed class ControllerLeaseOwnership : IDisposable
             if (_pendingRenewal is Guid pending)
             {
                 var read = await _store.ReadLeaseAsync(current.Deployment, cancellationToken).ConfigureAwait(false);
+                cancellationToken.ThrowIfCancellationRequested();
+                if (!proof.TryGetUpperBound(_clock.GetUtcNow(), current.ValidUntil, _reserve, out _))
+                {
+                    return await LoseAsync().ConfigureAwait(false);
+                }
                 if (read is { Mode: ControllerLeaseMode.Active } && read.Fence == current.Fence && read.TransitionId == pending)
                 {
                     current = read;
@@ -87,7 +94,9 @@ public sealed class ControllerLeaseOwnership : IDisposable
             }
             if (_duration - (current.ValidUntil - now) < TimeSpan.FromMilliseconds(1))
             {
-                if (await _store.ReadLeaseAsync(current.Deployment, cancellationToken).ConfigureAwait(false) != current)
+                var read = await _store.ReadLeaseAsync(current.Deployment, cancellationToken).ConfigureAwait(false);
+                cancellationToken.ThrowIfCancellationRequested();
+                if (read != current || !proof.TryGetUpperBound(_clock.GetUtcNow(), current.ValidUntil, _reserve, out _))
                 {
                     return await LoseAsync().ConfigureAwait(false);
                 }
@@ -95,7 +104,9 @@ public sealed class ControllerLeaseOwnership : IDisposable
                 return ControllerHeartbeatStatus.Current;
             }
 
-            var renewed = await _store.RenewLeaseAsync(current, latest, now + _duration, cancellationToken).ConfigureAwait(false);
+            var renewed = await _store.RenewLeaseAsync(current, latest, now + _duration, () => writeStarted = true, cancellationToken)
+                .ConfigureAwait(false);
+            cancellationToken.ThrowIfCancellationRequested();
             if (renewed.Outcome == LifecycleWriteOutcome.Committed && renewed.Lease is { } next)
             {
                 Volatile.Write(ref _authority, new ActiveControllerAuthority(next, proof));
@@ -108,6 +119,12 @@ public sealed class ControllerLeaseOwnership : IDisposable
                 return ControllerHeartbeatStatus.RetryRequired;
             }
             return await LoseAsync().ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (writeStarted)
+        {
+            // The caller cannot know whether the transaction committed. Fence before unlocking.
+            _ = await LoseAsync().ConfigureAwait(false);
+            throw;
         }
         catch (IOException)
         {
@@ -136,10 +153,9 @@ public sealed class ControllerLeaseOwnership : IDisposable
                     return;
                 }
 
-                using var deadline = new CancellationTokenSource(remaining < interval ? remaining : interval, _clock);
-                using var attempt = CancellationTokenSource.CreateLinkedTokenSource(lifetime.Token, deadline.Token);
-                var evidence = await readClock(attempt.Token).ConfigureAwait(false);
-                if (await RenewAsync(evidence, attempt.Token).ConfigureAwait(false) == ControllerHeartbeatStatus.OwnershipLost)
+                var status = await HeartbeatAsync(remaining < interval ? remaining : interval, readClock, lifetime.Token)
+                    .ConfigureAwait(false);
+                if (status == ControllerHeartbeatStatus.OwnershipLost)
                 {
                     return;
                 }
@@ -147,7 +163,9 @@ public sealed class ControllerLeaseOwnership : IDisposable
                 remaining = ReadHeartbeatWindow();
                 if (remaining > TimeSpan.Zero)
                 {
-                    await Task.Delay(remaining < interval ? remaining : interval, _clock, lifetime.Token).ConfigureAwait(false);
+                    // Leave time for the retry within the previous clock proof.
+                    var delay = status == ControllerHeartbeatStatus.RetryRequired && interval > RetryInterval ? RetryInterval : interval;
+                    await Task.Delay(remaining < delay ? remaining : delay, _clock, lifetime.Token).ConfigureAwait(false);
                 }
             }
         }
@@ -156,13 +174,40 @@ public sealed class ControllerLeaseOwnership : IDisposable
         }
         catch (OperationCanceledException)
         {
-            // An attempt deadline can interrupt a renewal with an unknown outcome.
             _ = await LoseAsync().ConfigureAwait(false);
         }
         catch (Exception)
         {
             _ = await LoseAsync().ConfigureAwait(false);
             throw;
+        }
+    }
+
+    private async Task<ControllerHeartbeatStatus> HeartbeatAsync(TimeSpan budget,
+        Func<CancellationToken, Task<ControllerClockEvidence?>> readClock, CancellationToken lifetime)
+    {
+        using var deadline = new CancellationTokenSource(budget, _clock);
+        using var attempt = CancellationTokenSource.CreateLinkedTokenSource(lifetime, deadline.Token);
+        try
+        {
+            ControllerClockEvidence? evidence;
+            try
+            {
+                evidence = await readClock(attempt.Token).ConfigureAwait(false);
+            }
+            catch (TimeoutException)
+            {
+                attempt.Token.ThrowIfCancellationRequested();
+                return ControllerHeartbeatStatus.RetryRequired;
+            }
+            return evidence is null ? await LoseAsync().ConfigureAwait(false)
+                : await RenewAsync(evidence, attempt.Token).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (deadline.IsCancellationRequested && !lifetime.IsCancellationRequested)
+        {
+            // RenewAsync fences a possibly sent write. Only the old proof and lease
+            // can authorize another attempt after a read or a provably unsent write.
+            return ControllerHeartbeatStatus.RetryRequired;
         }
     }
 

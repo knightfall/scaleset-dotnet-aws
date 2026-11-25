@@ -1,8 +1,10 @@
 using System.Net;
 using System.Text.Json;
 using System.Text.Json.Nodes;
+using System.Threading.Channels;
 using Amazon.Runtime;
 using Amazon.SecretsManager;
+using Knightfall.ScaleSet.Aws.Controller.Lifecycle;
 using Knightfall.ScaleSet.Aws.Core.Catalog;
 using Knightfall.ScaleSet.Aws.Core.Configuration;
 using Knightfall.ScaleSet.Aws.Core.Lifecycle;
@@ -299,8 +301,324 @@ public sealed class ControllerLifecycleTests
         Assert.Equal(lease, await store.ReadLeaseAsync(lease.Deployment, cancellation));
     }
 
-    [Fact]
-    public async Task HeartbeatDeadlineAfterCommitEndsLocalAuthorityWithoutAnotherWrite()
+    [Theory]
+    [InlineData("metadata timeout")]
+    [InlineData("attempt timeout")]
+    [InlineData("lease compare timeout")]
+    public async Task HeartbeatRetriesReadOnlyTimeoutWithoutRefreshingThePreviousProof(string stage)
+    {
+        var cancellation = TestContext.Current.CancellationToken;
+        using var stopping = CancellationTokenSource.CreateLinkedTokenSource(cancellation);
+        using var table = await MiniStackTable.CreateAsync(cancellation);
+        var clock = new FixtureClock { HoldTimers = true };
+        var store = new DynamoDbLifecycleStore(table.Client, table.Name, clock);
+        var configuration = await ConfigurationAsync(draining: false, cancellation);
+        var lease = await AcquireAsync(store, configuration, clock, MiniStackTable.FirstTask, cancellation);
+        var originalProof = new ControllerClockEvidence(clock.Now, clock.Now.AddSeconds(15), TimeSpan.FromSeconds(1));
+        using var ownership = new ControllerLeaseOwnership(store, lease, originalProof, clock, LeaseDuration, Reserve);
+        clock.Now = clock.Now.AddSeconds(5);
+        table.Wire.Clear();
+        var paused = stage == "lease compare timeout" ? table.Wire.PauseNextRead(LifecycleKey.Lease(lease.Deployment)) : null;
+        var clockRead = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        int reads = 0;
+
+        async Task<ControllerClockEvidence?> ReadClock(CancellationToken token)
+        {
+            if (++reads == 1)
+            {
+                await clockRead.Task.WaitAsync(token);
+            }
+            return ClockProof(clock);
+        }
+
+        var interval = TimeSpan.FromSeconds(5);
+        var heartbeat = ownership.RunHeartbeatsAsync(interval, ReadClock, stopping.Token);
+        try
+        {
+            var deadline = await clock.NextTimerAsync(cancellation);
+            Assert.Equal(interval, deadline.DueTime);
+            clock.Now += interval;
+            if (stage == "metadata timeout")
+            {
+                clockRead.SetException(new TimeoutException("Synthetic ECS metadata timeout."));
+            }
+            else
+            {
+                if (paused is not null)
+                {
+                    clockRead.SetResult();
+                    await paused.Captured.WaitAsync(TimeSpan.FromSeconds(10), cancellation);
+                }
+                deadline.Fire();
+            }
+
+            var retry = await clock.NextTimerAsync(cancellation);
+            Assert.Equal(TimeSpan.FromSeconds(1), retry.DueTime);
+            Assert.Equal(new ActiveControllerAuthority(lease, originalProof), ownership.ReadAuthority());
+            Assert.False(ownership.OwnershipLost.IsCancellationRequested);
+            Assert.DoesNotContain(table.Wire.Requests, request => request.Operation == "TransactWriteItems");
+
+            clock.Now += retry.DueTime;
+            retry.Fire();
+            var retriedDeadline = await clock.NextTimerAsync(cancellation);
+            Assert.Equal(TimeSpan.FromSeconds(3), retriedDeadline.DueTime);
+            _ = await clock.NextTimerAsync(cancellation); // Post-renewal delay.
+            var renewed = Assert.IsType<ActiveControllerAuthority>(ownership.ReadAuthority());
+            Assert.Equal(ClockProof(clock), renewed.Clock);
+            Assert.Equal(lease.Fence, renewed.Lease.Fence);
+            Assert.Equal(lease.Revision + 1, renewed.Lease.Revision);
+            Assert.Equal(renewed.Lease, await store.ReadLeaseAsync(lease.Deployment, cancellation));
+            Assert.Single(table.Wire.Requests, request => request.Operation == "TransactWriteItems");
+            Assert.Equal(2, reads);
+        }
+        finally
+        {
+            paused?.Resume();
+            await stopping.CancelAsync();
+            await heartbeat.WaitAsync(TimeSpan.FromSeconds(10), cancellation);
+        }
+        Assert.False(ownership.OwnershipLost.IsCancellationRequested);
+    }
+
+    [Theory]
+    [InlineData("renew")]
+    [InlineData("foreign task")]
+    [InlineData("unsynchronized clock")]
+    [InlineData("stop")]
+    public async Task HeartbeatHonorsSocketConnectTimeoutAndTheNextAuthorityDecision(string next)
+    {
+        var cancellation = TestContext.Current.CancellationToken;
+        using var stopping = CancellationTokenSource.CreateLinkedTokenSource(cancellation);
+        using var table = await MiniStackTable.CreateAsync(cancellation);
+        var clock = new FixtureClock { HoldTimers = true };
+        var metadataClock = new FixtureClock { HoldTimers = true };
+        var store = new DynamoDbLifecycleStore(table.Client, table.Name, clock);
+        var configuration = await ConfigurationAsync(draining: false, cancellation);
+        string cluster = EcsControllerMetadata.ResolveClusterArn(configuration);
+        string task = cluster.Replace(":cluster/", ":task/", StringComparison.Ordinal) + "/00000000000000000000000000000001";
+        var lease = await AcquireAsync(store, configuration, clock, task, cancellation);
+        var previousProof = new ControllerClockEvidence(clock.Now, clock.Now.AddSeconds(11), TimeSpan.FromSeconds(1));
+        using var ownership = new ControllerLeaseOwnership(store, lease, previousProof, clock, LeaseDuration, Reserve);
+        clock.Now = clock.Now.AddSeconds(5);
+        table.Wire.Clear();
+
+        var connectStarted = new TaskCompletionSource<CancellationToken>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var completeConnect = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        int reads = 0;
+        using var metadata = new EcsControllerMetadata(configuration, metadataClock, "http://169.254.170.2/v4/fixture",
+            allowLoopback: false, new HeartbeatMetadataWire(async token =>
+            {
+                if (++reads == 1)
+                {
+                    connectStarted.SetResult(token);
+                    await completeConnect.Task;
+                    // The socket timeout belongs to its own cancelled token, not the request deadline.
+                    var connectToken = new CancellationToken(canceled: true);
+                    throw new TaskCanceledException("Simulated socket connect cancellation.",
+                        new TimeoutException("Simulated socket connect timeout."), connectToken);
+                }
+
+                return new HttpResponseMessage(HttpStatusCode.OK)
+                {
+                    Content = new StringContent(JsonSerializer.Serialize(new
+                    {
+                        Cluster = cluster,
+                        TaskARN = next == "foreign task" ? task[..^1] + "2" : task,
+                        LaunchType = "FARGATE",
+                        ClockDrift = new
+                        {
+                            ClockErrorBound = 0.4,
+                            ReferenceTimestamp = metadataClock.Now.UtcDateTime,
+                            ClockSynchronizationStatus = next == "unsynchronized clock" ? "NOT_SYNCHRONIZED" : "SYNCHRONIZED",
+                        },
+                    })),
+                };
+            }));
+
+        var interval = TimeSpan.FromSeconds(5);
+        var heartbeat = ownership.RunHeartbeatsAsync(interval, token =>
+        {
+            metadataClock.Now = clock.Now;
+            return metadata.ReadClockAsync(task, token);
+        }, stopping.Token);
+        try
+        {
+            var originalDeadline = await clock.NextTimerAsync(cancellation);
+            var metadataDeadline = await metadataClock.NextTimerAsync(cancellation);
+            var request = await connectStarted.Task.WaitAsync(cancellation);
+            Assert.False(request.IsCancellationRequested);
+            Assert.Equal(interval, originalDeadline.DueTime);
+            Assert.Equal(TimeSpan.FromSeconds(3), metadataDeadline.DueTime);
+            if (next == "stop")
+            {
+                await stopping.CancelAsync();
+                Assert.True(request.IsCancellationRequested);
+                completeConnect.SetResult();
+                await heartbeat.WaitAsync(TimeSpan.FromSeconds(10), cancellation);
+                Assert.Equal(1, reads);
+                Assert.False(ownership.OwnershipLost.IsCancellationRequested);
+                Assert.DoesNotContain(table.Wire.Requests, request => request.Operation == "TransactWriteItems");
+                return;
+            }
+
+            clock.Now = clock.Now.AddSeconds(1);
+            completeConnect.SetResult();
+            var retry = await clock.NextTimerAsync(cancellation);
+            Assert.Equal(TimeSpan.FromSeconds(1), retry.DueTime);
+            Assert.Equal(new ActiveControllerAuthority(lease, previousProof), ownership.ReadAuthority());
+            Assert.DoesNotContain(table.Wire.Requests, request => request.Operation == "TransactWriteItems");
+
+            clock.Now += retry.DueTime;
+            retry.Fire();
+            var nextDeadline = await clock.NextTimerAsync(cancellation);
+            Assert.Equal(TimeSpan.FromSeconds(3), nextDeadline.DueTime);
+            if (next == "renew")
+            {
+                _ = await clock.NextTimerAsync(cancellation); // Post-renewal delay.
+                var renewed = Assert.IsType<ActiveControllerAuthority>(ownership.ReadAuthority());
+                Assert.Equal(lease.Fence, renewed.Lease.Fence);
+                Assert.Equal(lease.Revision + 1, renewed.Lease.Revision);
+                Assert.Equal(clock.Now, renewed.Clock.ObservedAt);
+                Assert.Single(table.Wire.Requests, request => request.Operation == "TransactWriteItems");
+                Assert.Equal(renewed.Lease, await store.ReadLeaseAsync(lease.Deployment, cancellation));
+            }
+            else
+            {
+                await heartbeat.WaitAsync(TimeSpan.FromSeconds(10), cancellation);
+                Assert.True(ownership.OwnershipLost.IsCancellationRequested);
+                Assert.Null(ownership.ReadAuthority());
+                Assert.DoesNotContain(table.Wire.Requests, request => request.Operation == "TransactWriteItems");
+                Assert.Equal(lease, await store.ReadLeaseAsync(lease.Deployment, cancellation));
+            }
+            Assert.Equal(2, reads);
+        }
+        finally
+        {
+            completeConnect.TrySetResult();
+            await stopping.CancelAsync();
+            await heartbeat.WaitAsync(TimeSpan.FromSeconds(10), cancellation);
+        }
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task HeartbeatReadTimeoutStopsAtThePreviousProofOrLeaseReserve(bool clockExpiresFirst)
+    {
+        var cancellation = TestContext.Current.CancellationToken;
+        using var stopping = CancellationTokenSource.CreateLinkedTokenSource(cancellation);
+        using var table = await MiniStackTable.CreateAsync(cancellation);
+        var clock = new FixtureClock { HoldTimers = true };
+        var store = new DynamoDbLifecycleStore(table.Client, table.Name, clock);
+        var configuration = await ConfigurationAsync(draining: false, cancellation);
+        var lease = await AcquireAsync(store, configuration, clock, MiniStackTable.FirstTask, cancellation);
+        var skew = TimeSpan.FromSeconds(1);
+        var window = TimeSpan.FromSeconds(2);
+        if (!clockExpiresFirst)
+        {
+            clock.Now = lease.ValidUntil - Reserve - skew - window;
+        }
+        var proof = clockExpiresFirst ? new ControllerClockEvidence(clock.Now, clock.Now + window + skew, skew) : ClockProof(clock);
+        using var ownership = new ControllerLeaseOwnership(store, lease, proof, clock, LeaseDuration, Reserve);
+        table.Wire.Clear();
+        int reads = 0;
+        var heartbeat = ownership.RunHeartbeatsAsync(TimeSpan.FromSeconds(5), async token =>
+        {
+            reads++;
+            await Task.Delay(Timeout.InfiniteTimeSpan, token);
+            return ClockProof(clock);
+        }, stopping.Token);
+        try
+        {
+            var deadline = await clock.NextTimerAsync(cancellation);
+            Assert.Equal(window, deadline.DueTime);
+            clock.Now += window - TimeSpan.FromMilliseconds(1);
+            Assert.Equal(lease, ownership.ReadAuthority()?.Lease);
+            Assert.False(heartbeat.IsCompleted);
+
+            clock.Now = clock.Now.AddMilliseconds(1);
+            deadline.Fire();
+            await heartbeat.WaitAsync(TimeSpan.FromSeconds(10), cancellation);
+        }
+        finally
+        {
+            await stopping.CancelAsync();
+            await heartbeat.WaitAsync(TimeSpan.FromSeconds(10), cancellation);
+        }
+
+        Assert.Equal(1, reads);
+        Assert.True(ownership.OwnershipLost.IsCancellationRequested);
+        Assert.Null(ownership.ReadAuthority());
+        Assert.DoesNotContain(table.Wire.Requests, request => request.Operation == "TransactWriteItems");
+        Assert.Equal(lease, await store.ReadLeaseAsync(lease.Deployment, cancellation));
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task HeartbeatDoesNotSubmitRenewalAfterShutdownOrReplacementDuringCompareRead(bool replaced)
+    {
+        var cancellation = TestContext.Current.CancellationToken;
+        using var stopping = CancellationTokenSource.CreateLinkedTokenSource(cancellation);
+        using var table = await MiniStackTable.CreateAsync(cancellation);
+        var clock = new FixtureClock { HoldTimers = true };
+        var store = new DynamoDbLifecycleStore(table.Client, table.Name, clock);
+        var configuration = await ConfigurationAsync(draining: false, cancellation);
+        var lease = await AcquireAsync(store, configuration, clock, MiniStackTable.FirstTask, cancellation);
+        using var ownership = new ControllerLeaseOwnership(store, lease, ClockProof(clock), clock, LeaseDuration, Reserve);
+        clock.Now = clock.Now.AddSeconds(20);
+        table.Wire.Clear();
+        var paused = table.Wire.PauseNextRead(LifecycleKey.Lease(lease.Deployment));
+        var heartbeat = ownership.RunHeartbeatsAsync(TimeSpan.FromSeconds(1),
+            _ => Task.FromResult<ControllerClockEvidence?>(ClockProof(clock)), stopping.Token);
+        try
+        {
+            var deadline = await clock.NextTimerAsync(cancellation);
+            await paused.Captured.WaitAsync(TimeSpan.FromSeconds(10), cancellation);
+            if (!replaced)
+            {
+                await stopping.CancelAsync();
+                await heartbeat.WaitAsync(TimeSpan.FromSeconds(10), cancellation);
+                Assert.DoesNotContain(table.Wire.Requests, request => request.Operation == "TransactWriteItems");
+                Assert.Equal(lease, await store.ReadLeaseAsync(lease.Deployment, cancellation));
+                return;
+            }
+
+            clock.Now += deadline.DueTime;
+            deadline.Fire();
+            var retry = await clock.NextTimerAsync(cancellation);
+            var successorClock = new FixtureClock { Now = lease.ValidUntil.AddSeconds(2) };
+            var successorStore = new DynamoDbLifecycleStore(table.Client, table.Name, successorClock);
+            var successor = await AcquireAsync(successorStore, configuration, successorClock, SecondTask, cancellation);
+            table.Wire.Clear();
+            clock.Now += retry.DueTime;
+            retry.Fire();
+            await heartbeat.WaitAsync(TimeSpan.FromSeconds(10), cancellation);
+
+            Assert.True(ownership.OwnershipLost.IsCancellationRequested);
+            Assert.Null(ownership.ReadAuthority());
+            Assert.DoesNotContain(table.Wire.Requests, request => request.Operation == "TransactWriteItems");
+            var profile = new LifecycleProfile(lease.Deployment, ProfileId);
+            var binding = new SessionBinding(profile, GitHubRoutingIdentity.Scope(Scope), GitHubWire.SetId);
+            var open = await store.BeginSessionOpenAsync(binding, lease.Fence,
+                null, "stale-owner", clock.Now.AddSeconds(1), clock.Now.AddSeconds(30), cancellation);
+            Assert.Equal(LifecycleWriteOutcome.LeaseRejected, open.Outcome);
+            Assert.Null(open.Permission);
+            Assert.Null(await store.ReadSessionAsync(profile, cancellation));
+            Assert.Equal(successor, await store.ReadLeaseAsync(lease.Deployment, cancellation));
+        }
+        finally
+        {
+            paused.Resume();
+            await stopping.CancelAsync();
+            await heartbeat.WaitAsync(TimeSpan.FromSeconds(10), cancellation);
+        }
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task HeartbeatCancellationAtTheWriteBoundaryFencesBothPossibleOutcomes(bool committed)
     {
         var cancellation = TestContext.Current.CancellationToken;
         using var table = await MiniStackTable.CreateAsync(cancellation);
@@ -311,15 +629,18 @@ public sealed class ControllerLifecycleTests
         using var ownership = new ControllerLeaseOwnership(store, lease, ClockProof(clock), clock, LeaseDuration, Reserve);
         clock.Now = clock.Now.AddSeconds(20);
         table.Wire.Clear();
-        var paused = table.Wire.PauseAfterNextSuccessfulTransactionWrite(LifecycleKey.Lease(lease.Deployment));
+        var key = LifecycleKey.Lease(lease.Deployment);
+        var paused = committed ? table.Wire.PauseAfterNextSuccessfulTransactionWrite(key) : table.Wire.PauseNextTransactionWrite(key);
         try
         {
             var heartbeat = ownership.RunHeartbeatsAsync(TimeSpan.FromSeconds(1),
                 _ => Task.FromResult<ControllerClockEvidence?>(ClockProof(clock)), cancellation);
-            await paused.Captured.WaitAsync(TimeSpan.FromSeconds(5), cancellation);
+            var deadline = await clock.NextTimerAsync(cancellation);
+            await paused.Captured.WaitAsync(TimeSpan.FromSeconds(10), cancellation);
             Assert.Equal(lease, ownership.ReadAuthority()?.Lease);
-            Assert.IsType<Action>(clock.FireTimer)();
-            await heartbeat.WaitAsync(TimeSpan.FromSeconds(5), cancellation);
+            clock.Now += deadline.DueTime;
+            deadline.Fire();
+            await heartbeat.WaitAsync(TimeSpan.FromSeconds(10), cancellation);
         }
         finally
         {
@@ -332,7 +653,7 @@ public sealed class ControllerLifecycleTests
         var durable = Assert.IsType<ControllerLease>(await store.ReadLeaseAsync(lease.Deployment, cancellation));
         Assert.Equal(lease.Fence, durable.Fence);
         Assert.Equal(ControllerLeaseMode.Active, durable.Mode);
-        Assert.Equal(lease.Revision + 1, durable.Revision);
+        Assert.Equal(lease.Revision + (committed ? 1 : 0), durable.Revision);
     }
 
     [Theory]
@@ -500,11 +821,24 @@ public sealed class ControllerLifecycleTests
 
     private static ControllerClockEvidence ClockProof(FixtureClock clock) => new(clock.Now, clock.Now.AddMinutes(3), TimeSpan.FromSeconds(1));
 
+    private sealed class HeartbeatMetadataWire(Func<CancellationToken, Task<HttpResponseMessage>> respond) : HttpMessageHandler
+    {
+        protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+        {
+            Assert.Equal("http://169.254.170.2/v4/fixture/task", request.RequestUri?.AbsoluteUri);
+            return respond(cancellationToken);
+        }
+    }
+
     private sealed class FixtureClock : TimeProvider
     {
+        private readonly Channel<(TimeSpan DueTime, Action Fire)> _timers = Channel.CreateUnbounded<(TimeSpan, Action)>();
+
         internal DateTimeOffset Now { get; set; } = MiniStackTable.Now;
         internal bool HoldTimers { get; init; }
-        internal Action? FireTimer { get; private set; }
+
+        internal Task<(TimeSpan DueTime, Action Fire)> NextTimerAsync(CancellationToken cancellationToken) =>
+            _timers.Reader.ReadAsync(cancellationToken).AsTask().WaitAsync(TimeSpan.FromSeconds(10), cancellationToken);
 
         public override DateTimeOffset GetUtcNow() => Now;
 
@@ -514,7 +848,7 @@ public sealed class ControllerLifecycleTests
             {
                 return System.CreateTimer(callback, state, dueTime, period);
             }
-            FireTimer = () => callback(state);
+            Assert.True(_timers.Writer.TryWrite((dueTime, () => callback(state))));
             return System.CreateTimer(callback, state, Timeout.InfiniteTimeSpan, Timeout.InfiniteTimeSpan);
         }
     }

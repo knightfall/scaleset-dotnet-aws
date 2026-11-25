@@ -103,10 +103,18 @@ public sealed partial class DynamoDbLifecycleStore
             existing?.Mode == ControllerLeaseMode.Released ? null : expiredBy, cancellationToken).ConfigureAwait(false));
     }
 
-    public async Task<ControllerLeaseChange> RenewLeaseAsync(
+    public Task<ControllerLeaseChange> RenewLeaseAsync(
         ControllerLease expected,
         DateTimeOffset latestNow,
         DateTimeOffset validUntil,
+        CancellationToken cancellationToken) =>
+        RenewLeaseAsync(expected, latestNow, validUntil, markWriteStarted: null, cancellationToken);
+
+    internal async Task<ControllerLeaseChange> RenewLeaseAsync(
+        ControllerLease expected,
+        DateTimeOffset latestNow,
+        DateTimeOffset validUntil,
+        Action? markWriteStarted,
         CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(expected);
@@ -122,6 +130,8 @@ public sealed partial class DynamoDbLifecycleStore
             return telemetry.Complete(new ControllerLeaseChange(LifecycleWriteOutcome.Conflict, null));
         }
         var renewed = expected with { ValidUntil = deadline, Revision = NextRevision(expected.Revision), TransitionId = Guid.NewGuid() };
+        cancellationToken.ThrowIfCancellationRequested();
+        markWriteStarted?.Invoke();
         return telemetry.Complete(await WriteLeaseChangeAsync(renewed, expected, ConservativeLatest(latestNow), null, cancellationToken)
             .ConfigureAwait(false));
     }
