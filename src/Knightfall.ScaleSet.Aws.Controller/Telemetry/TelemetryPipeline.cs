@@ -87,6 +87,8 @@ public sealed class TelemetryPipeline : IAsyncDisposable
 
     internal ExportReceipt? FirstReceipt(TelemetrySignal signal) => _exports.First(signal);
 
+    /// <summary>Stops the telemetry workers and joins their cleanup within one shared budget.</summary>
+    /// <returns>Whether cleanup completed successfully. Delivery remains best effort and has separate export receipts.</returns>
     public Task<bool> StopAsync()
     {
         lock (_shutdownGate)

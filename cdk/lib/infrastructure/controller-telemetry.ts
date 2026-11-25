@@ -90,6 +90,23 @@ function endpoint(value: unknown): value is string {
   }
   const authority = /^https?:\/\/([^/]+)/iu.exec(value)?.[1];
   if (!authority || /[@%]/u.test(authority)) return false;
+  const path = value.slice(value.indexOf("://") + 3 + authority.length);
+  if (
+    /[\[\]]/u.test(path) ||
+    path.split("/").some((part) => part === "." || part === "..")
+  ) {
+    return false;
+  }
+  for (const escape of path.matchAll(/%([0-9a-f]{2})/giu)) {
+    const octet = Number.parseInt(escape[1], 16);
+    if (
+      octet < 0x20 ||
+      octet === 0x7f ||
+      (octet >= 0x80 && /[a-f]/u.test(escape[1])) ||
+      /[A-Za-z0-9._~\\-]/u.test(String.fromCharCode(octet))
+    )
+      return false;
+  }
   const url = URL.parse(value);
   return url !== null && url.hostname.length > 0 && url.port !== "0";
 }

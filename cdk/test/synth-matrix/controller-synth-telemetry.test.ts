@@ -344,6 +344,44 @@ test("typed telemetry rejects unknown fields, plaintext headers and malformed ho
   );
 });
 
+test("CDK uses the same literal endpoint paths as the runtime", () => {
+  const cases = JSON.parse(
+    readFileSync(
+      new URL(
+        "../../../testdata/telemetry/otlp-endpoints.json",
+        import.meta.url,
+      ),
+      "utf8",
+    ),
+  ) as { endpoint: string; path: string | null }[];
+  for (const { endpoint, path } of cases) {
+    const input = {
+      exporters: {
+        traces: {
+          endpoint,
+          protocol: "http/protobuf",
+          headersSecret: { secretArn: commonSecret },
+        },
+      },
+    };
+    if (path === null) {
+      assert.throws(() => resolveControllerTelemetry(input, aws), {
+        message:
+          "Invalid controller telemetry setting exporters.traces.endpoint.",
+      });
+      continue;
+    }
+
+    const resolved = resolveControllerTelemetry(input, aws);
+    assert.equal(
+      resolved.environment.OTEL_EXPORTER_OTLP_TRACES_ENDPOINT,
+      endpoint,
+    );
+    assert.equal(new URL(endpoint).pathname, path);
+    assert.equal(resolved.headers[0]?.secretArn, commonSecret);
+  }
+});
+
 test("credentialed remote OTLP requires TLS for each resolved signal", () => {
   const secure = "https://collector.example.invalid";
   const unsecured = "http://collector.example.invalid";

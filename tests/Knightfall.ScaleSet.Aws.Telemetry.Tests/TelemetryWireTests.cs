@@ -30,7 +30,7 @@ public sealed partial class TelemetryWireTests
     {
         var cancellationToken = TestContext.Current.CancellationToken;
         await using var receiver = await OtlpLoopback.StartAsync(grpc, respond: null, cancellationToken);
-        var settings = Settings(receiver.Url + "/otlp-prefix/", grpc);
+        var settings = Settings(receiver.Url + "/otlp-prefix/café/📦/%5Bblue%5D/", grpc);
         await using var output = new StringWriter(CultureInfo.InvariantCulture);
         await using var errors = new StringWriter(CultureInfo.InvariantCulture);
 
@@ -46,6 +46,7 @@ public sealed partial class TelemetryWireTests
             Assert.Equal(grpc ? "application/grpc" : "application/x-protobuf", request.MediaType);
             Assert.Equal("Bearer test-fixture", request.Authorization);
             Assert.StartsWith("/otlp-prefix/", request.Path, StringComparison.Ordinal);
+            Assert.StartsWith("/otlp-prefix/caf%C3%A9/%F0%9F%93%A6/%5Bblue%5D/", request.RawTarget, StringComparison.Ordinal);
         }
 
         var trace = Signal(requests, grpc, "traces", "trace", "Trace");
@@ -249,6 +250,101 @@ public sealed partial class TelemetryWireTests
         Assert.Equal(profiles.Select(static profile => profile.Id).Order(StringComparer.Ordinal),
             points.Select(static point => point.StringAttributes(7)["profile"]).Order(StringComparer.Ordinal));
         Assert.Equal(config.EnvironmentName, metric.Message(1).StringAttributes(1)["scaleset.deployment.name"]);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task RepeatedSpanKeysCannotOverrideApprovedDimensionsOnTheWire(bool grpc)
+    {
+        var cancellationToken = TestContext.Current.CancellationToken;
+        await using var receiver = await OtlpLoopback.StartAsync(grpc, respond: null, cancellationToken);
+        var config = RuntimeConfigurationLoader.Load(await File.ReadAllBytesAsync(Path.Combine(AppContext.BaseDirectory, "mixed.json"), cancellationToken));
+        await using var pipeline = TelemetryPipeline.Start(Settings(receiver.Url, grpc, runtime: config));
+        using var source = new ActivitySource(Controller);
+        var identity = Assert.IsType<TelemetryProfile>(TelemetryProfile.From(config.Profiles[0]));
+        string wrongProvider = identity.Provider == "ec2" ? "fargate" : "ec2";
+        var parent = new ActivityContext(ActivityTraceId.CreateRandom(), ActivitySpanId.CreateRandom(), ActivityTraceFlags.Recorded,
+            traceState: "fixture=" + Secret, isRemote: true);
+
+        using (var normal = Assert.IsType<Activity>(source.StartActivity("scaleset.aws.ec2.launch", ActivityKind.Internal, parent)))
+        {
+            identity.SetTags(normal);
+            normal.SetTag("operation", "launch").SetTag("outcome", "success").SetTag("reason", "none");
+        }
+
+        foreach (bool approvedFirst in new[] { false, true })
+        {
+            using var span = Assert.IsType<Activity>(source.StartActivity("scaleset.aws.ec2.terminate", ActivityKind.Internal, parent));
+            foreach (bool approved in new[] { approvedFirst, !approvedFirst })
+            {
+                span.AddTag("profile", approved ? identity.Id : Secret)
+                    .AddTag("provider", approved ? identity.Provider : wrongProvider)
+                    .AddTag("reason", approved ? "timeout" : Secret)
+                    .AddTag("operation", approved ? "terminate" : Secret)
+                    .AddTag("unknown", Secret);
+            }
+            span.SetTag("outcome", "failed").SetStatus(ActivityStatusCode.Error, Secret);
+            Assert.Equal(2, span.TagObjects.Count(tag => tag.Key == "profile"));
+        }
+
+        Assert.True(await pipeline.StopAsync().WaitAsync(cancellationToken));
+        var trace = Signal(receiver.Requests, grpc, "traces", "trace", "Trace");
+        var spans = trace.Messages(2).SelectMany(scope => scope.Messages(2)).ToArray();
+        Assert.Equal(3, spans.Length);
+        Assert.All(receiver.Requests, request => Assert.DoesNotContain(Secret, Encoding.UTF8.GetString(request.Payload()), StringComparison.Ordinal));
+        Assert.All(spans, span =>
+        {
+            Assert.Equal(parent.TraceId.ToHexString(), Convert.ToHexStringLower(span.Bytes(1)));
+            Assert.Equal(parent.SpanId.ToHexString(), Convert.ToHexStringLower(span.Bytes(4)));
+            Assert.Empty(span.BytesOrEmpty(3));
+        });
+
+        var accepted = Assert.Single(spans, span => span.Text(5) == "scaleset.aws.ec2.launch").StringAttributes(9);
+        Assert.Equal(5, accepted.Count);
+        Assert.Equal(identity.Id, accepted["profile"]);
+        Assert.Equal(identity.Provider, accepted["provider"]);
+        Assert.Equal("launch", accepted["operation"]);
+        Assert.Equal("success", accepted["outcome"]);
+        Assert.Equal("none", accepted["reason"]);
+        foreach (var span in spans.Where(span => span.Text(5) == "scaleset.aws.ec2.terminate"))
+        {
+            var attributes = span.StringAttributes(9);
+            Assert.Equal(2, attributes.Count);
+            Assert.Equal("failed", attributes["outcome"]);
+            Assert.Equal("other", attributes["reason"]);
+        }
+        Assert.Equal(2, spans.Count(span => span.Text(5) == "scaleset.aws.ec2.terminate"));
+    }
+
+    [Theory]
+    [InlineData(false, false)]
+    [InlineData(false, true)]
+    [InlineData(true, false)]
+    [InlineData(true, true)]
+    public async Task BoundedLogShutdownReportsCleanupAndTracksCollectorAcceptanceSeparately(bool grpc, bool accepted)
+    {
+        var cancellationToken = TestContext.Current.CancellationToken;
+        await using var receiver = await OtlpLoopback.StartAsync(grpc,
+            _ => accepted ? ReceiverReply.Accepted : ReceiverReply.Rejected, cancellationToken);
+        var settings = TelemetrySettings.Load(readEnvironment: key => key switch
+        {
+            "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT" => receiver.Url + "/v1/logs",
+            "OTEL_EXPORTER_OTLP_LOGS_PROTOCOL" => grpc ? "grpc" : "http/protobuf",
+            _ => null,
+        });
+        await using var pipeline = TelemetryPipeline.Start(settings, TextWriter.Null, new DiscardConsole());
+        WriteEvent(pipeline.Logging.CreateLogger(Controller), "smoke", "success");
+        var stopwatch = Stopwatch.StartNew();
+        var stopping = pipeline.StopAsync();
+
+        Assert.True(await stopping.WaitAsync(TimeSpan.FromSeconds(5.25), cancellationToken));
+        Assert.True(stopwatch.Elapsed < TimeSpan.FromSeconds(5.25));
+        Assert.Same(stopping, pipeline.StopAsync());
+        Assert.Equal(accepted ? ExportReceipt.Accepted : ExportReceipt.Rejected, pipeline.FirstReceipt(TelemetrySignal.Logs));
+        var payload = new OtlpMessage(Assert.Single(receiver.Requests).Payload());
+        var record = payload.Message(1).Message(2).Message(2);
+        Assert.Equal("smoke", record.StringAttributes(6)["operation"]);
     }
 
     [Theory]
