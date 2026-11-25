@@ -224,6 +224,11 @@ internal sealed class MiniStackWire : DelegatingHandler
     internal void FailNextGetItem(LifecycleKey key, Exception error) =>
         Interlocked.Exchange(ref _failedGetItem, new StorageFailure(key, null, null, error));
 
+    internal void DenyGetItem(LifecycleKey key) =>
+        Interlocked.Exchange(ref _failedGetItem, new StorageFailure(key, HttpStatusCode.Forbidden, "AccessDeniedException", Repeat: true));
+
+    internal void RestoreGetItem() => Interlocked.Exchange(ref _failedGetItem, null);
+
     internal void FailNextTransactWrite(LifecycleKey key, string errorCode) =>
         Interlocked.Exchange(ref _failedTransactWrite, new StorageFailure(key, HttpStatusCode.BadRequest, errorCode));
 
@@ -269,7 +274,7 @@ internal sealed class MiniStackWire : DelegatingHandler
 
         if (operation == "GetItem" && _failedGetItem is { } fault &&
             MatchesKey(call.Request.GetProperty("Key"), fault.Key) &&
-            ReferenceEquals(Interlocked.CompareExchange(ref _failedGetItem, null, fault), fault))
+            ReferenceEquals(Interlocked.CompareExchange(ref _failedGetItem, fault.Repeat ? fault : null, fault), fault))
         {
             return FailureResponse(fault);
         }
@@ -379,7 +384,8 @@ internal sealed class MiniStackWire : DelegatingHandler
         };
     }
 
-    private sealed record StorageFailure(LifecycleKey Key, HttpStatusCode? Status, string? ErrorCode, Exception? Failure = null);
+    private sealed record StorageFailure(LifecycleKey Key, HttpStatusCode? Status, string? ErrorCode, Exception? Failure = null,
+        bool Repeat = false);
 
     internal sealed class PausedRequest(LifecycleKey key)
     {

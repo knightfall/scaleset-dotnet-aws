@@ -7,14 +7,25 @@ internal sealed class ObservedMessageSession(IMessageSessionClient inner, TimePr
 {
     public RunnerScaleSetSession Session => inner.Session;
 
+    internal bool PollCredentialRejected { get; set; }
+
+    internal bool PollCompleted { get; set; }
+
     public async Task<RunnerScaleSetMessage?> GetMessageAsync(long lastMessageId, int maxCapacity, CancellationToken cancellationToken)
     {
         using var telemetry = GitHubListenerDiagnostics.Start("poll", clock, cancellationToken);
         try
         {
             var message = await inner.GetMessageAsync(lastMessageId, maxCapacity, cancellationToken).ConfigureAwait(false);
+            PollCompleted = true;
             telemetry.Complete(message is null ? "empty" : "received");
             return message;
+        }
+        catch (ScaleSetApiException error) when (error is { StatusCode: 401, Method: "GET" })
+        {
+            PollCredentialRejected = true;
+            telemetry.Complete("failed", "unauthorized");
+            throw;
         }
         catch (ScaleSetRateLimitException)
         {

@@ -382,7 +382,10 @@ internal static class ActiveControllerRuntime
         private void Publish(DateTimeOffset now) => context.PublishHealth(new ControllerHealthSnapshot(true, true, true,
             !_stopped && owner.ReadAuthority() is not null, profiles.Select(entry => new ControllerProfileHealth(entry.Key.ProfileId,
                 !_stopped && _readyUntil.GetValueOrDefault(entry.Key.ProfileId) > now &&
-                (!entry.Session.RequiresListenerHealth || entry.Session.IsListenerAvailable))).ToImmutableArray()));
+                (!entry.Session.RequiresListenerHealth || entry.Session.IsListenerAvailable))
+            {
+                ListenerFailure = entry.Session.RequiresListenerHealth ? entry.Session.ListenerFailure : null,
+            }).ToImmutableArray()));
     }
 
     private sealed class ActiveControllerShutdownWork(ControllerProfileReconciler[] profiles, Task workers,

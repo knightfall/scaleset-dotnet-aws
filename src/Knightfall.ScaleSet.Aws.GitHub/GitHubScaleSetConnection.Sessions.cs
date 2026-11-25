@@ -24,19 +24,23 @@ public sealed partial class GitHubScaleSetConnection
     }
 
     internal async Task RetireSessionAsync(
-        SessionSendAuthorization authorization, IMessageSession? owned, CancellationToken cancellationToken)
+        SessionSendAuthorization authorization, IMessageSession? owned, CancellationToken cancellationToken,
+        bool useAdministratorForOwnedClose = false)
     {
         var session = authorization.Session;
         if (session.Phase != SessionPhase.Closing || session.SessionId is not { } id ||
-            (owned is null ? session.CloseKind != SessionCloseKind.FencedRetirement :
-                session.CloseKind != SessionCloseKind.OwnedClient || owned.Session.SessionId != id))
+            (owned is null ? useAdministratorForOwnedClose || session.CloseKind != SessionCloseKind.FencedRetirement :
+                session.CloseKind != SessionCloseKind.OwnedClient || owned.Session.SessionId != id ||
+                (useAdministratorForOwnedClose && owned.Session.RunnerScaleSet is { Id: > 0 } set && set.Id != session.Binding.ScaleSetId)))
         {
             throw BindingMismatch();
         }
 
         _ = await RunSessionMutationAsync(authorization, owned is null ? "session-retire" : "session-close", async token =>
         {
-            if (owned is null)
+            // A validated replacement can supply transport while the retained client
+            // above still proves ownership of this exact session.
+            if (owned is null || useAdministratorForOwnedClose)
             {
                 await _client.DeleteMessageSessionAsync(session.Binding.ScaleSetId, id, token).ConfigureAwait(false);
             }

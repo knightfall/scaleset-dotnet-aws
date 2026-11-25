@@ -47,9 +47,21 @@ public sealed class ControllerHealthTests
                 });
         }
 
-        Volatile.Write(ref snapshot, snapshot with { LeaseActive = true });
+        Volatile.Write(ref snapshot, snapshot with
+        {
+            LeaseActive = true,
+            Profiles = [new("linux-ec2", true), new("linux-fargate", false) { ListenerFailure = "listener_storage_rejected" }],
+        });
         using var degraded = await client.GetAsync("readyz", cancellationToken);
         Assert.Equal(HttpStatusCode.ServiceUnavailable, degraded.StatusCode);
+        using (var body = JsonDocument.Parse(await degraded.Content.ReadAsStringAsync(cancellationToken)))
+        {
+            var profiles = body.RootElement.GetProperty("profiles");
+            Assert.False(profiles[0].TryGetProperty("listenerFailure", out _));
+            Assert.Equal("listener_storage_rejected", profiles[1].GetProperty("listenerFailure").GetString());
+        }
+        using var stillLive = await client.GetAsync("healthz", cancellationToken);
+        Assert.Equal(HttpStatusCode.OK, stillLive.StatusCode);
 
         Volatile.Write(ref snapshot, snapshot with { Profiles = [new("linux-ec2", true), new("linux-fargate", true)] });
         using var ready = await client.GetAsync("readyz", cancellationToken);

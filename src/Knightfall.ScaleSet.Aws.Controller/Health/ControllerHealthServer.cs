@@ -1,4 +1,5 @@
 using System.Collections.Immutable;
+using System.Text.Json.Serialization;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Http;
@@ -10,7 +11,11 @@ using Microsoft.Extensions.Logging;
 
 namespace Knightfall.ScaleSet.Aws.Controller.Health;
 
-public sealed record ControllerProfileHealth(string Profile, bool Ready);
+public sealed record ControllerProfileHealth(string Profile, bool Ready)
+{
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? ListenerFailure { get; init; }
+}
 
 public sealed record ControllerHealthSnapshot(
     bool Live,
