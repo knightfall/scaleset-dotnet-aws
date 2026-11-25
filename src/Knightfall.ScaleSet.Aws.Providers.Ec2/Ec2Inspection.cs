@@ -58,6 +58,7 @@ public enum Ec2InstanceState
     Running = 2,
     ShuttingDown = 3,
     Terminated = 4,
+    Stopped = 5,
 }
 
 public sealed record Ec2InventoryEntry(

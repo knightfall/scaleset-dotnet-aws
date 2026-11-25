@@ -184,14 +184,24 @@ public sealed partial class DynamoDbLifecycleStore
             return telemetry.Complete(new JitHandoffChange(LifecycleWriteOutcome.Conflict));
         }
 
-        var key = LifecycleKey.Offer(handoff.Identity.AwsUserId);
-        var next = handoff with
+        var next = RevokedJitHandoff(handoff, Guid.NewGuid());
+        // Revocation removes the offer. The counted handoff remains until the executor and registration have been reconciled.
+        return telemetry.Complete(await CommitJitHandoffChangeAsync(profile, next,
+            [LeaseCondition(lease.Fence), WriteExactJitHandoff(profile, handoff, next), DeleteExactOffer(handoff)], cancellationToken).ConfigureAwait(false));
+    }
+
+    private static JitHandoffSnapshot RevokedJitHandoff(JitHandoffSnapshot handoff, Guid transition) =>
+        handoff with
         {
             State = JitHandoffState.Revoked,
             Revision = NextRevision(handoff.Revision),
-            TransitionId = Guid.NewGuid(),
+            TransitionId = transition,
         };
-        var delete = new TransactionAction(key, new TransactWriteItem
+
+    private TransactionAction DeleteExactOffer(JitHandoffSnapshot handoff)
+    {
+        var key = LifecycleKey.Offer(handoff.Identity.AwsUserId);
+        return new TransactionAction(key, new TransactWriteItem
         {
             Delete = new Delete
             {
@@ -209,9 +219,6 @@ public sealed partial class DynamoDbLifecycleStore
                 },
             },
         });
-        // Revocation removes the offer. The counted handoff remains until the executor and registration have been reconciled.
-        return telemetry.Complete(await CommitJitHandoffChangeAsync(profile, next,
-            [LeaseCondition(lease.Fence), WriteExactJitHandoff(profile, handoff, next), delete], cancellationToken).ConfigureAwait(false));
     }
 
     public async Task<JitHandoffChange> CompleteTerminatedJitHandoffAsync(

@@ -12,6 +12,8 @@ internal sealed record RunnerBackendResource(
     string ResourceArn, ExecutorBinding? Binding, ExecutorResourceObservation? Observation, string? BootstrapCredentialArn)
 {
     public string? Ec2StatusQualificationSha256 { get; init; }
+
+    public bool IsStoppedEc2 { get; init; }
 }
 
 internal sealed record RunnerBackendInventory(

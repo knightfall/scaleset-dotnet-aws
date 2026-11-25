@@ -204,7 +204,7 @@ internal sealed class FargateRunnerBackend(
             var now = clock.GetUtcNow();
             var startupExpired = executor.State.StartedAt is { } start && now - start >= TimeSpan.FromSeconds(profile.Capacity.StartupTimeoutSeconds);
             if ((catalog.State != CatalogProfileState.Draining && !startupExpired) ||
-                await store.CloseFargateAdmissionAsync(authority.Lease, executor, timing.ObservationFreshness, cancellationToken).ConfigureAwait(false) !=
+                await store.CloseFargateAdmissionAsync(authority.Lease, catalog, executor, timing.ObservationFreshness, cancellationToken).ConfigureAwait(false) !=
                     LifecycleWriteOutcome.Committed)
             {
                 return;

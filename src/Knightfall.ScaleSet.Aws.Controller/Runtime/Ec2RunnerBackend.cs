@@ -250,6 +250,7 @@ internal sealed class Ec2RunnerBackend(
         string? credential = entry.InstanceProfileArn == _provisioner.InstanceProfileArn ? entry.InstanceProfileArn : null;
         return new RunnerBackendResource(entry.ResourceArn, binding, observation, credential)
         {
+            IsStoppedEc2 = entry.State == Ec2InstanceState.Stopped,
             Ec2StatusQualificationSha256 = _provisioner.StatusQualification is { } qualification && template?.VersionNumber == version &&
                 entry.ImageId == qualification.ImageId && credential is not null ? qualification.EvidenceSha256 : null,
         };
