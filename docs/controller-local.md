@@ -20,6 +20,10 @@ dotnet run --project src/Knightfall.ScaleSet.Aws.Controller -- \
 
 For S3 runtime input, configure the AWS SDK region and credentials for the configuration bucket. S3 reads require both the supplied version and the expected bytes to match. Configuration and demand reads from S3 each support artifacts up to 64 MiB. A local demand snapshot or replay uses the local runtime file's directory to resolve relative paths. A remote demand snapshot uses its own configured S3 version and digest.
 
+For an S3 demand snapshot, supply its `s3Uri`, `versionId`, and `sha256` using a versioned general-purpose bucket owned by the account in `spec.aws.account`. The literal URI key supports up to 1,024 ASCII letters, digits, periods, underscores, hyphens, and slash separators. Use nonempty path segments and avoid `.` or `..` segments. Copy the S3 version ID exactly, including characters such as `+`, `/`, and `=`. The controller checks the owner, version, and SHA-256 before using the snapshot. If an existing address falls outside this contract, copy it to a supported bucket and key, then update the address, version, and digest.
+
+Specify pinned GitHub scale-set IDs and EC2 Launch Template versions as quoted positive decimal strings to preserve precision. GitHub routing values retain their authored spelling. Scope, group, scale-set, and label comparisons use pinned Unicode 17.0 simple case-folding data. The [replay fixture](../testdata/dryrun/replay.json) shows the observation format and deployment and profile bindings. Replay evaluates observations in chronological order.
+
 The long-running controller verifies its runtime digest and requires a positive configuration generation.
 
 ```sh
