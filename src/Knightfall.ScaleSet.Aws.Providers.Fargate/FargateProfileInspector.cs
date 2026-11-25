@@ -238,9 +238,10 @@ public sealed partial class FargateProfileInspector
 
     private static bool ValidContainer(TaskDefinition definition, string runnerContainer, FargateContainerApproval approval)
     {
-        if (definition.ContainerDefinitions is not [var container] || container is null || container.Name != runnerContainer ||
+        if (definition.PidMode is not null ||
+            definition.ContainerDefinitions is not [var container] || container is null || container.Name != runnerContainer ||
             container.Essential == false || container.Privileged == true || container.RestartPolicy?.Enabled == true ||
-            container.HealthCheck is not null ||
+            container.HealthCheck is not null || container.LinuxParameters?.InitProcessEnabled == true ||
             container.ReadonlyRootFilesystem != true || container.Image != approval.Image ||
             !(container.EntryPoint ?? []).SequenceEqual(approval.EntryPoint, StringComparer.Ordinal) ||
             !(container.Command ?? []).SequenceEqual(approval.Command, StringComparer.Ordinal))

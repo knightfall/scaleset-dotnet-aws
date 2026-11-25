@@ -67,6 +67,9 @@ public sealed class FargateBootstrapTests
     [InlineData("task")]
     [InlineData("cluster")]
     [InlineData("container")]
+    [InlineData("mismatched-runtime-id")]
+    [InlineData("sidecar")]
+    [InlineData("internal-looking-container")]
     [InlineData("family")]
     [InlineData("invalid-revision")]
     [InlineData("redirect")]
@@ -248,6 +251,19 @@ public sealed class FargateBootstrapTests
             string body;
             if (path.EndsWith("/task", StringComparison.Ordinal))
             {
+                var containers = new List<object>
+                {
+                    new { DockerId = defect == "mismatched-runtime-id" ? TaskId + "-9876543210" : runtime, Name = "runner" },
+                };
+                if (defect is "sidecar" or "internal-looking-container")
+                {
+                    containers.Add(new
+                    {
+                        DockerId = TaskId + "-9876543210",
+                        Name = defect == "sidecar" ? "extra" : "~internal~ecs~pause",
+                        Type = defect == "sidecar" ? "NORMAL" : "CNI_PAUSE",
+                    });
+                }
                 body = JsonSerializer.Serialize(new
                 {
                     Cluster = defect == "cluster" ? Cluster + "-other" : Cluster,
@@ -255,7 +271,7 @@ public sealed class FargateBootstrapTests
                     Family = defect == "family" ? Settings.TaskFamily + "-other" : Settings.TaskFamily,
                     Revision = defect switch { "wrong-revision" => "8", "invalid-revision" => "07", _ => "7" },
                     LaunchType = "FARGATE",
-                    Containers = new[] { new { DockerId = runtime, Name = "runner" } },
+                    Containers = containers,
                 });
             }
             else
