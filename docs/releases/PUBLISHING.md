@@ -33,11 +33,27 @@ own ECR registry when importing an archive. [GitHub artifact attestations](https
   attestation verification, and publication use the job's `GITHUB_TOKEN`.
 
 Before creating the tag, qualify the **exact token** intended for production.
-Run the read-only check in Bash from the reviewed checkout when provisioning
-the token, before storing it as the environment secret. The check uses the same
-ruleset predicate as the protected job for main, tag immutability and tag
-creation. Save only the pass or fail result. The protected job independently
-checks the current rulesets again before publishing.
+To check the stored token, dispatch **Check production release settings** on the
+selected `main` commit. A production reviewer approves the read-only job. It
+uses the existing environment secret and reports only a sanitized result. It
+requires the same ruleset predicate as publication for `main`, tag immutability
+and tag creation.
+
+```sh
+repo=knightfall/scaleset-dotnet-aws
+gh secret list --repo "$repo" --env production
+gh workflow run release-settings.yml --repo "$repo" --ref main
+```
+
+Record the successful run and attempt for the selected commit. Check that
+`RELEASE_SETTINGS_READ_TOKEN` is present as a `production` environment secret
+and that its update time predates that run. Repeat the check if the secret
+changes or the selected commit changes. The protected publish job independently
+checks the current rulesets again after its own approval.
+
+When provisioning a token, you can also run the same check in Bash from the
+reviewed checkout before storing that exact token as the environment secret.
+Save only the pass or fail result.
 
 ```bash
 read -r -s -p 'Release settings token: ' release_settings_token
