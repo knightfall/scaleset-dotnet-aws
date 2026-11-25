@@ -246,17 +246,26 @@ public sealed partial class DynamoDbLifecycleStore
         LifecycleProfile profile, DeploymentLeaseFence lease, CancellationToken cancellationToken)
     {
         RequireProfileLease(profile, lease);
-        var (_, demand, owner) = await ReadDemandEnvelopeAsync(profile, cancellationToken).ConfigureAwait(false);
-        return owner == lease ? demand : null;
+        var (_, demand, session) = await ReadDemandEnvelopeAsync(profile, cancellationToken).ConfigureAwait(false);
+        return session?.Owner == lease ? demand : null;
     }
 
-    private async Task<(LifecycleRecord? Record, SessionDemandObservation? Demand, DeploymentLeaseFence? Owner)> ReadDemandEnvelopeAsync(
+    public async Task<(SessionDemandObservation Demand, long DemandRevision, long SessionRevision)?> ReadFargateLaunchDemandAsync(
+        LifecycleProfile profile, DeploymentLeaseFence lease, CancellationToken cancellationToken)
+    {
+        RequireProfileLease(profile, lease);
+        var (record, demand, session) = await ReadDemandEnvelopeAsync(profile, cancellationToken).ConfigureAwait(false);
+        return session is { } current && current.Owner == lease && demand is not null && record is not null
+            ? (demand, record.Revision, current.Revision) : null;
+    }
+
+    private async Task<(LifecycleRecord? Record, SessionDemandObservation? Demand, SessionRecord? Session)> ReadDemandEnvelopeAsync(
         LifecycleProfile profile, CancellationToken cancellationToken)
     {
         var record = await ReadRecordAsync(LifecycleKey.Demand(profile), cancellationToken).ConfigureAwait(false);
         var demand = record is null ? null : ParseExecutorRecord<SessionDemandObservation>(record);
         var session = await ReadSessionAsync(profile, cancellationToken).ConfigureAwait(false);
-        return (record, session is { Phase: SessionPhase.Active } && session.SessionId == demand?.SessionId ? demand : null, session?.Owner);
+        return (record, session is { Phase: SessionPhase.Active } && session.SessionId == demand?.SessionId ? demand : null, session);
     }
 
     private async Task<LifecycleWriteOutcome> UpdateExecutorAsync(

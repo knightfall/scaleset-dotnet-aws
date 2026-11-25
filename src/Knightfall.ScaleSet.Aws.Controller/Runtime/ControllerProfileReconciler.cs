@@ -1,5 +1,3 @@
-using System.Collections.Immutable;
-using System.Globalization;
 using Knightfall.ScaleSet.Aws.Controller.Lifecycle;
 using Knightfall.ScaleSet.Aws.Core.Catalog;
 using Knightfall.ScaleSet.Aws.Core.Configuration;
@@ -61,7 +59,8 @@ internal sealed class ControllerProfileReconciler(
         var snapshot = await store.ReadExecutorInventoryAsync(Key, cancellationToken).ConfigureAwait(false);
         bool complete = cloud.IsComplete && observed.Complete && (snapshot.IsConsistent || snapshot.Revision is null) &&
             snapshot.Executors.All(executor => observed.Exact.ContainsKey(executor.Binding.AllocationId));
-        var sample = ProjectInventory(snapshot, cloud, observed.Unowned, complete);
+        var sample = RunnerCapacityProjection.Project(profile, snapshot, cloud.ObservedAt, observed.Unowned, complete,
+            cloud.LaunchHeadroom, clock.GetUtcNow(), timing);
         var coverage = new ExecutorInventoryObservation(sample.ObservedAt, complete, observed.Unowned,
             sample.BackendCapacityCeiling, sample.BackendLaunchHeadroom);
         var published = await store.PublishExecutorInventoryAsync(Key, current.Lease.Fence, snapshot.Revision, coverage, cancellationToken)
@@ -137,32 +136,6 @@ internal sealed class ControllerProfileReconciler(
             }
         }
         return oldest;
-    }
-
-    private InventorySample ProjectInventory(ExecutorInventorySnapshot snapshot, RunnerBackendInventory cloud, int unowned, bool complete)
-    {
-        var slots = ImmutableArray.CreateBuilder<RunnerSlot>();
-        var now = clock.GetUtcNow();
-        foreach (var executor in snapshot.Executors)
-        {
-            var classified = ExecutorClassifier.Classify(executor.State, now, timing.ObservationFreshness, timing.LogFlushGrace);
-            if (classified.Occupied)
-            {
-                // The sample's cut-off can precede a concurrent event update. Such a start adds no credible pending capacity.
-                var start = executor.State.StartedAt <= cloud.ObservedAt ? executor.State.StartedAt : null;
-                slots.Add(new RunnerSlot(executor.Binding.ResourceArn, classified.SlotState, OwnershipVerified: true, start)
-                {
-                    CoversIdleReserve = classified.CoversIdleReserve,
-                });
-            }
-        }
-        for (int index = 0; index < unowned; index++)
-        {
-            slots.Add(new RunnerSlot("unowned-" + index.ToString(CultureInfo.InvariantCulture), RunnerSlotState.Unknown, OwnershipVerified: false));
-        }
-        int? ceiling = complete && cloud.LaunchHeadroom is int headroom
-            ? (int)Math.Min(profile.Capacity.MaxRunners, (long)slots.Count + headroom) : null;
-        return new InventorySample(cloud.ObservedAt, complete, ceiling, complete ? cloud.LaunchHeadroom : null, slots.ToImmutable());
     }
 
     private async Task<ObservedResources> ObserveResourcesAsync(

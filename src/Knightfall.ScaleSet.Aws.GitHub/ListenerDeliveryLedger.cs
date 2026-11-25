@@ -172,6 +172,12 @@ internal sealed class ListenerDeliveryLedger(DynamoDbLifecycleStore store, Owned
             .ConfigureAwait(false);
     }
 
+    internal async Task<(int Held, long? Revision)> ReadAdmissionBalanceAsync(CancellationToken cancellationToken)
+    {
+        var balance = await ReadBalanceAsync(cancellationToken).ConfigureAwait(false);
+        return (balance?.Value.HeldCount ?? 0, balance?.Record.Revision);
+    }
+
     internal async Task<CommittedAdmission?> ReserveAsync(
         Entry<MessageReceipt> receipt, long messageId, ImmutableArray<long> offers, int allowance, WarmAdmissionCredit? warm,
         IReadOnlyDictionary<LifecycleKey, long?> readGuards, CancellationToken cancellationToken)
@@ -198,9 +204,15 @@ internal sealed class ListenerDeliveryLedger(DynamoDbLifecycleStore store, Owned
         bool hasBalanceGuard = guards.TryGetValue(balanceKey, out long? balanceRevision);
         int totalAllowance = checked(allowance + (warm?.Count ?? 0));
         var balance = totalAllowance > 0 && !offers.IsEmpty ? await ReadBalanceAsync(cancellationToken).ConfigureAwait(false) : null;
+        if (totalAllowance > 0 && hasBalanceGuard && balanceRevision != balance?.Record.Revision)
+        {
+            return null;
+        }
         int held = balance?.Value.HeldCount ?? 0;
         int normalHeadroom = Math.Max(0, allowance - held);
         int headroom = Math.Max(0, totalAllowance - held);
+        int witnessOffset = warm is null ? 0 : checked(warm.Witnesses.Count - warm.Count + Math.Max(0, held - allowance));
+        DateTimeOffset? warmValidThrough = null;
         List<LifecycleRecordWrite> writes = [];
         var chosen = ImmutableArray.CreateBuilder<long>();
         Guid attemptId = Guid.NewGuid();
@@ -218,11 +230,10 @@ internal sealed class ListenerDeliveryLedger(DynamoDbLifecycleStore store, Owned
             // A nonempty reservation also fences the applied profile catalog.
             int additionalActions = (chosen.Count == 0 ? 1 + (hasBalanceGuard ? 0 : 1) : 0) +
                 (hasJobGuard ? 0 : 1) + (hasAcquisitionGuard ? 0 : 1);
-            bool firstWarm = chosen.Count == normalHeadroom;
-            if (firstWarm)
-            {
-                additionalActions += warm!.Guards.Count(guard => !guards.ContainsKey(guard.Key));
-            }
+            int warmChosen = chosen.Count - normalHeadroom;
+            WarmAdmissionWitness[] newWitnesses = warmChosen < 0 ? [] : warm!.Witnesses.Skip(warmChosen == 0 ? 0 : witnessOffset + warmChosen)
+                .Take(warmChosen == 0 ? witnessOffset + 1 : 1).ToArray();
+            additionalActions += newWitnesses.Count(witness => !guards.ContainsKey(witness.Guard.Key));
             if (actions + additionalActions > MaximumTransactionActions)
             {
                 continue;
@@ -234,18 +245,18 @@ internal sealed class ListenerDeliveryLedger(DynamoDbLifecycleStore store, Owned
             {
                 continue;
             }
-            if ((hasBalanceGuard && balanceRevision != balance?.Record.Revision) ||
-                jobRevision is not null || (hasAcquisitionGuard && acquisitionRevision != acquisition?.Record.Revision))
+            if (jobRevision is not null || (hasAcquisitionGuard && acquisitionRevision != acquisition?.Record.Revision))
             {
                 return null;
             }
 
             actions += additionalActions;
-            if (firstWarm)
+            foreach (var witness in newWitnesses)
             {
-                foreach (var guard in warm!.Guards)
+                guards[witness.Guard.Key] = witness.Guard.ExpectedRevision;
+                if (warmValidThrough is null || witness.ValidThrough < warmValidThrough)
                 {
-                    guards[guard.Key] = guard.ExpectedRevision;
+                    warmValidThrough = witness.ValidThrough;
                 }
             }
             chosen.Add(requestId);
@@ -267,7 +278,6 @@ internal sealed class ListenerDeliveryLedger(DynamoDbLifecycleStore store, Owned
         }
         writes.Add(Replace(receipt, receipt.Value with { Admission = attempt }));
         var conditions = guards.Select(guard => new LifecycleRecordCondition(guard.Key, guard.Value)).ToArray();
-        var warmValidThrough = chosen.Count > normalHeadroom ? warm!.ValidThrough : (DateTimeOffset?)null;
         if (warmValidThrough <= clock.GetUtcNow())
         {
             return null;
@@ -464,7 +474,9 @@ internal sealed class ListenerDeliveryLedger(DynamoDbLifecycleStore store, Owned
 
     internal sealed record Entry<T>(LifecycleRecord Record, T Value);
     internal sealed record MessageReceipt(string Digest, DateTimeOffset ObservedAt, int JobOffset, AdmissionAttempt? Admission);
-    internal sealed record WarmAdmissionCredit(int Count, DateTimeOffset ValidThrough, IReadOnlyList<LifecycleRecordCondition> Guards);
+    internal sealed record WarmAdmissionCredit(int Count, IReadOnlyList<WarmAdmissionWitness> Witnesses);
+
+    internal sealed record WarmAdmissionWitness(LifecycleRecordCondition Guard, DateTimeOffset ValidThrough);
     internal sealed record CommittedAdmission(AdmissionAttempt Attempt, DateTimeOffset? WarmValidThrough);
     internal sealed record AdmissionAttempt(Guid Id, AcquisitionRequest Request, string Sha256, bool OutcomeRecorded);
     internal sealed record AcquisitionRequest(string ScopeIdentity, long ScaleSetId, Guid SessionId, long MessageId,

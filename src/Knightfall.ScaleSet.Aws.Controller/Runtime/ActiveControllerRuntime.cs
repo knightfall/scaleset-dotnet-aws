@@ -73,7 +73,7 @@ internal static class ActiveControllerRuntime
             else
             {
                 backends.Add(key, new FargateRunnerBackend(configuration, profile, key, fargateInspector!, fargateEvidence!,
-                    fargateQuota!, fargateKeys, fargateInventory, store, journal, dispatcher, clock, EffectTiming.ObservationFreshness));
+                    fargateQuota!, fargateKeys, fargateInventory, store, journal, dispatcher, clock, EffectTiming));
             }
         }
 

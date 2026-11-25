@@ -223,6 +223,105 @@ public sealed class MixedControllerIntegrationTests(ITestOutputHelper output)
         }
     }
 
+    [Theory]
+    [InlineData("planned", false)]
+    [InlineData("executing", false)]
+    [InlineData("planned", true)]
+    public async Task UnsentFargateLaunchRechecksChangedDemandBeforeSendOrAfterRestart(string heldState, bool restart)
+    {
+        using var deadline = CancellationTokenSource.CreateLinkedTokenSource(TestContext.Current.CancellationToken);
+        deadline.CancelAfter(TimeSpan.FromSeconds(restart ? 90 : 40));
+        var token = deadline.Token;
+        await using var fixture = await MixedRuntimeFixture.CreateAsync("fargate", token);
+        string firstTask = await fixture.StartControllerTaskAsync(token);
+        string deployment = ControllerLeaseRecoveryCoordinator.DeploymentKey(fixture.Configuration);
+        var profile = fixture.Configuration.Profiles[0];
+        var key = new LifecycleProfile(deployment, profile.Id);
+        var github = fixture.Profiles[profile.Id].GitHub;
+        github.TotalAssignedJobs = 1;
+        fixture.Cloud.HoldNextFargateWrite(heldState);
+        await using var predecessor = MixedControllerProcess.Start(fixture, firstTask, telemetryEndpoint: null);
+        string intent = await fixture.Cloud.HeldFargateEffect.WaitAsync(TimeSpan.FromSeconds(22), token);
+        var lease = Assert.IsType<ControllerLease>(await fixture.Store.ReadLeaseAsync(deployment, token));
+        var journal = new DynamoDbEffectJournal(fixture.Store, TimeProvider.System);
+        var initial = Assert.IsType<EffectJournalSnapshot>(await journal.ReadAsync(key, intent, token));
+        Assert.Equal(heldState == "planned" ? EffectState.Planned : EffectState.Executing, initial.Entry.State);
+
+        github.TotalAssignedJobs = 0;
+        github.Offer();
+        await WaitAsync(async () => (await fixture.Store.ReadCurrentSessionDemandAsync(key, lease.Fence, token)) is { TotalAssignedJobs: 0 },
+            "the active listener records reduced demand", token);
+        if (restart)
+        {
+            await predecessor.KillAsync(token);
+            await fixture.Cloud.StopControllerTaskAsync(fixture.ControllerCluster, firstTask, token);
+        }
+        fixture.Cloud.ReleaseFargateWrite();
+        string? successorTask = restart ? await fixture.StartControllerTaskAsync(token) : null;
+        await using var successor = successorTask is null ? null : MixedControllerProcess.Start(fixture, successorTask, telemetryEndpoint: null);
+        var controller = successor ?? predecessor;
+        await WaitAsync(async () => await controller.ReadyAsync(token) == HttpStatusCode.OK, "controller ready with reduced demand", token);
+        await WaitForFargateInventoryPassesAsync(fixture, token);
+        Assert.DoesNotContain(fixture.Cloud.Calls, call => call is { Service: "ecs", Operation: "RunTask" });
+
+        github.TotalAssignedJobs = 1;
+        github.Offer();
+        await WaitAsync(() => Task.FromResult(fixture.Cloud.Calls.Any(call => call is { Service: "ecs", Operation: "RunTask" })),
+            "launch permitted when authoritative demand returns", token);
+        await WaitForFargateInventoryPassesAsync(fixture, token);
+        var sent = Assert.Single(fixture.Cloud.Calls, call => call is { Service: "ecs", Operation: "RunTask" });
+        using var body = JsonDocument.Parse(sent.Request);
+        var launch = Assert.IsType<FargateLaunchEffectRequest>(initial.Entry.Envelope.Request);
+        string? sentToken = body.RootElement.GetProperty("clientToken").GetString();
+        if (restart)
+        {
+            Assert.NotEqual(launch.ClientToken.ToString("N"), sentToken);
+            Assert.Equal(EffectResolutionKind.CanceledBeforeSend,
+                (await journal.ReadAsync(key, intent, token))?.Entry.Resolution?.Kind);
+        }
+        else
+        {
+            Assert.Equal(launch.ClientToken.ToString("N"), sentToken);
+        }
+    }
+
+    [Fact]
+    public async Task UnsentFargateLaunchWaitsWhenAStandaloneTaskFillsTheProfile()
+    {
+        using var deadline = CancellationTokenSource.CreateLinkedTokenSource(TestContext.Current.CancellationToken);
+        deadline.CancelAfter(TimeSpan.FromSeconds(45));
+        var token = deadline.Token;
+        await using var fixture = await MixedRuntimeFixture.CreateAsync("fargate", token);
+        string controllerTask = await fixture.StartControllerTaskAsync(token);
+        var profile = fixture.Configuration.Profiles[0];
+        string deployment = ControllerLeaseRecoveryCoordinator.DeploymentKey(fixture.Configuration);
+        var key = new LifecycleProfile(deployment, profile.Id);
+        var provisioner = Assert.IsType<FargateProvisionerConfiguration>(profile.Provisioner);
+        var cluster = Assert.IsType<ImportEcsClusterConfiguration>(fixture.Configuration.EcsClusters[provisioner.Cluster]);
+        string subnet = Assert.Single(fixture.Configuration.Networks[provisioner.Network].Subnets).Id;
+        fixture.Profiles[profile.Id].GitHub.TotalAssignedJobs = 1;
+        fixture.Cloud.HoldNextFargateWrite("planned");
+        await using var controller = MixedControllerProcess.Start(fixture, controllerTask, telemetryEndpoint: null);
+        string intent = await fixture.Cloud.HeldFargateEffect.WaitAsync(TimeSpan.FromSeconds(22), token);
+        var journal = new DynamoDbEffectJournal(fixture.Store, TimeProvider.System);
+        var planned = Assert.IsType<EffectJournalSnapshot>(await journal.ReadAsync(key, intent, token));
+        string occupying = await fixture.Cloud.StartControllerTaskAsync(cluster.Arn, provisioner.TaskDefinitionArn, subnet, token);
+        fixture.Cloud.ReleaseFargateWrite();
+        await WaitAsync(async () => (await fixture.Store.ReadExecutorInventoryAsync(key, token)).Coverage?.UnownedOccupied == 1,
+            "profile observes the standalone task occupying its only slot", token);
+        Assert.DoesNotContain(fixture.Cloud.Calls, call => call is { Service: "ecs", Operation: "RunTask" });
+        Assert.Equal(EffectState.Planned, (await journal.ReadAsync(key, intent, token))?.Entry.State);
+
+        await fixture.Cloud.StopControllerTaskAsync(cluster.Arn, occupying, token);
+        await WaitAsync(() => Task.FromResult(fixture.Cloud.Calls.Any(call => call is { Service: "ecs", Operation: "RunTask" })),
+            "the original plan can launch when the physical slot clears", token);
+        await WaitForFargateInventoryPassesAsync(fixture, token);
+        var sent = Assert.Single(fixture.Cloud.Calls, call => call is { Service: "ecs", Operation: "RunTask" });
+        using var request = JsonDocument.Parse(sent.Request);
+        var launch = Assert.IsType<FargateLaunchEffectRequest>(planned.Entry.Envelope.Request);
+        Assert.Equal(launch.ClientToken.ToString("N"), request.RootElement.GetProperty("clientToken").GetString());
+    }
+
     private static Task WaitForFargateInventoryPassesAsync(MixedRuntimeFixture fixture, CancellationToken token)
     {
         int inventoryRequests = fixture.Cloud.Calls.Count(call => call is { Service: "ecs", Operation: "ListTasks" });

@@ -18,6 +18,56 @@ public sealed partial class GitHubLifecycleIntegrationTests
     private static readonly GitHubJitTiming HandoffTiming = new(WriteReserve, SendWindow, TimeSpan.FromMinutes(1), TimeSpan.FromMinutes(2));
 
     [Theory]
+    [InlineData(1, 0)]
+    [InlineData(2, 1)]
+    public async Task WarmAdmissionProbesOnlyTheDeficitAndIgnoresAnUnusedExpiringRunner(int offeredCount, int expectedProbes)
+    {
+        var token = TestContext.Current.CancellationToken;
+        await using var rig = await SessionRig.CreateAsync(token);
+        var (_, first) = await IssueConsumedWarmRunnerAsync(rig, token);
+        var (_, second) = await IssueConsumedWarmRunnerAsync(rig, token, "fedcba9876543210fedcba9876543210");
+        rig.Simulator.MarkRunnerListening(first);
+        rig.Simulator.MarkRunnerListening(second);
+        await PublishWarmInventoryAsync(rig, token, maximum: 3);
+        var freshness = TimeSpan.FromSeconds(5);
+        using var lane = await OpenWarmLaneAsync(rig, freshness, token, maximum: 3);
+        Assert.Equal(ScaleSetListenerStepStatus.Initialized, (await lane.StepAsync(token)).Step?.Status);
+
+        long[] offered = offeredCount == 1 ? [815] : [815, 816];
+        long messageId = rig.Simulator.Offer(offered);
+        var inventory = await rig.Store.ReadExecutorInventoryAsync(rig.Profile, token);
+        Assert.Equal(2, inventory.Executors.Length);
+        var selected = inventory.Executors[(int)(messageId % inventory.Executors.Length)];
+        rig.Clock.Now += TimeSpan.FromSeconds(2);
+        Assert.Equal(LifecycleWriteOutcome.Committed, await rig.Store.ObserveResourceAsync(rig.Lease.Fence, selected.Binding,
+            new ExecutorResourceObservation(ExecutorResourceState.Running, rig.Clock.Now, null, Guid.NewGuid()), token));
+        await PublishWarmInventoryAsync(rig, token, maximum: 3);
+
+        var pause = rig.Table.Wire.PauseAfterNextSuccessfulTransactionWrite(LifecycleKey.Acquisition(rig.Profile, offered[0]));
+        var step = lane.StepAsync(token);
+        try
+        {
+            await pause.Captured.WaitAsync(TimeSpan.FromSeconds(10), token);
+            Assert.Equal(offeredCount, await rig.ReadHeldAsync(token));
+            rig.Clock.Now += TimeSpan.FromSeconds(4);
+        }
+        finally
+        {
+            pause.Resume();
+        }
+        Assert.Equal(ScaleSetListenerStepStatus.MessageAcknowledged, (await step).Step?.Status);
+        var probes = rig.Simulator.Requests.Where(request => request.Method == "GET" && request.Host == GitHubProtocolHost.PublicApi &&
+            request.Path.Contains("/actions/runners/", StringComparison.Ordinal)).ToArray();
+        Assert.Equal(expectedProbes, probes.Length);
+        if (expectedProbes != 0)
+        {
+            Assert.EndsWith(FormattableString.Invariant($"/{selected.State.RunnerId}"), Assert.Single(probes).Path, StringComparison.Ordinal);
+        }
+        Assert.Single(rig.Simulator.Requests, IsAcquisition);
+        Assert.Equal(offered, rig.Simulator.AcquiredRequests);
+    }
+
+    [Theory]
     [InlineData(false)]
     [InlineData(true)]
     public async Task WarmEvidenceExpiryPreventsAcquireAndReleasesOnlyAConfirmedUnsentReservation(bool committed)
@@ -131,26 +181,26 @@ public sealed partial class GitHubLifecycleIntegrationTests
         return (executor, Assert.IsType<long>(issued.RunnerId));
     }
 
-    private static async Task<GitHubListenerLane> OpenWarmLaneAsync(SessionRig rig, TimeSpan freshness, CancellationToken token)
+    private static async Task<GitHubListenerLane> OpenWarmLaneAsync(SessionRig rig, TimeSpan freshness, CancellationToken token, int maximum = 1)
     {
         var catalog = Assert.IsType<CatalogProfile>(await rig.Store.ReadCatalogProfileAsync(rig.Profile, token));
         var connection = await rig.ConnectAsync(token);
         var binding = new GitHubScaleSetBinding(rig.Configuration.GitHub[ConnectionId].ScopeUrl, catalog.Binding.RunnerGroup,
             Assert.IsType<long>(catalog.Binding.RunnerGroupId), catalog.Binding.ScaleSet,
             Assert.IsType<long>(catalog.Binding.ScaleSetId), catalog.Binding.Labels);
-        var definition = Definition(rig.Configuration, rig.Lease, rig.Clock, binding, connection, capacity: 1) with
+        var definition = Definition(rig.Configuration, rig.Lease, rig.Clock, binding, connection, capacity: maximum) with
         {
-            ReadCapacity = cancellation => rig.Store.ReadListenerCapacityAsync(rig.Profile, maximum: 1, freshness,
+            ReadCapacity = cancellation => rig.Store.ReadListenerCapacityAsync(rig.Profile, maximum, freshness,
                 logFlushGrace: TimeSpan.FromSeconds(30), cancellation),
         };
         return new GitHubListenerSupervisor(rig.Store, rig.Clock, ListenerTiming).Register(definition);
     }
 
-    private static async Task PublishWarmInventoryAsync(SessionRig rig, CancellationToken token)
+    private static async Task PublishWarmInventoryAsync(SessionRig rig, CancellationToken token, int maximum = 1)
     {
         var inventory = await rig.Store.ReadExecutorInventoryAsync(rig.Profile, token);
         Assert.Equal(LifecycleWriteOutcome.Committed, await rig.Store.PublishExecutorInventoryAsync(rig.Profile, rig.Lease.Fence,
-            inventory.Revision, new ExecutorInventoryObservation(rig.Clock.Now, IsComplete: true, BackendCapacityCeiling: 1), token));
+            inventory.Revision, new ExecutorInventoryObservation(rig.Clock.Now, IsComplete: true, BackendCapacityCeiling: maximum), token));
     }
 
     [Fact]
