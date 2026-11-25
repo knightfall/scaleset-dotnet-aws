@@ -10,17 +10,24 @@ namespace Knightfall.ScaleSet.Aws.RunnerBootstrap.Linux;
 internal sealed class LinuxRunnerBoundary : ILinuxOneJobBoundary
 {
     private const string DropPrivileges = "/usr/bin/setpriv";
+    private const string Unshare = "/usr/bin/unshare";
+    private const string NamespaceInit = "/usr/bin/bash";
     private const string BootIdFile = "/proc/sys/kernel/random/boot_id";
     private const int MaximumProofBytes = 4096;
+    private static readonly string[] ConfigFiles =
+        [".runner", ".runner_migrated", ".credentials", ".credentials_migrated", ".credentials_rsaparams"];
 
     private readonly LinuxRunnerSettings _settings;
     private readonly string _listener;
 
-    private LinuxRunnerBoundary(LinuxRunnerSettings settings, string listener)
+    private LinuxRunnerBoundary(LinuxRunnerSettings settings, string listener, bool isolatedProcessTree)
     {
         _settings = settings;
         _listener = listener;
+        IsolatedProcessTree = isolatedProcessTree;
     }
+
+    public bool IsolatedProcessTree { get; }
 
     internal static LinuxRunnerBoundary Verify(LinuxRunnerSettings settings, string? statusQualificationSha256 = null)
     {
@@ -44,10 +51,15 @@ internal sealed class LinuxRunnerBoundary : ILinuxOneJobBoundary
         if (proof is null || proof.ProtocolVersion != 1 || proof.BootId != bootId || !Guid.TryParseExact(bootId, "D", out _) ||
             proof.RuntimeRoot != settings.RuntimeRoot || proof.UserId != settings.UserId || proof.GroupId != settings.GroupId ||
             proof.ListenerSha256 != settings.ListenerSha256 || !proof.ProcessIsolationVerified ||
-            !proof.Ipv4MetadataDenied || !proof.Ipv6MetadataDenied || !proof.DockerBoundaryVerified ||
-            (statusQualificationSha256 is not null && proof.StatusQualificationSha256 != statusQualificationSha256))
+            !proof.Ipv4MetadataDenied || !proof.Ipv6MetadataDenied || !proof.DockerBoundaryVerified)
         {
             throw Unverified();
+        }
+        bool qualified = statusQualificationSha256 is not null;
+        if (qualified && (proof.StatusQualificationSha256 != statusQualificationSha256 || !proof.JobProcessTeardownVerified ||
+            !LinuxFiles.IsTrustedFile(Unshare, ownerOnly: false) || !LinuxFiles.IsTrustedFile(NamespaceInit, ownerOnly: false)))
+        {
+            throw new RunnerTeardownQualificationException();
         }
 
         string binary = Path.Combine(settings.RuntimeRoot, "bin", "Runner.Listener");
@@ -61,7 +73,7 @@ internal sealed class LinuxRunnerBoundary : ILinuxOneJobBoundary
             throw Unverified();
         }
 
-        return new LinuxRunnerBoundary(settings, binary);
+        return new LinuxRunnerBoundary(settings, binary, qualified);
     }
 
     private static bool VerifyVolatileRoot(string root)
@@ -111,13 +123,27 @@ internal sealed class LinuxRunnerBoundary : ILinuxOneJobBoundary
     {
         var start = new ProcessStartInfo
         {
-            FileName = DropPrivileges,
+            FileName = IsolatedProcessTree ? Unshare : DropPrivileges,
             WorkingDirectory = _settings.RuntimeRoot,
             RedirectStandardInput = true,
             RedirectStandardOutput = true,
             RedirectStandardError = true,
             UseShellExecute = false,
         };
+
+        if (IsolatedProcessTree)
+        {
+            // Keep PID 1 privileged so the parent-death signal survives the listener's credential changes.
+            string[] namespaceArguments =
+            [
+                "--pid", "--fork", "--kill-child", "--mount-proc", "--", NamespaceInit,
+                "--noprofile", "--norc", "-c", "\"$@\"; exit $?", "scaleset-job-init", DropPrivileges,
+            ];
+            foreach (string argument in namespaceArguments)
+            {
+                start.ArgumentList.Add(argument);
+            }
+        }
 
         string[] arguments =
         [
@@ -145,9 +171,41 @@ internal sealed class LinuxRunnerBoundary : ILinuxOneJobBoundary
 
     public void RemoveConfigFiles()
     {
-        foreach (string name in new[] { ".runner", ".runner_migrated", ".credentials", ".credentials_migrated", ".credentials_rsaparams" })
+        if (!LinuxFiles.IsPrivateRoot(_settings.RuntimeRoot, _settings.GroupId))
         {
-            File.Delete(Path.Combine(_settings.RuntimeRoot, name));
+            throw new RunnerCleanupIncompleteException();
+        }
+
+        bool cleaned = true;
+        foreach (string name in ConfigFiles)
+        {
+            cleaned &= RemoveConfigFile(Path.Combine(_settings.RuntimeRoot, name));
+        }
+        if (!cleaned)
+        {
+            throw new RunnerCleanupIncompleteException();
+        }
+    }
+
+    private static bool RemoveConfigFile(string path)
+    {
+        try
+        {
+            File.Delete(path);
+            return true;
+        }
+        catch (Exception error) when (error is IOException or UnauthorizedAccessException)
+        {
+            try
+            {
+                // Clear an empty directory collision without traversing a job-owned tree.
+                Directory.Delete(path);
+                return true;
+            }
+            catch (Exception collision) when (collision is IOException or UnauthorizedAccessException)
+            {
+                return false;
+            }
         }
     }
 
@@ -160,4 +218,7 @@ internal sealed record LinuxRunnerSettings(
 internal sealed record LinuxRunnerBoundaryProof(
     int ProtocolVersion, string BootId, string RuntimeRoot, string ListenerSha256, uint UserId, uint GroupId,
     bool ProcessIsolationVerified, bool Ipv4MetadataDenied, bool Ipv6MetadataDenied, bool DockerBoundaryVerified,
-    string? StatusQualificationSha256 = null);
+    string? StatusQualificationSha256 = null, bool JobProcessTeardownVerified = false);
+
+internal sealed class RunnerTeardownQualificationException() :
+    IOException("The EC2 boot proof does not establish qualified job process teardown.");
