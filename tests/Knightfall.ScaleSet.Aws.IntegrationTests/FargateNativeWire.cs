@@ -134,7 +134,7 @@ internal sealed class FargateNativeWire(Uri endpoint) : DelegatingHandler(new So
         {
             case "DescribeTaskDefinition":
                 // MiniStack emits an empty string for omitted PID mode. ECS represents the default by omission.
-                if (output["taskDefinition"] is JsonObject definition && definition["pidMode"]?.GetValue<string>() == string.Empty)
+                if (output["taskDefinition"] is JsonObject definition && definition["pidMode"]?.GetValue<string>().Length == 0)
                 {
                     definition.Remove("pidMode");
                 }
