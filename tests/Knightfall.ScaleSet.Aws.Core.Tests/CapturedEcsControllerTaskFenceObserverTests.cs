@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.Net;
 using Amazon.CloudWatchLogs;
 using Amazon.CloudWatchLogs.Model;
@@ -153,11 +154,81 @@ public sealed class CapturedEcsControllerTaskFenceObserverTests
         Assert.Equal(clock.Now.ToUnixTimeMilliseconds(), logs.Requests[^1].EndTime);
     }
 
+    [Fact]
+    public async Task FiniteScanContinuesBeyondOneHundredTwentyPagesAndFiveMinutes()
+    {
+        const int continuations = 132;
+        var pages = Enumerable.Range(1, continuations).Select(page =>
+            Page(page.ToString(CultureInfo.InvariantCulture), page == 1 ? [NativeStop] : []));
+        using var logs = new LogWire([.. pages, Page(null, NativeStop)]);
+        var token = TestContext.Current.CancellationToken;
+        var clock = new FixtureClock();
+        var reader = Reader(logs, clock: clock);
+
+        for (int page = 0; page < continuations; page += 6)
+        {
+            Assert.Equal(ControllerTaskFenceStatus.Missing, (await reader.ObserveAsync(TaskArn, Acquired, token)).Status);
+            Assert.Equal(page + 6, logs.Requests.Count);
+            clock.Now = clock.Now.AddSeconds(20);
+        }
+
+        Assert.True(clock.Now - Now > TimeSpan.FromMinutes(5));
+        var stopped = new ControllerTaskFenceObservation(ControllerTaskFenceStatus.Stopped, Capture.QualifiedUntil);
+        Assert.Equal(stopped, await reader.ObserveAsync(TaskArn, Acquired, token));
+        Assert.Equal(continuations + 1, logs.Requests.Count);
+        Assert.Null(logs.Requests[0].NextToken);
+        Assert.Equal(Enumerable.Range(1, continuations).Select(page => page.ToString(CultureInfo.InvariantCulture)),
+            logs.Requests.Skip(1).Select(request => request.NextToken));
+        Assert.All(logs.Requests, request => Assert.Equal(Now.ToUnixTimeMilliseconds(), request.EndTime));
+    }
+
+    [Fact]
+    public async Task NonAdjacentCursorCycleDiscardsWitnessWithoutCompletingTheFence()
+    {
+        using var logs = new LogWire(Page("a", NativeStop), Page("b"), Page("c"), Page("d"), Page("e"), Page("f"),
+            Page("g"), Page("h"), Page("i"), Page("j"), Page("g"), Page(null));
+        var token = TestContext.Current.CancellationToken;
+        var clock = new FixtureClock();
+        var reader = Reader(logs, clock: clock);
+
+        Assert.Equal(ControllerTaskFenceStatus.Missing, (await reader.ObserveAsync(TaskArn, Acquired, token)).Status);
+        Assert.Equal(6, logs.Requests.Count);
+        clock.Now = Now.AddSeconds(5);
+        Assert.Equal(ControllerTaskFenceStatus.Missing, (await reader.ObserveAsync(TaskArn, Acquired, token)).Status);
+        Assert.Equal(["f", "g", "h", "i", "j"], logs.Requests.Skip(6).Select(request => request.NextToken));
+
+        Assert.Equal(ControllerTaskFenceStatus.Missing, (await reader.ObserveAsync(TaskArn, Acquired, token)).Status);
+        Assert.Null(logs.Requests[^1].NextToken);
+        Assert.Equal(clock.Now.ToUnixTimeMilliseconds(), logs.Requests[^1].EndTime);
+    }
+
+    [Fact]
+    public async Task CompletedReuseExpiresAfterFiveMinutesWithoutAValidatedRead()
+    {
+        using var logs = new LogWire(Page("a"), Page("b"), Page("c"), Page("d"), Page("e"), Page("f"),
+            Page(null, NativeStop), Page(null, NativeStop), Page(null, NativeStop), Page(null));
+        var token = TestContext.Current.CancellationToken;
+        var clock = new FixtureClock();
+        var reader = Reader(logs, clock: clock);
+
+        Assert.Equal(ControllerTaskFenceStatus.Missing, (await reader.ObserveAsync(TaskArn, Acquired, token)).Status);
+        Assert.Equal(ControllerTaskFenceStatus.Stopped, (await reader.ObserveAsync(TaskArn, Acquired, token)).Status);
+        clock.Now = Now.AddMinutes(4);
+        Assert.Equal(ControllerTaskFenceStatus.Stopped, (await reader.ObserveAsync(TaskArn, Acquired, token)).Status);
+        clock.Now = Now.AddMinutes(8);
+        Assert.Equal(ControllerTaskFenceStatus.Stopped, (await reader.ObserveAsync(TaskArn, Acquired, token)).Status);
+        Assert.Equal(["f", "f", "f"], logs.Requests.Skip(6).Select(request => request.NextToken));
+
+        clock.Now = Now.AddMinutes(13);
+        Assert.Equal(ControllerTaskFenceStatus.Missing, (await reader.ObserveAsync(TaskArn, Acquired, token)).Status);
+        Assert.Null(logs.Requests[^1].NextToken);
+        Assert.Equal(clock.Now.ToUnixTimeMilliseconds(), logs.Requests[^1].EndTime);
+    }
+
     [Theory]
     [InlineData("conflict")]
     [InlineData("repeated token")]
     [InlineData("invalid token")]
-    [InlineData("scan expiry")]
     [InlineData("qualification expiry")]
     public async Task UnsafeContinuationOrExpiredWindowDiscardsEarlierEvidence(string interruption)
     {
@@ -166,7 +237,7 @@ public sealed class CapturedEcsControllerTaskFenceObserverTests
         FilterLogEventsResponse[] remaining = interruption switch
         {
             "conflict" => [Page(null, conflicting), Page(null)],
-            "repeated token" => [Page("a"), Page(null)],
+            "repeated token" => [Page("f"), Page(null)],
             _ => [Page(null)],
         };
         using var logs = new LogWire([.. pending, .. remaining]);
@@ -176,12 +247,7 @@ public sealed class CapturedEcsControllerTaskFenceObserverTests
 
         Assert.Equal(ControllerTaskFenceStatus.Missing, (await reader.ObserveAsync(TaskArn, Acquired, token)).Status);
         Assert.Equal(6, logs.Requests.Count);
-        clock.Now = interruption switch
-        {
-            "scan expiry" => Now.AddMinutes(5),
-            "qualification expiry" => Capture.QualifiedUntil,
-            _ => Now.AddSeconds(5),
-        };
+        clock.Now = interruption == "qualification expiry" ? Capture.QualifiedUntil : Now.AddSeconds(5);
         if (interruption == "invalid token")
         {
             logs.BeforeResponse = (request, _) =>
@@ -207,6 +273,67 @@ public sealed class CapturedEcsControllerTaskFenceObserverTests
         }
         Assert.Null(logs.Requests[^1].NextToken);
         Assert.Equal(clock.Now.ToUnixTimeMilliseconds(), logs.Requests[^1].EndTime);
+    }
+
+    [Fact]
+    public async Task ClockRollbackAfterProgressStartsAWholeScan()
+    {
+        using var logs = new LogWire(Page("a", NativeStop), Page("b"), Page("c"), Page("d"), Page("e"), Page("f"),
+            Page("g"), Page("h"), Page("i"), Page("j"), Page("k"), Page("l"), Page(null));
+        var token = TestContext.Current.CancellationToken;
+        var clock = new FixtureClock();
+        var reader = Reader(logs, clock: clock);
+        Assert.Equal(ControllerTaskFenceStatus.Missing, (await reader.ObserveAsync(TaskArn, Acquired, token)).Status);
+        clock.Now = Now.AddSeconds(5);
+        Assert.Equal(ControllerTaskFenceStatus.Missing, (await reader.ObserveAsync(TaskArn, Acquired, token)).Status);
+        Assert.Equal("f", logs.Requests[6].NextToken);
+        Assert.Equal(Now.ToUnixTimeMilliseconds(), logs.Requests[6].EndTime);
+
+        clock.Now = Now.AddSeconds(4);
+        Assert.Equal(ControllerTaskFenceStatus.Missing, (await reader.ObserveAsync(TaskArn, Acquired, token)).Status);
+        Assert.Null(logs.Requests[^1].NextToken);
+        Assert.Equal(clock.Now.ToUnixTimeMilliseconds(), logs.Requests[^1].EndTime);
+    }
+
+    [Fact]
+    public async Task DirectEcsChangeDiscardsTheExactPredecessorsProgress()
+    {
+        using var logs = new LogWire(Page("a", NativeStop), Page("b"), Page("c"), Page("d"), Page("e"), Page("f"), Page(null));
+        var token = TestContext.Current.CancellationToken;
+        var direct = new ExactObserver(ControllerTaskFenceStatus.Missing);
+        var reader = Reader(logs, current: direct);
+        Assert.Equal(ControllerTaskFenceStatus.Missing, (await reader.ObserveAsync(TaskArn, Acquired, token)).Status);
+
+        direct.Status = ControllerTaskFenceStatus.Running;
+        Assert.Equal(ControllerTaskFenceStatus.Running, (await reader.ObserveAsync(TaskArn, Acquired, token)).Status);
+        Assert.Equal(6, logs.Requests.Count);
+
+        direct.Status = ControllerTaskFenceStatus.Missing;
+        Assert.Equal(ControllerTaskFenceStatus.Missing, (await reader.ObserveAsync(TaskArn, Acquired, token)).Status);
+        Assert.Null(logs.Requests[^1].NextToken);
+    }
+
+    [Fact]
+    public async Task TransientServiceFailureCanResumeItsLastValidatedCursor()
+    {
+        using var logs = new LogWire(Page("a", NativeStop), Page(null));
+        var token = TestContext.Current.CancellationToken;
+        var clock = new FixtureClock();
+        logs.BeforeResponse = (request, _) =>
+        {
+            if (request.NextToken == "a")
+            {
+                throw new ServiceUnavailableException("Fixture times out upstream.") { StatusCode = HttpStatusCode.ServiceUnavailable };
+            }
+        };
+        var reader = Reader(logs, clock: clock);
+        Assert.Equal(ControllerTaskFenceStatus.Missing, (await reader.ObserveAsync(TaskArn, Acquired, token)).Status);
+
+        logs.BeforeResponse = null;
+        clock.Now = Now.AddSeconds(5);
+        Assert.Equal(ControllerTaskFenceStatus.Stopped, (await reader.ObserveAsync(TaskArn, Acquired, token)).Status);
+        Assert.Equal(new[] { null, "a", "a" }, logs.Requests.Select(request => request.NextToken));
+        Assert.All(logs.Requests, request => Assert.Equal(Now.ToUnixTimeMilliseconds(), request.EndTime));
     }
 
     [Fact]
@@ -276,8 +403,8 @@ public sealed class CapturedEcsControllerTaskFenceObserverTests
     }
 
     private static CapturedEcsControllerTaskFenceObserver Reader(LogWire logs, ControllerTaskFenceStatus state = ControllerTaskFenceStatus.Missing,
-        ControllerPredecessorCapture? capture = null, FixtureClock? clock = null) =>
-        new(new ExactObserver(state), logs, new AwsEnvironment("123456789012", "us-east-1"), Cluster, capture ?? Capture, clock ?? new FixtureClock());
+        ControllerPredecessorCapture? capture = null, FixtureClock? clock = null, ExactObserver? current = null) =>
+        new(current ?? new ExactObserver(state), logs, new AwsEnvironment("123456789012", "us-east-1"), Cluster, capture ?? Capture, clock ?? new FixtureClock());
 
     private static FilterLogEventsResponse Page(string? token, params string[] messages) => new()
     {
@@ -288,7 +415,9 @@ public sealed class CapturedEcsControllerTaskFenceObserverTests
 
     private sealed class ExactObserver(ControllerTaskFenceStatus status) : IControllerTaskFenceObserver
     {
-        public Task<ControllerTaskFenceStatus> ReadAsync(string taskArn, CancellationToken cancellationToken) => Task.FromResult(status);
+        internal ControllerTaskFenceStatus Status { get; set; } = status;
+
+        public Task<ControllerTaskFenceStatus> ReadAsync(string taskArn, CancellationToken cancellationToken) => Task.FromResult(Status);
     }
 
     private sealed class FixtureClock : TimeProvider

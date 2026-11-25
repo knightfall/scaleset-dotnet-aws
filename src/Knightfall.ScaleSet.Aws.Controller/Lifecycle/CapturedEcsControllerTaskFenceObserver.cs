@@ -19,13 +19,12 @@ internal sealed partial class CapturedEcsControllerTaskFenceObserver(
     string clusterArn, ControllerPredecessorCapture capture, TimeProvider clock, ILogger? logger = null) : IControllerTaskFenceObserver
 {
     private const int MaximumPagesPerLookup = 6;
-    private const int MaximumPagesPerScan = 120;
     /// <summary>Recovery can require both the previous owner and an earlier unresolved predecessor.</summary>
     private const int MaximumScans = 2;
     private const int PageSize = 8;
     private const int MaximumEventLength = 64 * 1024;
     private static readonly TimeSpan LookupBudget = TimeSpan.FromSeconds(2);
-    private static readonly TimeSpan ScanLifetime = TimeSpan.FromMinutes(5);
+    private static readonly TimeSpan CompletedScanReuse = TimeSpan.FromMinutes(5);
     private static readonly JsonDocumentOptions EventOptions = new() { AllowDuplicateProperties = false, MaxDepth = 32 };
     private readonly Dictionary<string, CaptureScan> _scans = new(StringComparer.Ordinal);
     private int _observing;
@@ -75,12 +74,16 @@ internal sealed partial class CapturedEcsControllerTaskFenceObserver(
             var evidence = await ReadExactTerminalEventAsync(taskArn, scan, linked.Token).ConfigureAwait(false);
             cancellationToken.ThrowIfCancellationRequested();
             var verifiedAt = clock.GetUtcNow();
-            if (!scan.IsCurrent(verifiedAt) || verifiedAt >= capture.QualifiedUntil)
+            if (!scan.TryObserveClock(verifiedAt) || verifiedAt >= capture.QualifiedUntil)
             {
                 _scans.Remove(taskArn);
             }
             else if (evidence is { } eventId && !linked.IsCancellationRequested)
             {
+                if (scan.LastCompletedReadAt.HasValue)
+                {
+                    scan.LastCompletedReadAt = verifiedAt;
+                }
                 ReportCapture(eventId);
                 return new ControllerTaskFenceObservation(ControllerTaskFenceStatus.Stopped, capture.QualifiedUntil);
             }
@@ -89,9 +92,11 @@ internal sealed partial class CapturedEcsControllerTaskFenceObserver(
         catch (Exception error) when (error is AmazonClientException or AmazonServiceException or HttpRequestException or
                                       IOException or SocketException or JsonException or TimeoutException or OperationCanceledException)
         {
-            // A canceled lookup can resume after its last validated page. An AWS rejection, including
-            // an invalid continuation, discards the entire scan before another lookup can authorize it.
-            if (error is not OperationCanceledException || !linked.IsCancellationRequested || scan.NextToken is null)
+            // Retain validated progress across a transient read failure. Invalid continuations and
+            // other definitive rejections invalidate the held scan before it can supply evidence.
+            var failedAt = clock.GetUtcNow();
+            if (scan.NextToken is null || !IsTransientReadFailure(error, linked.Token) ||
+                !scan.TryObserveClock(failedAt) || failedAt >= capture.QualifiedUntil)
             {
                 _scans.Remove(taskArn);
             }
@@ -102,7 +107,7 @@ internal sealed partial class CapturedEcsControllerTaskFenceObserver(
 
     private CaptureScan ReadOrStartScan(string taskArn, DateTimeOffset acquired, DateTimeOffset now)
     {
-        if (_scans.TryGetValue(taskArn, out var scan) && scan.Acquired == acquired && scan.IsCurrent(now))
+        if (_scans.TryGetValue(taskArn, out var scan) && scan.Acquired == acquired && scan.TryObserveClock(now))
         {
             return scan;
         }
@@ -120,7 +125,7 @@ internal sealed partial class CapturedEcsControllerTaskFenceObserver(
 
     private async Task<Guid?> ReadExactTerminalEventAsync(string taskArn, CaptureScan scan, CancellationToken cancellationToken)
     {
-        if (scan.Complete && scan.Witness is { } witness)
+        if (scan.LastCompletedReadAt.HasValue && scan.Witness is { } witness)
         {
             return await RecheckCompleteScanAsync(taskArn, scan, witness, cancellationToken).ConfigureAwait(false)
                 ? witness.Evidence.Id : DiscardScan(taskArn);
@@ -141,18 +146,20 @@ internal sealed partial class CapturedEcsControllerTaskFenceObserver(
             if (read.NextToken is not { } token)
             {
                 var id = scan.Witness?.Evidence.Id;
-                if (!resumed || id is null)
+                if (resumed && id.HasValue)
+                {
+                    scan.LastCompletedReadAt = clock.GetUtcNow();
+                }
+                else
                 {
                     _scans.Remove(taskArn);
                 }
-                scan.Complete = true;
                 return id;
             }
-            if (scan.Visited.Count >= MaximumPagesPerScan - 1 || !scan.Visited.Add(token))
+            if (!scan.TryAdvance(token))
             {
                 return DiscardScan(taskArn);
             }
-            scan.NextToken = token;
         }
 
         return null;
@@ -220,6 +227,16 @@ internal sealed partial class CapturedEcsControllerTaskFenceObserver(
         _scans.Remove(taskArn);
         return null;
     }
+
+    private static bool IsTransientReadFailure(Exception error, CancellationToken cancellationToken) => error switch
+    {
+        OperationCanceledException => cancellationToken.IsCancellationRequested,
+        IOException or SocketException or TimeoutException => true,
+        HttpRequestException failure => failure.StatusCode is null or HttpStatusCode.RequestTimeout or HttpStatusCode.TooManyRequests or >= HttpStatusCode.InternalServerError,
+        AmazonServiceException failure => failure.StatusCode is HttpStatusCode.RequestTimeout or HttpStatusCode.TooManyRequests or >= HttpStatusCode.InternalServerError ||
+            failure.ErrorCode is "Throttling" or "ThrottlingException",
+        _ => false,
+    };
 
     private Guid? ParseTerminalEvent(string message, string taskArn, DateTimeOffset acquired, DateTimeOffset start, DateTimeOffset now)
     {
@@ -290,14 +307,45 @@ internal sealed partial class CapturedEcsControllerTaskFenceObserver(
 
     private sealed class CaptureScan(DateTimeOffset acquired, DateTimeOffset start, DateTimeOffset end)
     {
+        private DateTimeOffset _lastObservedAt = end;
+        private string? _cycleAnchor;
+        private ulong _cycleSpan = 1;
+        private ulong _sinceAnchor;
+
         public DateTimeOffset Acquired { get; } = acquired;
         public DateTimeOffset Start { get; } = start;
         public DateTimeOffset End { get; } = end;
-        public HashSet<string> Visited { get; } = new(StringComparer.Ordinal);
-        public string? NextToken { get; set; }
+        public string? NextToken { get; private set; }
         public CaptureWitness? Witness { get; set; }
-        public bool Complete { get; set; }
+        public DateTimeOffset? LastCompletedReadAt { get; set; }
 
-        public bool IsCurrent(DateTimeOffset now) => now >= End && now - End < ScanLifetime;
+        public bool TryObserveClock(DateTimeOffset now)
+        {
+            if (now < _lastObservedAt || (LastCompletedReadAt is { } completed && (now < completed || now - completed >= CompletedScanReuse)))
+            {
+                return false;
+            }
+            _lastObservedAt = now;
+            return true;
+        }
+
+        public bool TryAdvance(string token)
+        {
+            // Brent's cycle detector compares a fixed cursor with the following exponentially
+            // longer span. A stable cursor cycle is detected without retaining the full history.
+            if (_sinceAnchor == _cycleSpan)
+            {
+                _cycleAnchor = NextToken;
+                _cycleSpan = _cycleSpan <= ulong.MaxValue / 2 ? _cycleSpan * 2 : ulong.MaxValue;
+                _sinceAnchor = 0;
+            }
+            if (token == NextToken || token == _cycleAnchor)
+            {
+                return false;
+            }
+            _sinceAnchor++;
+            NextToken = token;
+            return true;
+        }
     }
 }
