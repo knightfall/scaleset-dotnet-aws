@@ -40,8 +40,17 @@ public sealed class RuntimeArtifact
     }
 }
 
-internal sealed record VersionedS3Artifact(string Bucket, string Key, string VersionId)
+internal sealed record VersionedS3Artifact(string Bucket, string Key, string VersionId, string? ExpectedBucketOwner = null)
 {
+    internal static VersionedS3Artifact FromSnapshot(S3SnapshotDemandConfiguration snapshot, string account)
+    {
+        // The shared runtime schema admits only literal snapshot addresses. Use the same key as IAM.
+        const string scheme = "s3://";
+        int delimiter = snapshot.S3Uri.IndexOf('/', scheme.Length);
+        return new VersionedS3Artifact(snapshot.S3Uri[scheme.Length..delimiter], snapshot.S3Uri[(delimiter + 1)..],
+            snapshot.VersionId, account);
+    }
+
     internal static VersionedS3Artifact Parse(string uri, string versionId)
     {
         ArgumentNullException.ThrowIfNull(uri);

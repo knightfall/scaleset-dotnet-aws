@@ -154,8 +154,13 @@ public sealed class DryRunCommandTests
         Assert.DoesNotContain("missing.json", result.Error, StringComparison.Ordinal);
     }
 
-    [Fact]
-    public async Task ReadsVersionPinnedS3DemandUsingTheVerifiedRuntimeRegion()
+    [Theory]
+    [InlineData("111122223333", RuntimeArtifactTests.Version, true, null)]
+    [InlineData("444455556666", RuntimeArtifactTests.Version, true, "The requested runtime or read-only evidence could not be loaded.")]
+    [InlineData("111122223333", "different-version", true, "The requested runtime or read-only evidence could not be loaded.")]
+    [InlineData("111122223333", RuntimeArtifactTests.Version, false, "The demand snapshot SHA-256 does not match the configured digest.")]
+    public async Task ReadsOnlyTheLiteralSnapshotWithTheVerifiedOwnerVersionAndDigest(
+        string bucketOwner, string returnedVersion, bool matchesDigest, string? expectedError)
     {
         using var files = new TemporaryDirectory();
         byte[] evidence = """
@@ -175,16 +180,18 @@ public sealed class DryRunCommandTests
               }]
             }
             """u8.ToArray();
+        const string key = "profile-blue/v1/Runner_demand.json";
         var config = ConfigurationFixtures.EditRuntime(ConfigurationFixtures.Ec2Pinned,
+            ConfigurationEdit.Set("/spec/dryRun/inspectAws", true),
             ConfigurationEdit.Set("/spec/dryRun/demand", new
             {
                 type = "snapshot",
-                s3Uri = RuntimeArtifactTests.S3Uri,
+                s3Uri = $"s3://snapshot-fixture/{key}",
                 versionId = RuntimeArtifactTests.Version,
-                sha256 = ConfigurationFixtures.Sha256(evidence),
+                sha256 = matchesDigest ? ConfigurationFixtures.Sha256(evidence) : new string('0', 64),
             }));
         var path = files.Write("runtime.json", config);
-        using var wire = new VersionedS3Wire(evidence, RuntimeArtifactTests.Version);
+        using var wire = new VersionedS3Wire(evidence, returnedVersion, bucketOwner);
         var clock = new FixedTimeProvider(new DateTimeOffset(2026, 1, 1, 0, 3, 0, TimeSpan.Zero));
         await using var stdout = new StringWriter(CultureInfo.InvariantCulture);
         await using var stderr = new StringWriter(CultureInfo.InvariantCulture);
@@ -195,15 +202,27 @@ public sealed class DryRunCommandTests
             {
                 Assert.Equal("ap-southeast-2", region);
                 return wire.CreateClient();
-            }, _ => null, inspectInventory: null, clock, TestContext.Current.CancellationToken);
+            }, _ => null, (_, _) => throw new InvalidOperationException("Snapshot must bypass inventory."),
+            clock, TestContext.Current.CancellationToken);
+
+        var request = Assert.Single(wire.Requests);
+        Assert.Equal(HttpMethod.Get, request.Method);
+        Assert.Equal($"/snapshot-fixture/{key}", request.Uri.AbsolutePath);
+        Assert.Equal("111122223333", request.ExpectedBucketOwner);
+        Assert.Equal(RuntimeArtifactTests.Version, HttpUtility.ParseQueryString(request.Uri.Query)["versionId"]);
+        if (expectedError is not null)
+        {
+            Assert.Equal(1, exit);
+            Assert.Empty(stdout.ToString());
+            Assert.Equal(expectedError, stderr.ToString().TrimEnd());
+            return;
+        }
 
         Assert.True(exit == 0, stderr.ToString());
         Assert.Empty(stderr.ToString());
-        var request = Assert.Single(wire.Requests);
-        Assert.Equal(HttpMethod.Get, request.Method);
-        Assert.Equal(RuntimeArtifactTests.Version, HttpUtility.ParseQueryString(request.Uri.Query)["versionId"]);
         using var report = JsonDocument.Parse(stdout.ToString());
         Assert.Equal("snapshot", report.RootElement.GetProperty("demandSource").GetString());
+        Assert.False(report.RootElement.GetProperty("inspection").GetProperty("performed").GetBoolean());
         var profile = Assert.Single(report.RootElement.GetProperty("profiles").EnumerateArray());
         Assert.Equal(1, profile.GetProperty("capacity").GetProperty("totalAssignedJobs").GetInt32());
     }

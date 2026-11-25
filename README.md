@@ -71,8 +71,9 @@ npm --prefix cdk run config:emit -- ../testdata/config/ec2-only-latest.yaml /tmp
 ```
 
 The compiler prints the SHA-256 of the exact UTF-8 file it writes. It applies
-`dry-run` mode and no demand source by default. This example configures a demand
-snapshot and requests AWS inspection when reconciled. Specify pinned GitHub
+`dry-run` mode and no demand source by default. This example configures a local
+demand snapshot. AWS inventory inspection requires `dryRun.inspectAws: true`
+and `dryRun.demand.type: none`. Specify pinned GitHub
 scale-set IDs and EC2 launch-template versions as quoted positive decimal
 strings to preserve their precision.
 
@@ -91,6 +92,16 @@ dotnet run --project src/Knightfall.ScaleSet.Aws.Controller -- reconcile --confi
 For local snapshots or replays, set the demand path relative to the runtime
 JSON file or use an absolute path. The [replay fixture](testdata/dryrun/replay.json)
 shows the observation format, including the deployment and GitHub profile
-bindings. Replay evaluates observations in chronological order. The offline
-command reports whether AWS inspection was requested and requires local
-evidence files.
+bindings. Replay evaluates observations in chronological order. The report
+includes whether AWS inspection was requested and performed.
+
+For an S3 demand snapshot, supply its `s3Uri`, `versionId`, and `sha256`.
+Use a versioned general-purpose bucket owned by the AWS account configured in
+`spec.aws.account`.
+The URI key is literal and uses up to 1,024 ASCII letters, digits, periods,
+underscores, hyphens, and slash separators. Use nonempty path segments and avoid
+`.` or `..` segments. Copy the S3 version ID exactly, including characters such
+as `+`, `/`, and `=`. The controller checks the owner, version, and SHA-256
+before using the snapshot. If an existing address falls outside this contract,
+copy the snapshot to a supported bucket and key, then update the configured
+address, version, and digest.

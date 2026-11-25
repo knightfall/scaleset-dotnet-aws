@@ -323,7 +323,7 @@ function verifyTemplate(
   const { spec } = compiled.runtime;
   const active = spec.mode === "active";
   const selected =
-    active || spec.dryRun.inspectAws
+    active || (spec.dryRun.inspectAws && spec.dryRun.demand.type === "none")
       ? spec.profiles.filter((profile) => profile.state !== "disabled")
       : [];
   const ec2 = ec2Profiles(selected);
@@ -644,11 +644,10 @@ function verifyTaskRole(
   queueArns: unknown[],
 ) {
   const active = spec.mode === "active";
-  const inspect = spec.dryRun.inspectAws;
   const expected = new Set(["s3:GetObjectVersion"]);
   const add = (...actions: string[]) =>
     actions.forEach((action) => expected.add(action));
-  if (active || inspect) add("dynamodb:GetItem", "dynamodb:Query");
+  if (active) add("dynamodb:GetItem", "dynamodb:Query");
   if (ec2.length > 0)
     add(
       "ec2:DescribeInstances",
@@ -743,16 +742,8 @@ function verifyTaskRole(
   );
   const table = tableArn(template, spec);
   const due = { "Fn::Join": ["", [table, "/index/due"]] };
-  verifyGrants(
-    statements,
-    "dynamodb:GetItem",
-    active || inspect ? scope([table]) : [],
-  );
-  verifyGrants(
-    statements,
-    "dynamodb:Query",
-    active || inspect ? scope([table, due]) : [],
-  );
+  verifyGrants(statements, "dynamodb:GetItem", active ? scope([table]) : []);
+  verifyGrants(statements, "dynamodb:Query", active ? scope([table, due]) : []);
   for (const action of expected) {
     if (
       action.startsWith("ec2:Describe") ||

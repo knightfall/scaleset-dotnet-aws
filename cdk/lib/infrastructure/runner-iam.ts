@@ -30,28 +30,20 @@ export function fargateProfiles(profiles: readonly RunnerProfile[]) {
   );
 }
 
-export function grantTableAccess(
-  role: iam.Role,
-  table: ITable,
-  active: boolean,
-  inspect: boolean,
-) {
-  if (!active && !inspect) return;
+export function grantTableAccess(role: iam.Role, table: ITable) {
   allow(role, ["dynamodb:GetItem", "dynamodb:Query"], [table.tableArn]);
   allow(role, ["dynamodb:Query"], [`${table.tableArn}/index/due`]);
-  if (active) {
-    allow(
-      role,
-      [
-        "dynamodb:ConditionCheckItem",
-        "dynamodb:PutItem",
-        "dynamodb:UpdateItem",
-        "dynamodb:DeleteItem",
-      ],
-      [table.tableArn],
-      { StringEquals: { "dynamodb:EnclosingOperation": "TransactWriteItems" } },
-    );
-  }
+  allow(
+    role,
+    [
+      "dynamodb:ConditionCheckItem",
+      "dynamodb:PutItem",
+      "dynamodb:UpdateItem",
+      "dynamodb:DeleteItem",
+    ],
+    [table.tableArn],
+    { StringEquals: { "dynamodb:EnclosingOperation": "TransactWriteItems" } },
+  );
 }
 
 export function grantHostFence(role: iam.Role, cluster: RunnerCluster) {

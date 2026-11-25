@@ -82,7 +82,8 @@ export class ControllerInfrastructure extends Stack {
     const telemetry = resolveControllerTelemetry(props.telemetry, spec.aws);
 
     const active = spec.mode === "active";
-    const inspect = !active && spec.dryRun.inspectAws;
+    const inspect =
+      !active && spec.dryRun.inspectAws && spec.dryRun.demand.type === "none";
     const enabled = spec.profiles
       .filter(({ state }) => state !== "disabled")
       .toSorted((a, b) => (a.id < b.id ? -1 : Number(a.id > b.id)));
@@ -145,10 +146,11 @@ export class ControllerInfrastructure extends Stack {
         }),
       );
     }
-    if (!active) {
+    if (active) {
+      grantTableAccess(this.controllerRole, this.trackingTable);
+    } else {
       this.grantSnapshot(runtime);
     }
-    grantTableAccess(this.controllerRole, this.trackingTable, active, inspect);
     grantEc2(this.controllerRole, runtime, ec2, active);
     grantFargate(this.controllerRole, runtime, fargate, clusters, active);
     const runnerPolicyDependencies = supportsHelloIngress
@@ -339,6 +341,7 @@ export class ControllerInfrastructure extends Stack {
   private grantSnapshot(runtime: RunnerControllerRuntime) {
     const demand = runtime.spec.dryRun.demand;
     if (demand.type !== "snapshot" || !("s3Uri" in demand)) return;
+    // The shared runtime schema admits only literal snapshot addresses. IAM and the SDK use the same key.
     const path = demand.s3Uri.slice("s3://".length);
     this.controllerRole.addToPolicy(
       new iam.PolicyStatement({
@@ -351,7 +354,12 @@ export class ControllerInfrastructure extends Stack {
             resource: path,
           }),
         ],
-        conditions: { StringEquals: { "s3:VersionId": demand.versionId } },
+        conditions: {
+          StringEquals: {
+            "s3:VersionId": demand.versionId,
+            "s3:ResourceAccount": runtime.spec.aws.account,
+          },
+        },
       }),
     );
   }

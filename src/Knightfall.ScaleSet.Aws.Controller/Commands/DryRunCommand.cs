@@ -110,7 +110,7 @@ public static class DryRunCommand
     {
         if (configuration.DryRun.Demand is S3SnapshotDemandConfiguration remote)
         {
-            var artifact = VersionedS3Artifact.Parse(remote.S3Uri, remote.VersionId);
+            var artifact = VersionedS3Artifact.FromSnapshot(remote, configuration.Aws.Account);
             return await RuntimeArtifactLoader.ReadS3Async(artifact, configuration.Aws.Region, createS3Client, cancellationToken);
         }
 

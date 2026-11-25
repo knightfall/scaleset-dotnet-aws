@@ -278,7 +278,19 @@ test("Fargate preflight is available in inspection mode and refuses unrelated pr
         : profile,
     ),
   });
-  for (const config of [offline, disabled, fixture("ec2-only-pinned")]) {
+  const snapshot = rewrite(inspection, {
+    ...inspection.runtime.spec,
+    dryRun: {
+      demand: { type: "snapshot", path: "demand.json" },
+      inspectAws: true,
+    },
+  });
+  for (const config of [
+    offline,
+    snapshot,
+    disabled,
+    fixture("ec2-only-pinned"),
+  ]) {
     assert.throws(
       () => synthesize(config, evidence),
       /SCALESET_FARGATE_PREFLIGHT is invalid/u,
@@ -969,7 +981,7 @@ test("only an active qualified EC2 role receives the supervisor STATUS policy", 
   );
 });
 
-test("dry run uses neither lifecycle mutations nor event consumers", () => {
+test("S3 snapshot dry run grants only the nominated object, version, and account in addition to runtime input", () => {
   const config = fixture("mixed-ec2-fargate");
   for (const inspectAws of [false, true]) {
     const template = synthesize(
@@ -979,8 +991,8 @@ test("dry run uses neither lifecycle mutations nor event consumers", () => {
         dryRun: {
           demand: {
             type: "snapshot",
-            s3Uri: "s3://snapshot-fixture/engineer/data.json",
-            versionId: "fixture-version",
+            s3Uri: "s3://snapshot-fixture/profile-blue/v1/Runner_demand.json",
+            versionId: "specific+version/=",
             sha256: "a".repeat(64),
           },
           inspectAws,
@@ -1002,39 +1014,74 @@ test("dry run uses neither lifecycle mutations nor event consumers", () => {
     assert.equal(command[0], "run");
     assert.ok(!command.includes("--ec2-event-queue-url"));
     assert.ok(!command.includes("--ecs-event-queue-url"));
-    for (const action of [
-      "secretsmanager:GetSecretValue",
-      "iam:PassRole",
-      "ec2:RunInstances",
-      "ec2:TerminateInstances",
-      "ec2:CreateTags",
-      "ecs:RunTask",
-      "ecs:StopTask",
-      "ecs:TagResource",
-      "sqs:ReceiveMessage",
-      "sqs:DeleteMessage",
-      "dynamodb:ConditionCheckItem",
-      "dynamodb:PutItem",
-      "dynamodb:UpdateItem",
-      "dynamodb:DeleteItem",
-    ]) {
-      assert.ok(!names.has(action), action);
-    }
-    assert.equal(names.has("ec2:DescribeInstances"), inspectAws);
-    assert.equal(names.has("ecs:DescribeTaskDefinition"), inspectAws);
-    assert.equal(names.has("dynamodb:GetItem"), inspectAws);
-    const reads = rolePolicy(template).filter(
-      ({ Action }) => Action === "s3:GetObjectVersion",
-    );
+    assert.deepEqual([...names], ["s3:GetObjectVersion"]);
+    const reads = rolePolicy(template);
     assert.equal(reads.length, 2);
-    assert.ok(
-      reads.some(
-        (statement) =>
-          JSON.stringify(statement).includes(
-            "snapshot-fixture/engineer/data.json",
-          ) && statement.Condition?.StringEquals !== undefined,
+    assert.deepEqual(
+      reads.find((statement) =>
+        JSON.stringify(statement.Resource).includes("snapshot-fixture"),
       ),
+      {
+        Action: "s3:GetObjectVersion",
+        Condition: {
+          StringEquals: {
+            "s3:VersionId": "specific+version/=",
+            "s3:ResourceAccount": config.runtime.spec.aws.account,
+          },
+        },
+        Effect: "Allow",
+        Resource: {
+          "Fn::Join": [
+            "",
+            [
+              "arn:",
+              { Ref: "AWS::Partition" },
+              ":s3:::snapshot-fixture/profile-blue/v1/Runner_demand.json",
+            ],
+          ],
+        },
+      },
     );
+  }
+});
+
+test("dry-run inventory reads follow inspectAws and enabled mixed provisioners without lifecycle access", () => {
+  const config = fixture("mixed-ec2-fargate");
+  for (const inspectAws of [false, true]) {
+    for (const disabled of [undefined, "ec2", "fargate"] as const) {
+      const template = synthesize(
+        rewrite(config, {
+          ...config.runtime.spec,
+          mode: "dry-run",
+          dryRun: { demand: { type: "none" }, inspectAws },
+          profiles: config.runtime.spec.profiles.map((profile) =>
+            profile.provisioner.type === disabled
+              ? { ...profile, state: "disabled" }
+              : profile,
+          ),
+        }),
+      );
+      const names = actions(template);
+      assert.equal(
+        names.has("ec2:DescribeInstances"),
+        inspectAws && disabled !== "ec2",
+      );
+      assert.equal(
+        names.has("ecs:ListTasks"),
+        inspectAws && disabled !== "fargate",
+      );
+      assert.equal(
+        names.has("iam:GetInstanceProfile"),
+        inspectAws && disabled !== "ec2",
+      );
+      assert.ok([...names].every((action) => !action.startsWith("dynamodb:")));
+      assert.equal(
+        rolePolicy(template).filter(
+          ({ Action }) => Action === "s3:GetObjectVersion",
+        ).length,
+        1,
+      );
+    }
   }
 });
 

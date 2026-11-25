@@ -31,6 +31,7 @@ public static class RuntimeArtifactLoader
             BucketName = source.Bucket,
             Key = source.Key,
             VersionId = source.VersionId,
+            ExpectedBucketOwner = source.ExpectedBucketOwner,
         }, cancellationToken);
 
         if (!string.Equals(response.VersionId, source.VersionId, StringComparison.Ordinal))
