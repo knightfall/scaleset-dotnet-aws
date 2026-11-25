@@ -1,3 +1,4 @@
+using Amazon.Runtime;
 using Knightfall.ScaleSet.Aws.Core.Configuration;
 using Knightfall.ScaleSet.Aws.Core.Lifecycle;
 using Knightfall.ScaleSet.Aws.Core.Telemetry;
@@ -95,7 +96,7 @@ public sealed partial class GitHubListenerLane : IDisposable
         {
             return Report(Failed(error));
         }
-        catch (Exception error) when (error is GitHubOperationException or ScaleSetApiException or IOException or InvalidDataException or TimeoutException)
+        catch (Exception error) when (IsLaneFailure(error))
         {
             return Report(Failed(error));
         }
@@ -172,7 +173,7 @@ public sealed partial class GitHubListenerLane : IDisposable
         {
             return Report(Failed(error));
         }
-        catch (Exception error) when (error is GitHubOperationException or ScaleSetApiException or IOException or InvalidDataException or TimeoutException)
+        catch (Exception error) when (IsLaneFailure(error))
         {
             return Report(Failed(error));
         }
@@ -214,7 +215,7 @@ public sealed partial class GitHubListenerLane : IDisposable
         {
             return Report(Failed(error));
         }
-        catch (Exception error) when (error is GitHubOperationException or ScaleSetApiException or IOException or InvalidDataException or TimeoutException)
+        catch (Exception error) when (IsLaneFailure(error))
         {
             return Report(Failed(error));
         }
@@ -238,6 +239,10 @@ public sealed partial class GitHubListenerLane : IDisposable
                     nextRotation = _clock.GetUtcNow() + rotationInterval;
                 }
                 var result = await StepAsync(stoppingToken).ConfigureAwait(false);
+                if (result.Status == GitHubListenerLaneStatus.StorageRejected)
+                {
+                    return;
+                }
                 if (result.Step?.Status is not (ScaleSetListenerStepStatus.MessageAcknowledged or ScaleSetListenerStepStatus.Initialized))
                 {
                     await Task.Delay(retryDelay, _clock, delayCancellation.Token).ConfigureAwait(false);
@@ -495,10 +500,17 @@ public sealed partial class GitHubListenerLane : IDisposable
         {
             return new GitHubListenerLaneResult(GitHubListenerLaneStatus.StorageUnavailable);
         }
+        if (error is AmazonServiceException)
+        {
+            return new GitHubListenerLaneResult(GitHubListenerLaneStatus.StorageRejected);
+        }
         var safe = GitHubOperationException.From(error);
         _cooldown.Record(_connection.SecretArn, safe);
         return new GitHubListenerLaneResult(GitHubListenerLaneStatus.Failed, RetryAt: _cooldown.Read(_connection.SecretArn), Failure: safe);
     }
+
+    private static bool IsLaneFailure(Exception error) =>
+        error is GitHubOperationException or ScaleSetApiException or IOException or InvalidDataException or TimeoutException or AmazonServiceException;
 
     private sealed record KnownSessionResponse(SessionSendAuthorization Authorization, IMessageSession? OpenedSession);
 }

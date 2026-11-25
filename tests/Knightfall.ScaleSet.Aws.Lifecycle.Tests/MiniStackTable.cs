@@ -221,6 +221,9 @@ internal sealed class MiniStackWire : DelegatingHandler
     internal void FailNextGetItem(LifecycleKey key, HttpStatusCode? status, string? errorCode) =>
         Interlocked.Exchange(ref _failedGetItem, new StorageFailure(key, status, errorCode));
 
+    internal void FailNextGetItem(LifecycleKey key, Exception error) =>
+        Interlocked.Exchange(ref _failedGetItem, new StorageFailure(key, null, null, error));
+
     internal void FailNextTransactWrite(LifecycleKey key, string errorCode) =>
         Interlocked.Exchange(ref _failedTransactWrite, new StorageFailure(key, HttpStatusCode.BadRequest, errorCode));
 
@@ -287,14 +290,14 @@ internal sealed class MiniStackWire : DelegatingHandler
             await barrier.WaitAsync(cancellationToken);
         }
         if (operation == "TransactWriteItems" && _pausedWrite is { } writePause &&
-            MatchesTransactionPut(call, writePause) &&
+            MatchesTransactionWrite(call, writePause) &&
             Interlocked.CompareExchange(ref _pausedWrite, null, writePause) == writePause)
         {
             await writePause.AwaitResumeAsync(cancellationToken);
         }
         var actual = await base.SendAsync(request, cancellationToken);
         if (operation == "TransactWriteItems" && actual.IsSuccessStatusCode && _pausedSuccessfulWrite is { } afterWrite &&
-            MatchesTransactionPut(call, afterWrite) &&
+            MatchesTransactionWrite(call, afterWrite) &&
             Interlocked.CompareExchange(ref _pausedSuccessfulWrite, null, afterWrite) == afterWrite)
         {
             await afterWrite.AwaitResumeAsync(cancellationToken);
@@ -345,9 +348,10 @@ internal sealed class MiniStackWire : DelegatingHandler
         return actual;
     }
 
-    private static bool MatchesTransactionPut(MiniStackCall call, PausedRequest pause) =>
+    private static bool MatchesTransactionWrite(MiniStackCall call, PausedRequest pause) =>
         call.Request.GetProperty("TransactItems").EnumerateArray().Any(action =>
-            action.TryGetProperty("Put", out var put) && pause.Matches(put.GetProperty("Item")));
+            (action.TryGetProperty("Put", out var put) && pause.Matches(put.GetProperty("Item"))) ||
+            (action.TryGetProperty("Update", out var update) && pause.Matches(update.GetProperty("Key"))));
 
     private static bool MatchesKey(JsonElement item, LifecycleKey key) =>
         item.GetProperty("PK").GetProperty("S").GetString() == key.PartitionKey &&
@@ -355,6 +359,10 @@ internal sealed class MiniStackWire : DelegatingHandler
 
     private static HttpResponseMessage FailureResponse(StorageFailure fault)
     {
+        if (fault.Failure is { } error)
+        {
+            throw error;
+        }
         if (fault.Status is not { } status)
         {
             throw new HttpRequestException(HttpRequestError.ConnectionError, "synthetic storage diagnostic",
@@ -371,7 +379,7 @@ internal sealed class MiniStackWire : DelegatingHandler
         };
     }
 
-    private sealed record StorageFailure(LifecycleKey Key, HttpStatusCode? Status, string? ErrorCode);
+    private sealed record StorageFailure(LifecycleKey Key, HttpStatusCode? Status, string? ErrorCode, Exception? Failure = null);
 
     internal sealed class PausedRequest(LifecycleKey key)
     {

@@ -31,6 +31,7 @@ public enum GitHubListenerLaneStatus
     CredentialRejected = 7,
     CredentialAdopted = 8,
     StorageUnavailable = 9,
+    StorageRejected = 10,
 }
 
 public sealed record GitHubListenerLaneResult(

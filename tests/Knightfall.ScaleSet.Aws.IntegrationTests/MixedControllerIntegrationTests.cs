@@ -18,6 +18,37 @@ namespace Knightfall.ScaleSet.Aws.IntegrationTests;
 public sealed class MixedControllerIntegrationTests(ITestOutputHelper output)
 {
     [Fact]
+    public async Task UnexpectedHeartbeatLossExitsUnsuccessfullyAndRetainsTheUncertainPredecessorFence()
+    {
+        using var deadline = CancellationTokenSource.CreateLinkedTokenSource(TestContext.Current.CancellationToken);
+        deadline.CancelAfter(TimeSpan.FromSeconds(45));
+        var token = deadline.Token;
+        await using var fixture = await MixedRuntimeFixture.CreateAsync("mixed", token);
+        string taskArn = await fixture.StartControllerTaskAsync(token);
+        await using var worker = MixedControllerProcess.Start(fixture, taskArn, telemetryEndpoint: null);
+        string deployment = ControllerLeaseRecoveryCoordinator.DeploymentKey(fixture.Configuration);
+        await WaitAsync(async () => await worker.ReadyAsync(token) == HttpStatusCode.OK, "mixed worker ready before heartbeat loss", token);
+        var original = Assert.IsType<ControllerLease>(await fixture.Store.ReadLeaseAsync(deployment, token));
+        Assert.Equal(taskArn, original.OwnerTaskArn);
+        Assert.Equal(ControllerLeaseMode.Active, original.Mode);
+        fixture.Cloud.SetClock(taskArn, healthy: false);
+
+        Assert.Equal(1, await worker.ExitCodeAsync(token));
+
+        Assert.Contains(fixture.Cloud.Calls, call => call is { Service: "metadata", Operation: "NOT_SYNCHRONIZED" });
+        var retained = Assert.IsType<ControllerLease>(await fixture.Store.ReadLeaseAsync(deployment, token));
+        Assert.Equal(original.Fence, retained.Fence);
+        Assert.Equal(ControllerLeaseMode.Active, retained.Mode);
+        foreach (var profile in fixture.Profiles.Values)
+        {
+            Assert.DoesNotContain(profile.GitHub.Requests, request => request.Method == "DELETE" &&
+                request.Path.Contains("/sessions/", StringComparison.Ordinal));
+            var session = await fixture.Store.ReadSessionAsync(new LifecycleProfile(deployment, profile.Id), token);
+            Assert.Equal(SessionPhase.Active, session?.Phase);
+        }
+    }
+
+    [Fact]
     public async Task FargateReserveStaysAtOneWithoutDemandAndReplacesAnExactStoppedTaskOnce()
     {
         using var deadline = CancellationTokenSource.CreateLinkedTokenSource(TestContext.Current.CancellationToken);

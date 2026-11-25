@@ -214,7 +214,8 @@ public sealed partial class DynamoDbLifecycleStore
     {
         AmazonServiceException service => IsTransientStorageStatus(service.StatusCode) || service.Retryable is { Throttling: true } ||
             service.ErrorCode is "ProvisionedThroughputExceededException" or "ProvisionedThroughputExceeded" or
-                "RequestLimitExceeded" or "RequestLimitExceededException" or "ThrottlingException",
+                "RequestLimitExceeded" or "RequestLimitExceededException" or "ThrottlingException" or "ExpiredToken" or "ExpiredTokenException",
+        AmazonClientException or TimeoutException or OperationCanceledException => true,
         HttpRequestException { StatusCode: null } => true,
         HttpRequestException { StatusCode: { } status } => IsTransientStorageStatus(status),
         _ => false,
@@ -362,7 +363,7 @@ public sealed partial class DynamoDbLifecycleStore
         {
             return telemetry.Complete(LifecycleWriteOutcome.Indeterminate);
         }
-        catch (Exception error) when (error is HttpRequestException or IOException or TimeoutException)
+        catch (Exception error) when (error is AmazonClientException or HttpRequestException or IOException or TimeoutException)
         {
             return telemetry.Complete(LifecycleWriteOutcome.Indeterminate);
         }

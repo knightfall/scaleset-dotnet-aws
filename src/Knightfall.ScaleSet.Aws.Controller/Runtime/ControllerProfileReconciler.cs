@@ -82,10 +82,7 @@ internal sealed class ControllerProfileReconciler(
         var effectIndex = await store.ReadEffectIndexAsync(Key, cancellationToken).ConfigureAwait(false);
         bool exactIndex = effectIndex is { State: EffectIndexState.Ready } && effectIndex.OwnerEpoch == current.Lease.Epoch &&
             effectIndex.WriterProtocol == current.Lease.WriterProtocol;
-        bool listenerAvailable = Session.ListenerResult is not { Status: GitHubListenerLaneStatus.RecoveryRequired or
-            GitHubListenerLaneStatus.Failed or GitHubListenerLaneStatus.OwnershipUnavailable or GitHubListenerLaneStatus.StorageUnavailable or
-            GitHubListenerLaneStatus.Stopped };
-        bool ready = IsReady(catalog.State, binding, plan, exactIndex, complete, listenerAvailable);
+        bool ready = IsReady(catalog.State, binding, plan, exactIndex, complete, Session.IsListenerAvailable);
         var now = clock.GetUtcNow();
         telemetry.SetOwnership(current.Lease, current.Clock, timing.WriteReserve);
         telemetry.SetListenerCooldown(current.Lease.Fence, Key.ProfileId, Session.ReadCredentialCooldown());

@@ -160,6 +160,8 @@ public sealed class GitHubListenerSupervisorTests
     [Theory]
     [InlineData(HttpStatusCode.BadRequest, "ProvisionedThroughputExceededException", false)]
     [InlineData(HttpStatusCode.InternalServerError, "InternalServerError", false)]
+    [InlineData(HttpStatusCode.Forbidden, "ExpiredTokenException", false)]
+    [InlineData(HttpStatusCode.RequestTimeout, "RequestTimeout", false)]
     [InlineData(null, null, false)]
     [InlineData(HttpStatusCode.BadRequest, "ProvisionedThroughputExceededException", true)]
     [InlineData(HttpStatusCode.BadRequest, "RequestLimitExceeded", true)]
