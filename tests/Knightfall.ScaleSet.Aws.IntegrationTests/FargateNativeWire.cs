@@ -123,7 +123,8 @@ internal sealed class FargateNativeWire(Uri endpoint) : DelegatingHandler(new So
         }
 
         var response = await base.SendAsync(request, cancellationToken).ConfigureAwait(false);
-        if (response.StatusCode != HttpStatusCode.OK || operation is not ("DescribeTasks" or "ListTasks" or "StopTask" or "ListAccountSettings"))
+        if (response.StatusCode != HttpStatusCode.OK ||
+            operation is not ("DescribeTasks" or "DescribeTaskDefinition" or "ListTasks" or "StopTask" or "ListAccountSettings"))
         {
             return response;
         }
@@ -131,6 +132,13 @@ internal sealed class FargateNativeWire(Uri endpoint) : DelegatingHandler(new So
         var output = JsonNode.Parse(await response.Content.ReadAsStringAsync(cancellationToken).ConfigureAwait(false))!.AsObject();
         switch (operation)
         {
+            case "DescribeTaskDefinition":
+                // MiniStack emits an empty string for omitted PID mode. ECS represents the default by omission.
+                if (output["taskDefinition"] is JsonObject definition && definition["pidMode"]?.GetValue<string>() == string.Empty)
+                {
+                    definition.Remove("pidMode");
+                }
+                break;
             case "DescribeTasks":
                 foreach (var item in output["tasks"]!.AsArray())
                 {
