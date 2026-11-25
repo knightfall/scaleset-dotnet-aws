@@ -6,13 +6,18 @@ fail() {
   exit 1
 }
 
+case "$#:${1:-}" in
+  0:|1:--settings-only) ;;
+  *) fail 'Use production.sh with no arguments or --settings-only.' ;;
+esac
+
 repo="repos/$GITHUB_REPOSITORY"
 [[ -n "${RELEASE_SETTINGS_READ_TOKEN:-}" ]] || fail 'Configure RELEASE_SETTINGS_READ_TOKEN in production.'
 settings_token=$RELEASE_SETTINGS_READ_TOKEN
 unset RELEASE_SETTINGS_READ_TOKEN
 
 settings_read() {
-  GH_TOKEN="$settings_token" gh api "$@"
+  GH_TOKEN="$settings_token" gh api "$@" 2>/dev/null
 }
 
 settings_read "$repo/immutable-releases" | jq -e '.enabled == true' > /dev/null ||
@@ -31,8 +36,13 @@ while IFS= read -r id; do
   settings_read "$repo/rulesets/$id" >> "$rulesets" || fail 'Could not read an active repository ruleset.'
 done <<< "$ruleset_ids"
 unset settings_token
-jq -se --arg repo "$GITHUB_REPOSITORY" -f .github/release/production-rules.jq "$rulesets" > /dev/null ||
+jq -se --arg repo "$GITHUB_REPOSITORY" -f .github/release/production-rules.jq "$rulesets" > /dev/null 2>&1 ||
   fail 'Required main and release-tag rulesets or explicit bypass evidence are missing. Check rule targeting, enforcement and settings token visibility.'
+
+if [[ "${1:-}" == --settings-only ]]; then
+  printf '%s\n' 'Read-only repository release settings verified.'
+  exit 0
+fi
 
 gh api "$repo/environments/production" | jq -e '
   .can_admins_bypass == false and .deployment_branch_policy.custom_branch_policies == true

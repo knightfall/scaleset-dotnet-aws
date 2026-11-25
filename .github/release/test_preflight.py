@@ -96,10 +96,10 @@ print(os.environ["TEST_TAG_COMMIT"], ref + "^{}")
         path.write_text("#!/usr/bin/env python3\n" + source)
         path.chmod(0o700)
 
-    def run_gate(self, api=None, script="preflight", **env):
+    def run_gate(self, api=None, script="preflight", args=(), **env):
         self.output.unlink(missing_ok=True)
         return subprocess.run(
-            ["bash", f".github/release/{script}.sh"], cwd=self.root, capture_output=True, text=True,
+            ["bash", f".github/release/{script}.sh", *args], cwd=self.root, capture_output=True, text=True,
             env=dict(self.env, **env, TEST_GITHUB_API=json.dumps(api or self.api)), check=False,
         )
 
@@ -204,6 +204,26 @@ print(os.environ["TEST_TAG_COMMIT"], ref + "^{}")
                 result = self.run_gate(api, script="production", RELEASE_SETTINGS_READ_TOKEN="settings-token")
                 self.assertNotEqual(0, result.returncode)
                 self.assertIn("explicit bypass evidence", result.stderr)
+                self.assertNotIn("settings-token", result.stderr)
+
+    def test_pre_tag_settings_only_uses_the_same_bypass_predicate(self):
+        api = copy.deepcopy(self.api)
+        del api["environments/production"]
+        result = self.run_gate(api, script="production", args=("--settings-only",),
+                               RELEASE_SETTINGS_READ_TOKEN="settings-token")
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertEqual("Read-only repository release settings verified.\n", result.stdout)
+        self.assertEqual("", result.stderr)
+
+        for ruleset in ("rulesets/11", "rulesets/12", "rulesets/13"):
+            with self.subTest(ruleset=ruleset):
+                incomplete = copy.deepcopy(api)
+                del incomplete[ruleset]["bypass_actors"]
+                result = self.run_gate(incomplete, script="production", args=("--settings-only",),
+                                       RELEASE_SETTINGS_READ_TOKEN="settings-token")
+                self.assertNotEqual(0, result.returncode)
+                self.assertIn("explicit bypass evidence", result.stderr)
+                self.assertEqual("", result.stdout)
                 self.assertNotIn("settings-token", result.stderr)
 
     def test_production_fails_closed_when_settings_queries_fail(self):
