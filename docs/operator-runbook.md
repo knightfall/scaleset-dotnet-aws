@@ -138,6 +138,12 @@ npm --prefix cdk run deploy:controller -- \
 3. Run the receiver smoke check from the intended network, then confirm queryable metrics, traces, and logs for the new `service.instance.id`. Confirm that enabled profiles have fresh readiness and that the resource and profile attributes match the artifact. Investigate zero readiness or absent data with the [telemetry playbook](operator-telemetry.md).
 4. Record activation time, exact owner task ARN and lease epoch, runtime version and generation, task definition ARN, image digest, and the qualification evidence for each profile. Retain the previous compatible YAML, runtime, image digest, and assembly.
 
+### Qualify encrypted observation delivery
+
+For each enabled backend, record the exact EventBridge rules, primary and dead-letter queues, and their shared KMS key. Each queue permits `sqs:SendMessage` from EventBridge only for its controller rules. The provider key permits the EventBridge encryption actions for the deploying account. The controller consumes the primary queue. The same dead-letter queue handles EventBridge delivery failures and SQS redrive after the configured receive limit. [EventBridge queue policy](https://docs.aws.amazon.com/eventbridge/latest/userguide/eb-use-resource-based.html#sqs-permissions) · [EventBridge dead-letter policy](https://docs.aws.amazon.com/eventbridge/latest/userguide/eb-rule-dlq.html) · [SQS key management](https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/sqs-key-management.html)
+
+In an authorized qualification stack, observe a matching EC2 or ECS state change arrive on the encrypted primary queue and reach the controller. Use a controlled target-delivery failure to verify EventBridge can write the encrypted dead-letter queue. Exercise SQS receive-limit redrive separately and confirm the operator can read the retained messages. Record the regional delivery result, including any key or queue access errors. Offline CDK synthesis verifies policy scope and routing. Actual service context and cross-account behavior require target evidence.
+
 ## Cut over runner HELLO registration
 
 The controller stack reports a `Bootstrap…HelloUrl` output for each enabled

@@ -13,7 +13,6 @@ import {
 import * as dynamodb from "aws-cdk-lib/aws-dynamodb";
 import * as ecs from "aws-cdk-lib/aws-ecs";
 import * as events from "aws-cdk-lib/aws-events";
-import * as targets from "aws-cdk-lib/aws-events-targets";
 import * as iam from "aws-cdk-lib/aws-iam";
 import * as kms from "aws-cdk-lib/aws-kms";
 import * as sqs from "aws-cdk-lib/aws-sqs";
@@ -366,6 +365,7 @@ export class ControllerInfrastructure extends Stack {
         principals: [new iam.ServicePrincipal("events.amazonaws.com")],
         actions: ["kms:Decrypt", "kms:GenerateDataKey"],
         resources: ["*"],
+        conditions: { StringEquals: { "aws:SourceAccount": this.account } },
       }),
     );
     const security = {
@@ -404,7 +404,23 @@ export class ControllerInfrastructure extends Stack {
         region: [this.region],
       },
     });
-    rule.addTarget(new targets.SqsQueue(queue, { deadLetterQueue: dlq }));
+    for (const destination of [queue, dlq]) {
+      destination.addToResourcePolicy(
+        new iam.PolicyStatement({
+          principals: [new iam.ServicePrincipal("events.amazonaws.com")],
+          actions: ["sqs:SendMessage"],
+          resources: [destination.queueArn],
+          conditions: { ArnEquals: { "aws:SourceArn": rule.ruleArn } },
+        }),
+      );
+    }
+    // The standard CDK SQS target adds broad queue and KMS grants for encrypted targets.
+    rule.addTarget({
+      bind: () => ({
+        arn: queue.queueArn,
+        deadLetterConfig: { arn: dlq.queueArn },
+      }),
+    });
   }
 }
 
