@@ -417,7 +417,8 @@ public sealed partial class GitHubListenerLane : IDisposable
             return;
         }
         _checkpoint = new GitHubListenerCheckpointStore(_store, fence, _clock);
-        var handler = new GitHubListenerDeliveryHandler(_store, fence, session, ReadCapacityAsync, _clock);
+        var handler = new GitHubListenerDeliveryHandler(_store, fence, session, ReadCapacityAsync, _clock,
+            releaseOnAssignment: false, runnerConnection: _connection);
         var execution = new GitHubListenerExecutionPolicy(_store, fence, _checkpoint.SessionKey, _cooldown, _connection.SecretArn,
             ReadOwnershipAsync, handler.ReadPollCapacityAsync, _clock, _timing.WriteReserve, _definition.OwnershipLost);
         var options = new ScaleSetListenerPumpOptions(_checkpoint.SessionKey, _definition.OwnershipLost);

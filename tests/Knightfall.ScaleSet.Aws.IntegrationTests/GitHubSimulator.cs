@@ -73,6 +73,7 @@ internal sealed class GitHubSimulator(string groupName, GitHubSimulatorAddress? 
     internal SimulatorRequest[] Requests => _requests.ToArray();
     internal Guid? SessionId { get { lock (_sync) { return _session?.Id; } } }
     internal long? RegisteredRunnerId { get { lock (_sync) { return _runners.Values.SingleOrDefault()?.Id; } } }
+    internal long[] AcquiredRequests { get { lock (_sync) { return _acquired.Order().ToArray(); } } }
     internal int TotalAssignedJobs { get; set; }
 
     internal void SeedScaleSet(string name, IEnumerable<string> labels)
@@ -104,8 +105,40 @@ internal sealed class GitHubSimulator(string groupName, GitHubSimulatorAddress? 
             string body = JsonSerializer.Serialize(requestIds.Select(id =>
                 new { messageType = "JobAvailable", runnerRequestId = id, requestLabels = DefaultLabels }));
             long id = _messageId++;
-            _queue.Add(id, new SimulatedMessage(id, AsRequested, body, new { totalAssignedJobs = TotalAssignedJobs }));
+            _queue.Add(id, new SimulatedMessage(id, AsRequested, body, Statistics()));
             return id;
+        }
+    }
+
+    internal void MarkRunnerListening(long runnerId)
+    {
+        lock (_sync)
+        {
+            _runners[runnerId] = _runners[runnerId] with { Listening = true };
+        }
+    }
+
+    internal void ReplaceWithUnownedIdleRunner(long runnerId)
+    {
+        lock (_sync)
+        {
+            if (!_runners.Remove(runnerId))
+            {
+                throw new InvalidOperationException("The fixture runner to replace is missing.");
+            }
+            var foreign = new SimulatedRunner(_nextRunner++, SetId, "unowned-idle-runner", Assigned: false, Listening: true);
+            _runners.Add(foreign.Id, foreign);
+        }
+    }
+
+    internal void ForgetRunnerRegistration(long runnerId)
+    {
+        lock (_sync)
+        {
+            if (!_runners.Remove(runnerId))
+            {
+                throw new InvalidOperationException("The fixture runner to remove is missing.");
+            }
         }
     }
 
@@ -178,6 +211,12 @@ internal sealed class GitHubSimulator(string groupName, GitHubSimulatorAddress? 
             .RequireHost(Address.ApiHosts);
         app.MapPost("/enterprises/{enterprise}/actions/runners/registration-token", RegistrationTokenResult)
             .RequireHost(Address.ApiHosts);
+        app.MapGet("/orgs/{owner}/actions/runners/{id:long}", (long id, HttpContext context) =>
+            ReadRunnerAvailability(context, id, requireApp: true)).RequireHost(Address.ApiHosts);
+        app.MapGet("/repos/{owner}/{repo}/actions/runners/{id:long}", (long id, HttpContext context) =>
+            ReadRunnerAvailability(context, id, requireApp: true)).RequireHost(Address.ApiHosts);
+        app.MapGet("/enterprises/{enterprise}/actions/runners/{id:long}", (long id, HttpContext context) =>
+            ReadRunnerAvailability(context, id, requireApp: false)).RequireHost(Address.ApiHosts);
         app.MapPost("/actions/runner-registration", (HttpContext context) =>
             context.Request.Headers.Authorization == "RemoteAuth " + RegistrationToken
                 ? Results.Json(new { url = $"https://{Address.ServiceHost}{ServiceBase}", token = AdminToken })
@@ -254,6 +293,26 @@ internal sealed class GitHubSimulator(string groupName, GitHubSimulatorAddress? 
         }
     }
 
+    private IResult ReadRunnerAvailability(HttpContext context, long id, bool requireApp)
+    {
+        bool authorized = requireApp ? Bearer(context) == AppAccessToken : Bearer(context) is FirstPat or NextPat;
+        lock (_sync)
+        {
+            if (!authorized)
+            {
+                return Results.Unauthorized();
+            }
+
+            return _runners.TryGetValue(id, out var runner) ? Results.Json(new
+            {
+                runner.Id,
+                runner.Name,
+                status = runner.Listening ? "online" : "offline",
+                busy = runner.Assigned,
+            }) : Results.NotFound();
+        }
+    }
+
     private IResult Queue(HttpContext context, Guid id, Func<IResult> result)
     {
         lock (_sync)
@@ -315,6 +374,14 @@ internal sealed class GitHubSimulator(string groupName, GitHubSimulatorAddress? 
         return message is null ? Results.StatusCode(202) : Results.Json(message);
     }
 
+    private object Statistics() => new
+    {
+        totalAssignedJobs = TotalAssignedJobs,
+        totalRegisteredRunners = _runners.Count,
+        totalIdleRunners = _runners.Values.Count(runner => runner.Listening && !runner.Assigned),
+        totalBusyRunners = _runners.Values.Count(runner => runner.Assigned),
+    };
+
     private IResult RemoveRunner(long id)
     {
         if (!_runners.TryGetValue(id, out var runner))
@@ -370,10 +437,10 @@ internal sealed class GitHubSimulator(string groupName, GitHubSimulatorAddress? 
         Results.Json(new { typeName = "Microsoft.VisualStudio.Services.AgentPool." + name }, statusCode: status);
 
     private static object RunnerPayload(SimulatedRunner runner) =>
-        new { id = runner.Id, runnerScaleSetId = runner.RunnerScaleSetId, name = runner.Name, status = "online" };
+        new { id = runner.Id, runnerScaleSetId = runner.RunnerScaleSetId, name = runner.Name };
 
     private sealed record SimulatedScaleSet(long Id, string Name, long RunnerGroupId, JsonElement Labels);
-    private sealed record SimulatedRunner(long Id, long RunnerScaleSetId, string Name, bool Assigned);
+    private sealed record SimulatedRunner(long Id, long RunnerScaleSetId, string Name, bool Assigned, bool Listening = false);
     private sealed record SimulatedSession(Guid Id, string Token);
     private sealed record SimulatedMessage(long MessageId, string MessageType, string Body, object Statistics);
 

@@ -1,3 +1,4 @@
+using System.Collections.Immutable;
 using Knightfall.ScaleSet.Aws.Core.Planning;
 
 namespace Knightfall.ScaleSet.Aws.Core.Lifecycle;
@@ -87,6 +88,7 @@ public static class ExecutorClassifier
 
         long occupied = coverage.UnownedOccupied;
         var matched = new HashSet<long>();
+        var warm = ImmutableArray.CreateBuilder<WarmRunnerCandidate>();
         bool coherent = true;
         foreach (var executor in inventory.Executors)
         {
@@ -96,6 +98,13 @@ public static class ExecutorClassifier
                 continue;
             }
             occupied++;
+            if (classification.CoversIdleReserve && executor.State.RunnerId is > 0)
+            {
+                var observedAt = executor.State.Resource!.ObservedAt;
+                var earliest = (observedAt < coverage.ObservedAt ? observedAt : coverage.ObservedAt).ToUniversalTime();
+                var validThrough = DateTimeOffset.MaxValue - earliest < freshness ? DateTimeOffset.MaxValue : earliest + freshness;
+                warm.Add(new WarmRunnerCandidate(executor, validThrough));
+            }
             if (classification.SlotState == RunnerSlotState.Busy && demand.MessageId is long messageId &&
                 executor.State.Job is { } job && job.SessionId == demand.SessionId && job.MessageId == messageId &&
                 job.ObservedAt == demand.ObservedAt && !matched.Add(job.RequestId))
@@ -106,7 +115,10 @@ public static class ExecutorClassifier
 
         int insideAssigned = coherent && matched.Count <= demand.TotalAssignedJobs ? matched.Count : 0;
         return new ListenerCapacity(Math.Min(maximum, coverage.BackendCapacityCeiling.Value),
-            (int)Math.Min(int.MaxValue, occupied - insideAssigned));
+            (int)Math.Min(int.MaxValue, occupied - insideAssigned))
+        {
+            WarmCandidates = coherent ? warm.ToImmutable() : [],
+        };
     }
 
     private static bool IsFresh(DateTimeOffset observedAt, DateTimeOffset now, TimeSpan freshness) =>

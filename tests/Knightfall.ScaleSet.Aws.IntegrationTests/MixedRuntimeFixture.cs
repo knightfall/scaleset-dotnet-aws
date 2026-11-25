@@ -54,14 +54,14 @@ internal sealed class MixedRuntimeFixture : IAsyncDisposable
     private string ControllerSubnet { get; set; } = null!;
 
     internal static async Task<MixedRuntimeFixture> CreateAsync(string mode, CancellationToken token,
-        bool sharedFargateCluster = false, long remainingFargateCpuUnits = 32_768, bool warmFargate = false)
+        bool sharedFargateCluster = false, long remainingFargateCpuUnits = 32_768, int? warmFargateMaximum = null)
     {
         var cloud = await MixedControllerCloud.StartAsync(token);
         MixedRuntimeFixture? fixture = null;
         try
         {
             fixture = new MixedRuntimeFixture(cloud, await MiniStackTable.CreateAsync(token));
-            await fixture.SeedAsync(mode, sharedFargateCluster, remainingFargateCpuUnits, warmFargate, token);
+            await fixture.SeedAsync(mode, sharedFargateCluster, remainingFargateCpuUnits, warmFargateMaximum, token);
             return fixture;
         }
         catch
@@ -78,7 +78,7 @@ internal sealed class MixedRuntimeFixture : IAsyncDisposable
         }
     }
 
-    private async Task SeedAsync(string mode, bool sharedFargateCluster, long remainingFargateCpuUnits, bool warmFargate,
+    private async Task SeedAsync(string mode, bool sharedFargateCluster, long remainingFargateCpuUnits, int? warmFargateMaximum,
         CancellationToken token)
     {
         string raw = await File.ReadAllTextAsync(Path.Combine(AppContext.BaseDirectory, "mixed-ec2-fargate.json"), token);
@@ -130,9 +130,9 @@ internal sealed class MixedRuntimeFixture : IAsyncDisposable
             var provisioner = profile["provisioner"]!;
             provisioner["network"] = networkName;
             profile["platform"]!["arch"] = "x64";
-            bool reserveOne = warmFargate && kind == "fargate";
-            profile["capacity"]!["idleReserve"] = reserveOne ? 1 : 0;
-            profile["capacity"]!["maxRunners"] = reserveOne ? 24 : 1;
+            int? warmMaximum = kind == "fargate" ? warmFargateMaximum : null;
+            profile["capacity"]!["idleReserve"] = warmMaximum is null ? 0 : 1;
+            profile["capacity"]!["maxRunners"] = warmMaximum ?? 1;
 
             if (kind == "ec2")
             {

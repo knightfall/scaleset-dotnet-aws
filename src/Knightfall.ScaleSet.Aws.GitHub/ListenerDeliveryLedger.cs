@@ -8,7 +8,7 @@ using Knightfall.ScaleSet.Aws.DynamoDb;
 
 namespace Knightfall.ScaleSet.Aws.GitHub;
 
-internal sealed class ListenerDeliveryLedger(DynamoDbLifecycleStore store, OwnedSessionFence fence)
+internal sealed class ListenerDeliveryLedger(DynamoDbLifecycleStore store, OwnedSessionFence fence, TimeProvider clock)
 {
     /// <summary>Bounds each transaction even when jobs touch two executors and their mappings.</summary>
     internal const int MaximumJobsPerTransaction = 11;
@@ -159,8 +159,8 @@ internal sealed class ListenerDeliveryLedger(DynamoDbLifecycleStore store, Owned
             .ConfigureAwait(false);
     }
 
-    internal async Task<AdmissionAttempt?> ReserveAsync(
-        Entry<MessageReceipt> receipt, long messageId, ImmutableArray<long> offers, int allowance,
+    internal async Task<CommittedAdmission?> ReserveAsync(
+        Entry<MessageReceipt> receipt, long messageId, ImmutableArray<long> offers, int allowance, WarmAdmissionCredit? warm,
         IReadOnlyDictionary<LifecycleKey, long?> readGuards, CancellationToken cancellationToken)
     {
         if (receipt.Value.Admission is not null)
@@ -183,8 +183,11 @@ internal sealed class ListenerDeliveryLedger(DynamoDbLifecycleStore store, Owned
 
         var balanceKey = LifecycleKey.Admission(profile);
         bool hasBalanceGuard = guards.TryGetValue(balanceKey, out long? balanceRevision);
-        var balance = allowance > 0 && !offers.IsEmpty ? await ReadBalanceAsync(cancellationToken).ConfigureAwait(false) : null;
-        int headroom = Math.Max(0, allowance - (balance?.Value.HeldCount ?? 0));
+        int totalAllowance = checked(allowance + (warm?.Count ?? 0));
+        var balance = totalAllowance > 0 && !offers.IsEmpty ? await ReadBalanceAsync(cancellationToken).ConfigureAwait(false) : null;
+        int held = balance?.Value.HeldCount ?? 0;
+        int normalHeadroom = Math.Max(0, allowance - held);
+        int headroom = Math.Max(0, totalAllowance - held);
         List<LifecycleRecordWrite> writes = [];
         var chosen = ImmutableArray.CreateBuilder<long>();
         Guid attemptId = Guid.NewGuid();
@@ -202,27 +205,40 @@ internal sealed class ListenerDeliveryLedger(DynamoDbLifecycleStore store, Owned
             // A nonempty reservation also fences the applied profile catalog.
             int additionalActions = (chosen.Count == 0 ? 1 + (hasBalanceGuard ? 0 : 1) : 0) +
                 (hasJobGuard ? 0 : 1) + (hasAcquisitionGuard ? 0 : 1);
+            bool firstWarm = chosen.Count == normalHeadroom;
+            if (firstWarm)
+            {
+                additionalActions += warm!.Guards.Count(guard => !guards.ContainsKey(guard.Key));
+            }
             if (actions + additionalActions > MaximumTransactionActions)
             {
                 continue;
             }
 
             var acquisition = await ReadAcquisitionAsync(requestId, cancellationToken).ConfigureAwait(false);
-            if (acquisition is not null || await store.ReadRecordAsync(jobKey, cancellationToken).ConfigureAwait(false) is not null)
+            if ((acquisition is not null && !CanReplaceUnsent(acquisition.Value, messageId)) ||
+                await store.ReadRecordAsync(jobKey, cancellationToken).ConfigureAwait(false) is not null)
             {
                 continue;
             }
             if ((hasBalanceGuard && balanceRevision != balance?.Record.Revision) ||
-                jobRevision is not null || acquisitionRevision is not null)
+                jobRevision is not null || (hasAcquisitionGuard && acquisitionRevision != acquisition?.Record.Revision))
             {
                 return null;
             }
 
             actions += additionalActions;
+            if (firstWarm)
+            {
+                foreach (var guard in warm!.Guards)
+                {
+                    guards[guard.Key] = guard.ExpectedRevision;
+                }
+            }
             chosen.Add(requestId);
             guards[jobKey] = null;
             guards.Remove(acquisitionKey);
-            writes.Add(NewWrite(acquisitionKey, new Acquisition(
+            writes.Add(Write(acquisitionKey, acquisition, new Acquisition(
                 requestId, fence.Identity.ScopeIdentity, fence.Identity.ScaleSetId, fence.Identity.SessionId,
                 messageId, attemptId, AcquisitionState.Reserved, null)));
         }
@@ -238,12 +254,20 @@ internal sealed class ListenerDeliveryLedger(DynamoDbLifecycleStore store, Owned
         }
         writes.Add(Replace(receipt, receipt.Value with { Admission = attempt }));
         var conditions = guards.Select(guard => new LifecycleRecordCondition(guard.Key, guard.Value)).ToArray();
-        return await store.WriteSessionRecordsAsync(fence, attemptId, writes, cancellationToken, conditions).ConfigureAwait(false)
-            == LifecycleWriteOutcome.Committed ? attempt : null;
+        var warmValidThrough = chosen.Count > normalHeadroom ? warm!.ValidThrough : (DateTimeOffset?)null;
+        if (warmValidThrough <= clock.GetUtcNow())
+        {
+            return null;
+        }
+        var result = chosen.Count == 0
+            ? await store.WriteSessionRecordsAsync(fence, attemptId, writes, cancellationToken, conditions).ConfigureAwait(false)
+            : await store.WriteSessionReservationAsync(fence, attemptId, writes, conditions, cancellationToken).ConfigureAwait(false);
+        return result == LifecycleWriteOutcome.Committed ? new CommittedAdmission(attempt, warmValidThrough) : null;
     }
 
     internal async Task<LifecycleWriteOutcome> SettleAttemptAsync(
-        Entry<MessageReceipt> receipt, long messageId, IReadOnlySet<long> accepted, CancellationToken cancellationToken)
+        Entry<MessageReceipt> receipt, long messageId, IReadOnlySet<long> accepted, CancellationToken cancellationToken,
+        bool abandonedBeforeSend = false)
     {
         if (receipt.Value.Admission is not { OutcomeRecorded: false } attempt)
         {
@@ -251,6 +275,7 @@ internal sealed class ListenerDeliveryLedger(DynamoDbLifecycleStore store, Owned
         }
 
         var writes = new List<LifecycleRecordWrite>(attempt.Request.RequestIds.Length + 1);
+        int released = 0;
         foreach (long requestId in attempt.Request.RequestIds)
         {
             var acquisition = await ReadAcquisitionAsync(requestId, cancellationToken).ConfigureAwait(false);
@@ -261,9 +286,22 @@ internal sealed class ListenerDeliveryLedger(DynamoDbLifecycleStore store, Owned
             }
             if (acquisition.Value.State == AcquisitionState.Reserved)
             {
-                var state = accepted.Contains(requestId) ? AcquisitionState.Accepted : AcquisitionState.Uncertain;
-                writes.Add(Replace(acquisition, acquisition.Value with { State = state }));
+                if (abandonedBeforeSend)
+                {
+                    writes.Add(Release(acquisition, new AdmissionEvidence(AdmissionEvidenceKind.AbandonedBeforeSend, attempt.Id.ToString("D"))));
+                    released++;
+                }
+                else
+                {
+                    var state = accepted.Contains(requestId) ? AcquisitionState.Accepted : AcquisitionState.Uncertain;
+                    writes.Add(Replace(acquisition, acquisition.Value with { State = state }));
+                }
             }
+        }
+        if (released != 0)
+        {
+            var balance = await ReadBalanceAsync(cancellationToken).ConfigureAwait(false);
+            writes.Add(DecrementBalance(balance, released));
         }
         writes.Add(Replace(receipt, receipt.Value with { Admission = attempt with { OutcomeRecorded = true } }));
         return await WriteAsync(writes, cancellationToken).ConfigureAwait(false);
@@ -347,6 +385,11 @@ internal sealed class ListenerDeliveryLedger(DynamoDbLifecycleStore store, Owned
         return entry;
     }
 
+    private bool CanReplaceUnsent(Acquisition acquisition, long messageId) =>
+        acquisition is { State: AcquisitionState.Released, Evidence: { Kind: AdmissionEvidenceKind.AbandonedBeforeSend } evidence } &&
+        evidence.Reference == acquisition.AttemptId.ToString("D") &&
+        (acquisition.SessionId != fence.Identity.SessionId || acquisition.MessageId < messageId);
+
     private bool MatchesEnvelope(AdmissionAttempt attempt, long messageId)
     {
         var request = attempt.Request;
@@ -408,6 +451,8 @@ internal sealed class ListenerDeliveryLedger(DynamoDbLifecycleStore store, Owned
 
     internal sealed record Entry<T>(LifecycleRecord Record, T Value);
     internal sealed record MessageReceipt(string Digest, DateTimeOffset ObservedAt, int JobOffset, AdmissionAttempt? Admission);
+    internal sealed record WarmAdmissionCredit(int Count, DateTimeOffset ValidThrough, IReadOnlyList<LifecycleRecordCondition> Guards);
+    internal sealed record CommittedAdmission(AdmissionAttempt Attempt, DateTimeOffset? WarmValidThrough);
     internal sealed record AdmissionAttempt(Guid Id, AcquisitionRequest Request, string Sha256, bool OutcomeRecorded);
     internal sealed record AcquisitionRequest(string ScopeIdentity, long ScaleSetId, Guid SessionId, long MessageId,
         ImmutableArray<long> RequestIds);
@@ -432,6 +477,7 @@ internal sealed class ListenerDeliveryLedger(DynamoDbLifecycleStore store, Owned
         Completed = 0,
         Assignment = 1,
         Rejected = 2,
+        AbandonedBeforeSend = 3,
     }
 
     private enum AcquisitionState

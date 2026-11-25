@@ -12,7 +12,10 @@ namespace Knightfall.ScaleSet.Aws.GitHub;
 
 public sealed class GitHubListenerDeliveryHandler : IScaleSetListenerDeliveryHandler
 {
+    private const int MaximumWarmRunnerChecks = 16;
     private static readonly TimeSpan DemandFreshness = TimeSpan.FromMinutes(10);
+    private static readonly TimeSpan WarmReadinessBudget = TimeSpan.FromSeconds(5);
+    private static readonly TimeSpan WarmReadinessFreshness = TimeSpan.FromSeconds(10);
     private static readonly ImmutableHashSet<long> NoAcceptedRequests = ImmutableHashSet<long>.Empty;
 
     private readonly DynamoDbLifecycleStore _store;
@@ -22,11 +25,20 @@ public sealed class GitHubListenerDeliveryHandler : IScaleSetListenerDeliveryHan
     private readonly TimeProvider _timeProvider;
     private readonly bool _releaseOnAssignment;
     private readonly ListenerDeliveryLedger _ledger;
+    private readonly GitHubScaleSetConnection? _runnerConnection;
 
     public GitHubListenerDeliveryHandler(
         DynamoDbLifecycleStore store, OwnedSessionFence owned, IMessageSessionClient session,
         Func<CancellationToken, Task<ListenerCapacity>> readCapacity, TimeProvider? timeProvider = null,
         bool releaseOnAssignment = false)
+        : this(store, owned, session, readCapacity, timeProvider, releaseOnAssignment, runnerConnection: null)
+    {
+    }
+
+    internal GitHubListenerDeliveryHandler(
+        DynamoDbLifecycleStore store, OwnedSessionFence owned, IMessageSessionClient session,
+        Func<CancellationToken, Task<ListenerCapacity>> readCapacity, TimeProvider? timeProvider,
+        bool releaseOnAssignment, GitHubScaleSetConnection? runnerConnection)
     {
         ArgumentNullException.ThrowIfNull(store);
         ArgumentNullException.ThrowIfNull(owned);
@@ -38,7 +50,8 @@ public sealed class GitHubListenerDeliveryHandler : IScaleSetListenerDeliveryHan
         _readCapacity = readCapacity;
         _timeProvider = timeProvider ?? TimeProvider.System;
         _releaseOnAssignment = releaseOnAssignment;
-        _ledger = new ListenerDeliveryLedger(store, owned);
+        _ledger = new ListenerDeliveryLedger(store, owned, _timeProvider);
+        _runnerConnection = runnerConnection;
     }
 
     public async Task<int> ReadPollCapacityAsync(CancellationToken cancellationToken)
@@ -113,7 +126,7 @@ public sealed class GitHubListenerDeliveryHandler : IScaleSetListenerDeliveryHan
             receipt = await RequireReceiptAsync(messageId, receipt.Value.Digest, cancellationToken).ConfigureAwait(false);
         }
 
-        return await HandleOffersAsync(receipt, messageId, facts.OfferedIds, cancellationToken).ConfigureAwait(false);
+        return await HandleOffersAsync(receipt, delivery, facts.OfferedIds, cancellationToken).ConfigureAwait(false);
     }
 
     public Task<bool> ConfirmDefinitiveRejectionAsync(
@@ -121,8 +134,9 @@ public sealed class GitHubListenerDeliveryHandler : IScaleSetListenerDeliveryHan
         _ledger.ConfirmDefinitiveRejectionAsync(requestId, attemptId, evidenceId, cancellationToken);
 
     private async Task<ScaleSetListenerDeliveryDisposition> HandleOffersAsync(
-        Entry<MessageReceipt> receipt, long messageId, ImmutableArray<long> offeredIds, CancellationToken cancellationToken)
+        Entry<MessageReceipt> receipt, ScaleSetListenerDelivery delivery, ImmutableArray<long> offeredIds, CancellationToken cancellationToken)
     {
+        long messageId = delivery.Message!.MessageId;
         if (receipt.Value.Admission is { } recorded)
         {
             if (recorded.OutcomeRecorded)
@@ -138,19 +152,34 @@ public sealed class GitHubListenerDeliveryHandler : IScaleSetListenerDeliveryHan
         {
             return ScaleSetListenerDeliveryDisposition.Deferred;
         }
-        int allowance = IsCurrent(basis.Demand?.Value)
-            ? (int)Math.Max(0L, (long)basis.Capacity.Maximum - basis.Capacity.OutsideAssigned - basis.Demand!.Value.TotalAssignedJobs) : 0;
-        var attempt = await _ledger.ReserveAsync(receipt, messageId, offeredIds, allowance, basis.Guards, cancellationToken)
+        int allowance = 0;
+        WarmAdmissionCredit? warm = null;
+        if (IsCurrent(basis.Demand?.Value) && !offeredIds.IsEmpty)
+        {
+            int assigned = basis.Demand!.Value.TotalAssignedJobs;
+            var credit = await ReadWarmCreditAsync(basis, receipt.Value, delivery, cancellationToken).ConfigureAwait(false);
+            if (IsCurrent(basis.Demand.Value))
+            {
+                long spare = (long)basis.Capacity.Maximum - basis.Capacity.OutsideAssigned - assigned;
+                allowance = (int)Math.Max(0L, spare);
+                if (credit is not null)
+                {
+                    int additional = (int)Math.Max(0L, spare + credit.Count) - allowance;
+                    warm = additional > 0 ? credit with { Count = additional } : null;
+                }
+            }
+        }
+        var reservation = await _ledger.ReserveAsync(receipt, messageId, offeredIds, allowance, warm, basis.Guards, cancellationToken)
             .ConfigureAwait(false);
-        GitHubListenerDiagnostics.Count("admission-reserve", attempt switch
+        GitHubListenerDiagnostics.Count("admission-reserve", reservation switch
         {
             null => "deferred",
-            { Request.RequestIds.IsEmpty: true } => "no_capacity",
+            { Attempt.Request.RequestIds.IsEmpty: true } => "no_capacity",
             _ => "reserved",
         });
-        if (attempt?.Request.RequestIds.IsEmpty != false)
+        if (reservation is not { Attempt.Request.RequestIds.IsEmpty: false })
         {
-            return Disposition(attempt is not null);
+            return Disposition(reservation is not null);
         }
 
         // Only the caller that received the successful reservation commit can reach the wire.
@@ -160,6 +189,15 @@ public sealed class GitHubListenerDeliveryHandler : IScaleSetListenerDeliveryHan
             return ScaleSetListenerDeliveryDisposition.Deferred;
         }
         cancellationToken.ThrowIfCancellationRequested();
+        if (reservation.WarmValidThrough <= _timeProvider.GetUtcNow())
+        {
+            receipt = await RequireReceiptAsync(messageId, receipt.Value.Digest, cancellationToken).ConfigureAwait(false);
+            var abandoned = await _ledger.SettleAttemptAsync(receipt, messageId, NoAcceptedRequests, cancellationToken,
+                abandonedBeforeSend: true).ConfigureAwait(false);
+            GitHubListenerDiagnostics.Count("admission-settle", GitHubListenerDiagnostics.WriteOutcome(abandoned));
+            return Disposition(abandoned == LifecycleWriteOutcome.Committed);
+        }
+        var attempt = reservation.Attempt;
         var accepted = NoAcceptedRequests;
         GitHubOperationException? cooldown = null;
         using (var telemetry = GitHubListenerDiagnostics.Start("acquire", _timeProvider, CancellationToken.None))
@@ -194,6 +232,79 @@ public sealed class GitHubListenerDeliveryHandler : IScaleSetListenerDeliveryHan
             throw cooldown;
         }
         return Disposition(settled == LifecycleWriteOutcome.Committed);
+    }
+
+    private async Task<WarmAdmissionCredit?> ReadWarmCreditAsync(AdmissionBasis basis, MessageReceipt receipt, ScaleSetListenerDelivery delivery,
+        CancellationToken cancellationToken)
+    {
+        var message = delivery.Message!;
+        var capacity = basis.Capacity;
+        if (_runnerConnection is null || capacity.WarmCandidates.IsDefaultOrEmpty || capacity.OutsideAssigned > capacity.Maximum ||
+            basis.Demand?.Value is not { } demand || capacity.Maximum <= demand.TotalAssignedJobs ||
+            demand.MessageId != message.MessageId || demand.ObservedAt != delivery.ObservedAt || receipt.ObservedAt != delivery.ObservedAt ||
+            message.Statistics?.TotalAssignedJobs != demand.TotalAssignedJobs)
+        {
+            return null;
+        }
+
+        var confirmed = new Dictionary<long, (LifecycleRecordCondition Guard, DateTimeOffset ValidThrough)>();
+        int count = capacity.WarmCandidates.Length;
+        int start = (int)(message.MessageId % count);
+        using var timeout = new CancellationTokenSource(WarmReadinessBudget, _timeProvider);
+        using var bounded = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, timeout.Token);
+        try
+        {
+            // A bounded check window moves with the delivery cursor so a large pool can expose later candidates.
+            for (int offset = 0; offset < Math.Min(count, MaximumWarmRunnerChecks); offset++)
+            {
+                bounded.Token.ThrowIfCancellationRequested();
+                var candidate = capacity.WarmCandidates[(int)(((long)start + offset) % count)];
+                if (candidate.ValidThrough <= _timeProvider.GetUtcNow() ||
+                    await _store.ReadWarmFargateHandoffAsync(candidate.Executor, _owned.Identity, bounded.Token)
+                        .ConfigureAwait(false) is not { RunnerId: long runnerId } handoff)
+                {
+                    continue;
+                }
+
+                var startedAt = _timeProvider.GetUtcNow();
+                if (!await _runnerConnection.IsExactRunnerAvailableAsync(_owned.Identity.ScopeIdentity, _owned.Identity.ScaleSetId,
+                    handoff.RunnerName, runnerId, bounded.Token).ConfigureAwait(false))
+                {
+                    continue;
+                }
+                var key = LifecycleKey.Handoff(_owned.Identity.Profile, handoff.Identity.AllocationId);
+                var readyThrough = Deadline(startedAt, WarmReadinessFreshness);
+                var validThrough = candidate.ValidThrough < readyThrough ? candidate.ValidThrough : readyThrough;
+                if (!confirmed.TryAdd(runnerId, (new LifecycleRecordCondition(key, handoff.Revision), validThrough)))
+                {
+                    return null;
+                }
+            }
+        }
+        catch (OperationCanceledException) when (timeout.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
+        {
+            // Previous exact witnesses can still apply within their individual freshness bounds.
+        }
+
+        cancellationToken.ThrowIfCancellationRequested();
+        var now = _timeProvider.GetUtcNow();
+        var current = confirmed.Values.Where(candidate => candidate.ValidThrough > now).ToArray();
+        if (current.Length == 0 || current.Length > capacity.OutsideAssigned ||
+            current.Any(candidate => basis.Guards.TryGetValue(candidate.Guard.Key, out var revision) &&
+            revision != candidate.Guard.ExpectedRevision))
+        {
+            return null;
+        }
+        var currentDeadline = current.Min(candidate => candidate.ValidThrough);
+        var demandDeadline = Deadline(demand.ObservedAt, DemandFreshness);
+        return new WarmAdmissionCredit(current.Length, currentDeadline < demandDeadline ? currentDeadline : demandDeadline,
+            current.Select(candidate => candidate.Guard).ToArray());
+    }
+
+    private static DateTimeOffset Deadline(DateTimeOffset observedAt, TimeSpan freshness)
+    {
+        var utc = observedAt.ToUniversalTime();
+        return DateTimeOffset.MaxValue - utc < freshness ? DateTimeOffset.MaxValue : utc + freshness;
     }
 
     private async Task<AdmissionBasis?> ReadBasisAsync(CancellationToken cancellationToken)

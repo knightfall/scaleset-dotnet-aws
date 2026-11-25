@@ -37,13 +37,20 @@ public sealed partial class DynamoDbLifecycleStore
         IReadOnlyList<LifecycleRecordCondition>? readGuards = null) =>
         WriteSessionRecordsCoreAsync(fence, transitionId, writes, readGuards, null, cancellationToken);
 
+    /// <summary>Commits exact reservations under the active session and open profile catalog fences.</summary>
+    public Task<LifecycleWriteOutcome> WriteSessionReservationAsync(OwnedSessionFence fence, Guid transitionId,
+        IReadOnlyList<LifecycleRecordWrite> writes, IReadOnlyList<LifecycleRecordCondition> readGuards,
+        CancellationToken cancellationToken) =>
+        WriteSessionRecordsCoreAsync(fence, transitionId, writes, readGuards, null, cancellationToken, requireOpenCatalog: true);
+
     private async Task<LifecycleWriteOutcome> WriteSessionRecordsCoreAsync(
         OwnedSessionFence fence,
         Guid transitionId,
         IReadOnlyList<LifecycleRecordWrite> writes,
         IReadOnlyList<LifecycleRecordCondition>? readGuards,
         IReadOnlyList<TransactionAction>? executorActions,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        bool requireOpenCatalog = false)
     {
         RequireSessionFence(fence);
         ArgumentNullException.ThrowIfNull(writes);
@@ -92,7 +99,7 @@ public sealed partial class DynamoDbLifecycleStore
             RequireSessionRecordKey(fence, write.Key, readOnly: false);
             actions.Add(BuildRecordWrite(fence.Lease.Deployment, transitionId, write));
         }
-        if (writes.Any(write => write is { Key.Kind: LifecycleItemKind.Acquisition, ExpectedRevision: null }))
+        if (requireOpenCatalog || writes.Any(write => write is { Key.Kind: LifecycleItemKind.Acquisition, ExpectedRevision: null }))
         {
             var catalog = await ReadCatalogProfileAsync(profile, cancellationToken).ConfigureAwait(false);
             if (catalog is not null && (catalog.State != CatalogProfileState.Active ||
@@ -275,7 +282,8 @@ public sealed partial class DynamoDbLifecycleStore
             LifecycleItemKind.Checkpoint => key == LifecycleKey.Checkpoint(identity.Profile, identity.SessionId),
             LifecycleItemKind.Message => key.SortKey.StartsWith($"MSG#{identity.SessionId:D}#", StringComparison.Ordinal),
             LifecycleItemKind.Demand or LifecycleItemKind.Admission or LifecycleItemKind.Job or LifecycleItemKind.Acquisition => true,
-            LifecycleItemKind.Effects or LifecycleItemKind.Runner or LifecycleItemKind.RunnerIdentity or LifecycleItemKind.RunnerInventory => readOnly,
+            LifecycleItemKind.Effects or LifecycleItemKind.Runner or LifecycleItemKind.RunnerIdentity or LifecycleItemKind.RunnerInventory or
+                LifecycleItemKind.Handoff => readOnly,
             _ => false,
         };
         if (!valid)

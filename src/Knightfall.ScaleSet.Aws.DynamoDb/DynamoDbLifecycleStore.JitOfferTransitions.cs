@@ -9,6 +9,34 @@ namespace Knightfall.ScaleSet.Aws.DynamoDb;
 
 public sealed partial class DynamoDbLifecycleStore
 {
+    /// <summary>Reads exact Fargate handoff evidence for an already-issued offer whose ciphertext is no longer present.</summary>
+    public async Task<JitHandoffSnapshot?> ReadWarmFargateHandoffAsync(ExecutorSnapshot executor, SessionIdentity session,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(executor);
+        ArgumentNullException.ThrowIfNull(session);
+        var binding = executor.Binding;
+        if (binding.Profile != session.Profile || binding.Provider is not FargateExecutorIdentity ||
+            executor.State is not { RunnerId: > 0, HasConflict: false, AdmissionClosure: null, Job: null, Process: null,
+                Resource.State: ExecutorResourceState.Running })
+        {
+            return null;
+        }
+
+        var handoff = await ReadJitHandoffAsync(binding.Profile, Guid.ParseExact(binding.AllocationId, "D"), cancellationToken)
+            .ConfigureAwait(false);
+        if (handoff is not { State: JitHandoffState.Offered, RunnerId: > 0 } || handoff.RunnerId != executor.State.RunnerId ||
+            !MatchesJitExecutor(executor, handoff.Identity) || handoff.Identity.ScopeIdentity != session.ScopeIdentity ||
+            handoff.Identity.ScaleSetId != session.ScaleSetId)
+        {
+            return null;
+        }
+
+        // Only the matching runner can consume the exact offer. Absence alone can also mean expiry.
+        var offer = await ReadItemAsync(LifecycleKey.Offer(handoff.Identity.AwsUserId), cancellationToken).ConfigureAwait(false);
+        return offer is null ? handoff : null;
+    }
+
     public async Task<JitHandoffChange> PublishJitHandoffAsync(
         ControllerLease lease, CatalogProfile catalog, JitHandoffSnapshot handoff, EffectJournalSnapshot attempt,
         long runnerId, JitOfferEnvelope offer, CancellationToken cancellationToken)
