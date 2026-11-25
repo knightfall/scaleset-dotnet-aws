@@ -10,7 +10,7 @@ try {
   const { config, generation, telemetry, encryption } = deploymentArguments(
     process.argv.slice(2),
   );
-  const compiled = compileConfig(readFileSync(config, "utf8"));
+  const compiled = compileConfig(readFileSync(config));
   synthesizeController(compiled, generation, undefined, {
     fargatePreflight: process.env[fargatePreflightEnvironmentName],
     telemetry: readControllerTelemetry(telemetry, compiled.runtime.spec.aws),

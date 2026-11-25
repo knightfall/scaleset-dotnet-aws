@@ -69,131 +69,160 @@ function deployment(
   const pendingChecks = [...checks];
   let template: Template | undefined;
   let changeSetId: string | undefined;
+  let changeSetName: string | undefined;
+  let completed = false;
   const ok = (value: object = {}): CommandResult => ({
     status: 0,
     stdout: JSON.stringify(value),
     stderr: "",
   });
-  const run = () =>
-    deployController(
-      {
-        compiled: candidate,
-        generation: "2",
-      },
-      (program, args) => {
-        const option = (name: string) => {
-          const index = args.indexOf(name);
-          assert.ok(index >= 0 && index + 1 < args.length, name);
-          return args[index + 1];
-        };
-        if (program === "dotnet") {
-          steps.push("retire");
-          assert.deepEqual(
-            args.slice(args.indexOf("--") + 1, args.indexOf("--") + 3),
-            ["preflight", "retire"],
-          );
-          assert.equal(option("--current-generation"), "1");
-          assert.equal(option("--generation"), "2");
-          assert.equal(option("--current-sha256"), prior.sha256);
-          assert.equal(option("--sha256"), candidate.sha256);
-          assert.equal(
-            readFileSync(option("--current-config"), "utf8"),
-            prior.json,
-          );
-          assert.equal(
-            readFileSync(option("--config"), "utf8"),
-            candidate.json,
-          );
-          const check = pendingChecks.shift();
-          assert.ok(check);
-          return check === "verified"
-            ? ok()
-            : {
-                status: 1,
-                stdout: "",
-                stderr: "retirement-required",
-              };
-        }
-        if (program === process.execPath) {
-          steps.push("prepare");
-          assert.equal(option("--method"), "prepare-change-set");
-          const outdir = option("--app");
-          const asset = readdirSync(outdir).find((name) =>
-            /^asset\..+\.json$/u.test(name),
-          );
-          assert.ok(asset);
-          assert.equal(
-            readFileSync(join(outdir, asset), "utf8"),
-            candidate.json,
-          );
-          template = Template.fromJSON(
-            JSON.parse(
-              readFileSync(join(outdir, "Controller.template.json"), "utf8"),
-            ),
-          );
-          template.hasOutput("RuntimeConfigSha256", {
-            Value: candidate.sha256,
-          });
-          template.hasOutput("DeploymentGeneration", { Value: "2" });
-          return ok();
-        }
-
-        assert.equal(program, "aws");
-        assert.equal(option("--region"), region);
-        const operation = args[6];
-        steps.push(operation);
-        switch (operation) {
-          case "get-caller-identity":
-            return ok({ Account: account });
-          case "describe-stacks": {
-            assert.equal(option("--stack-name"), stackName);
-            const outputs = {
-              DeploymentIdentity: deploymentIdentity(prior.runtime),
-              TrackingTableName: trackingTableName(prior.runtime),
-              RuntimeConfigUri: `s3://fixture-assets/runtime/${prior.sha256}.json`,
-              RuntimeConfigVersionId: version,
-              RuntimeConfigSha256: prior.sha256,
-              DeploymentGeneration: "1",
-            };
-            return ok({
-              Stacks: [
-                {
-                  StackName: stackName,
-                  StackId: stackId,
-                  StackStatus: "UPDATE_COMPLETE",
-                  Outputs: Object.entries(outputs).map(
-                    ([OutputKey, OutputValue]) => ({ OutputKey, OutputValue }),
-                  ),
-                },
-              ],
-            });
+  const run = () => {
+    const recovery = mkdtempSync(join(tmpdir(), "scaleset-transition-state-"));
+    try {
+      deployController(
+        {
+          compiled: candidate,
+          generation: "2",
+        },
+        (program, args) => {
+          const option = (name: string) => {
+            const index = args.indexOf(name);
+            assert.ok(index >= 0 && index + 1 < args.length, name);
+            return args[index + 1];
+          };
+          if (program === "dotnet") {
+            steps.push("retire");
+            assert.deepEqual(
+              args.slice(args.indexOf("--") + 1, args.indexOf("--") + 3),
+              ["preflight", "retire"],
+            );
+            assert.equal(option("--current-generation"), "1");
+            assert.equal(option("--generation"), "2");
+            assert.equal(option("--current-sha256"), prior.sha256);
+            assert.equal(option("--sha256"), candidate.sha256);
+            assert.equal(
+              readFileSync(option("--current-config"), "utf8"),
+              prior.json,
+            );
+            assert.equal(
+              readFileSync(option("--config"), "utf8"),
+              candidate.json,
+            );
+            const check = pendingChecks.shift();
+            assert.ok(check);
+            return check === "verified"
+              ? ok()
+              : {
+                  status: 1,
+                  stdout: "",
+                  stderr: "retirement-required",
+                };
           }
-          case "get-object":
-            assert.equal(option("--version-id"), version);
-            assert.equal(option("--expected-bucket-owner"), account);
-            writeFileSync(args.at(-1)!, prior.json);
-            return ok({ VersionId: version });
-          case "describe-change-set":
-            assert.equal(option("--stack-name"), stackName);
-            changeSetId = `${scope}:changeSet/${option("--change-set-name")}/fixture-set`;
-            return ok({
-              Status: "CREATE_COMPLETE",
-              ExecutionStatus: "AVAILABLE",
-              StackId: stackId,
-              ChangeSetId: changeSetId,
+          if (program === process.execPath) {
+            steps.push("prepare");
+            assert.equal(option("--method"), "prepare-change-set");
+            changeSetName = option("--change-set-name");
+            changeSetId = `${scope}:changeSet/${changeSetName}/fixture-set`;
+            const outdir = option("--app");
+            const asset = readdirSync(outdir).find((name) =>
+              /^asset\..+\.json$/u.test(name),
+            );
+            assert.ok(asset);
+            assert.equal(
+              readFileSync(join(outdir, asset), "utf8"),
+              candidate.json,
+            );
+            template = Template.fromJSON(
+              JSON.parse(
+                readFileSync(join(outdir, "Controller.template.json"), "utf8"),
+              ),
+            );
+            template.hasOutput("RuntimeConfigSha256", {
+              Value: candidate.sha256,
             });
-          case "execute-change-set":
-            assert.equal(option("--change-set-name"), changeSetId);
+            template.hasOutput("DeploymentGeneration", { Value: "2" });
             return ok();
-          case "wait":
-            assert.ok(args.includes("stack-update-complete"));
-            assert.equal(option("--stack-name"), stackId);
-            return ok();
-          default:
-            assert.fail(`Unexpected deployment call ${args.join(" ")}`);
-        }
-      },
-    );
+          }
+
+          assert.equal(program, "aws");
+          assert.equal(option("--region"), region);
+          const operation = args[6];
+          steps.push(operation);
+          switch (operation) {
+            case "get-caller-identity":
+              return ok({ Account: account });
+            case "describe-stacks": {
+              assert.equal(option("--stack-name"), stackName);
+              const outputs = {
+                DeploymentIdentity: deploymentIdentity(prior.runtime),
+                TrackingTableName: trackingTableName(prior.runtime),
+                RuntimeConfigUri: `s3://fixture-assets/runtime/${completed ? candidate.sha256 : prior.sha256}.json`,
+                RuntimeConfigVersionId: version,
+                RuntimeConfigSha256: completed
+                  ? candidate.sha256
+                  : prior.sha256,
+                DeploymentGeneration: completed ? "2" : "1",
+              };
+              return ok({
+                Stacks: [
+                  {
+                    StackName: stackName,
+                    StackId: stackId,
+                    StackStatus: "UPDATE_COMPLETE",
+                    Outputs: Object.entries(outputs).map(
+                      ([OutputKey, OutputValue]) => ({
+                        OutputKey,
+                        OutputValue,
+                      }),
+                    ),
+                  },
+                ],
+              });
+            }
+            case "get-object":
+              assert.equal(option("--version-id"), version);
+              assert.equal(option("--expected-bucket-owner"), account);
+              writeFileSync(args.at(-1)!, prior.json);
+              return ok({ VersionId: version });
+            case "describe-change-set":
+              assert.equal(option("--stack-name"), stackId);
+              assert.ok(
+                [changeSetName, changeSetId].includes(
+                  option("--change-set-name"),
+                ),
+              );
+              return ok({
+                Status: "CREATE_COMPLETE",
+                ExecutionStatus: "AVAILABLE",
+                StackId: stackId,
+                StackName: stackName,
+                ChangeSetId: changeSetId,
+              });
+            case "get-template":
+              assert.ok(template);
+              return ok({ TemplateBody: template.toJSON() });
+            case "delete-change-set":
+              assert.equal(option("--stack-name"), stackId);
+              assert.equal(option("--change-set-name"), changeSetId);
+              return ok();
+            case "execute-change-set":
+              assert.equal(option("--change-set-name"), changeSetId);
+              return ok();
+            case "wait":
+              assert.ok(args.includes("stack-update-complete"));
+              assert.equal(option("--stack-name"), stackId);
+              completed = true;
+              return ok();
+            default:
+              assert.fail(`Unexpected deployment call ${args.join(" ")}`);
+          }
+        },
+        recovery,
+      );
+    } finally {
+      rmSync(recovery, { recursive: true, force: true });
+    }
+  };
   return {
     run,
     steps,
@@ -210,10 +239,15 @@ const approvedUpdate = [
   ...currentRead,
   "retire",
   "prepare",
+  "describe-stacks",
   "describe-change-set",
+  "get-template",
+  "describe-stacks",
   "retire",
   "execute-change-set",
   "wait",
+  "describe-stacks",
+  "get-template",
 ];
 
 interface Statement {
@@ -545,8 +579,14 @@ test("the exact retirement preflight blocks premature removal before preparation
     ...currentRead,
     "retire",
     "prepare",
+    "describe-stacks",
     "describe-change-set",
+    "get-template",
+    "describe-stacks",
     "retire",
+    "describe-stacks",
+    "describe-change-set",
+    "delete-change-set",
   ]);
 });
 

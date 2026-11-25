@@ -21,7 +21,7 @@ export function generationValue(value: string): bigint {
   return generation;
 }
 
-export function deploymentArguments(argv: string[]) {
+export function deploymentArguments(argv: string[], allowResume = false) {
   const { values } = parseArgs({
     args: argv,
     options: {
@@ -29,6 +29,7 @@ export function deploymentArguments(argv: string[]) {
       generation: { type: "string" },
       telemetry: { type: "string" },
       encryption: { type: "string" },
+      ...(allowResume ? { resume: { type: "string" } as const } : {}),
     },
   });
   if (!values.config || !values.generation) {
@@ -42,6 +43,7 @@ export function deploymentArguments(argv: string[]) {
     generation: values.generation,
     telemetry: values.telemetry,
     encryption: values.encryption,
+    resume: typeof values.resume === "string" ? values.resume : undefined,
   };
 }
 
@@ -53,7 +55,11 @@ export function trackingTableName(runtime: RunnerControllerRuntime): string {
 }
 
 export function controllerStackName(runtime: RunnerControllerRuntime): string {
-  return `${runtime.metadata.name}-runner-controller`;
+  const name = `${runtime.metadata.name}-runner-controller`;
+  if (!/^[A-Za-z][A-Za-z0-9-]{0,127}$/u.test(name)) {
+    throw new Error("The derived CloudFormation stack name is invalid.");
+  }
+  return name;
 }
 
 export function deploymentIdentity(runtime: RunnerControllerRuntime): string {

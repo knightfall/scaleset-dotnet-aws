@@ -538,8 +538,10 @@ test("the synth CLI consumes an explicit telemetry document and ignores ambient 
   }
 });
 
-test("the protected deploy prepares a candidate with the same validated telemetry and runtime bytes", () => {
+test("the protected deploy prepares a candidate with the same validated telemetry and runtime bytes", (context) => {
   const invocations: string[] = [];
+  const recovery = mkdtempSync(join(tmpdir(), "scaleset-telemetry-state-"));
+  context.after(() => rmSync(recovery, { recursive: true, force: true }));
   assert.throws(
     () =>
       deployController(
@@ -576,7 +578,7 @@ test("the protected deploy prepares a candidate with the same validated telemetr
           if (args.includes("describe-stacks")) {
             invocations.push("stack");
             return {
-              status: 255,
+              status: 254,
               stdout: "",
               stderr: `An error occurred (ValidationError) when calling the DescribeStacks operation: Stack with id ${controllerStackName(compiled.runtime)} does not exist`,
             };
@@ -584,14 +586,15 @@ test("the protected deploy prepares a candidate with the same validated telemetr
           assert.ok(args.includes("describe-table"));
           invocations.push("table");
           return {
-            status: 255,
+            status: 254,
             stdout: "",
             stderr:
               "An error occurred (ResourceNotFoundException) when calling the DescribeTable operation: Not found",
           };
         },
+        recovery,
       ),
-    { message: "CDK change set preparation failed." },
+    /CDK change set preparation failed/u,
   );
   assert.deepEqual(invocations, ["identity", "stack", "table", "prepare"]);
 });

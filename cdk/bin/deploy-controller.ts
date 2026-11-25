@@ -8,10 +8,9 @@ import { fargatePreflightEnvironmentName } from "../lib/infrastructure/fargate-p
 import { readImportedEncryption } from "../lib/infrastructure/imported-encryption.ts";
 
 try {
-  const { config, generation, telemetry, encryption } = deploymentArguments(
-    process.argv.slice(2),
-  );
-  const compiled = compileConfig(readFileSync(config, "utf8"));
+  const { config, generation, telemetry, encryption, resume } =
+    deploymentArguments(process.argv.slice(2), true);
+  const compiled = compileConfig(readFileSync(config));
   const env = Object.fromEntries(
     Object.entries(process.env).filter(
       ([name]) =>
@@ -26,6 +25,7 @@ try {
     {
       compiled,
       generation,
+      resume,
       fargatePreflight: process.env[fargatePreflightEnvironmentName],
       telemetry: readControllerTelemetry(telemetry, compiled.runtime.spec.aws),
       encryption: readImportedEncryption(encryption),

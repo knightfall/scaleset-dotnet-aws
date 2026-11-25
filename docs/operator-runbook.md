@@ -132,6 +132,22 @@ npm --prefix cdk run deploy:controller -- \
   --config "$source_yaml" --generation "$generation" --telemetry "$telemetry_json"
 ```
 
+### Recover an interrupted apply
+
+Use AWS CLI v2 and the same reviewed YAML, generation, and optional deployment inputs for recovery. Deployment names start with an ASCII letter and contain at most 110 letters, digits or hyphens so the derived CloudFormation name fits its 128-character limit. Deploy, synth and runtime emission all require valid UTF-8. [CloudFormation stack names](https://docs.aws.amazon.com/AWSCloudFormation/latest/APIReference/API_CreateStack.html) · [AWS CLI return codes](https://docs.aws.amazon.com/cli/latest/userguide/cli-usage-returncodes.html)
+
+Before preparing a change set, the command writes a private recovery record under `~/.local/state/scaleset-dotnet-aws/deployments`. It identifies the reviewed runtime and synthesized template, the previously observed stack revision, and the attempted change set. A failed command reports the record path. After an abrupt stop, inspect the records in that directory and select the matching deployment identity, generation and digest. Resume one matching operation at a time. Include the original `--encryption` option if the deployment used one.
+
+```sh
+npm --prefix cdk run deploy:controller -- \
+  --config "$source_yaml" --generation "$generation" --telemetry "$telemetry_json" \
+  --resume "$recovery_record"
+```
+
+The command checks the exact CloudFormation stack and change set IDs and reads the proposed template back before execution. It reruns retirement or fresh-table checks and imported-key verification immediately before executing. A denied check can discard only the verified unexecuted change set. A retry can reuse its exact `REVIEW_IN_PROGRESS` stack. A lost execution reply leaves the record for reconciliation. Recovery uses the original execute token, and success requires the exact deployed template, generation and versioned runtime after the waiter. CloudFormation may invalidate other pending change sets once one update executes. [CloudFormation change set execution](https://docs.aws.amazon.com/AWSCloudFormation/latest/APIReference/API_ExecuteChangeSet.html)
+
+An unmatched review stack or replacement stack holds the operation. For an orphan without its recovery record, coordinate all writers before recovery. Use the exact stack ARN to inspect its state, all change sets and provisioned resources, and correlate the original operation in CloudTrail. Keep the stack on hold if ownership, emptiness or exclusive control is uncertain. Handle any separately authorized empty-stack removal through CloudFormation using the verified ARN. Validate the provider's review, cleanup and rollback behavior in the intended account and Region before relying on recovery in production. [CloudFormation stack review](https://docs.aws.amazon.com/AWSCloudFormation/latest/APIReference/API_CreateChangeSet.html) · [CloudFormation change set deletion](https://docs.aws.amazon.com/AWSCloudFormation/latest/APIReference/API_DeleteChangeSet.html)
+
 ### Verify the deployment
 
 1. Compare `DeploymentIdentity`, `TrackingTableName`, `RuntimeConfigUri`, `RuntimeConfigVersionId`, `RuntimeConfigSha256`, and `DeploymentGeneration` in the stack outputs to the recorded inputs. Confirm that ECS selected the expected task definition, image digest, and healthy task. Check the exact prior task ARN if the deployment replaced a controller.

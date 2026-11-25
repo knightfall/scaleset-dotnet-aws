@@ -1,9 +1,15 @@
-import { createHash, randomUUID } from "node:crypto";
+import { createHash } from "node:crypto";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { compileConfig, validateRuntime } from "../config/compiler.ts";
+import { isDeepStrictEqual } from "node:util";
+import {
+  compileConfig,
+  decodeConfiguration,
+  validateRuntime,
+} from "../config/compiler.ts";
+import { awsPartition } from "../config/semantics.ts";
 import { synthesizeController } from "./controller-stack.ts";
 import { resolveControllerTelemetry } from "./controller-telemetry.ts";
 import {
@@ -13,6 +19,16 @@ import {
   trackingTableName,
 } from "./deployment-input.ts";
 import type { ControllerDeploymentEnvironment } from "./deployment-input.ts";
+import {
+  decide,
+  finishAttempt,
+  newChangeSetName,
+  readAttempt,
+  readDecision,
+  recoveryFile,
+  saveAttempt,
+} from "./deployment-recovery.ts";
+import type { DeploymentAttempt } from "./deployment-recovery.ts";
 import { validateFargatePreflight } from "./fargate-preflight.ts";
 import { resolveImportedEncryption } from "./imported-encryption.ts";
 import {
@@ -34,6 +50,7 @@ type RunCommand = (program: string, args: string[]) => CommandResult;
 interface DeploymentTarget extends ControllerDeploymentEnvironment {
   readonly compiled: Compiled;
   readonly generation: string;
+  readonly resume?: string;
 }
 
 const cdkCli = fileURLToPath(
@@ -52,6 +69,8 @@ const stableStackStatuses = new Set([
   "IMPORT_COMPLETE",
   "IMPORT_ROLLBACK_COMPLETE",
 ]);
+const runtimeObjectUri =
+  /^s3:\/\/([a-z0-9.-]+)\/(runtime\/[0-9a-f]{64}\.json)$/u;
 
 function object(value: unknown): ObjectProperties {
   if (typeof value !== "object" || value === null || Array.isArray(value)) {
@@ -91,18 +110,64 @@ function stackScope(
   return (
     parts.length === 6 &&
     parts[0] === "arn" &&
-    /^aws(?:-[a-z0-9-]+)?$/u.test(parts[1]) &&
+    parts[1] === awsPartition(region) &&
     parts[2] === "cloudformation" &&
     parts[3] === region &&
     parts[4] === account &&
     parts[5].startsWith(`stack/${name}/`) &&
-    parts[5].length > name.length + 7
+    /^[a-zA-Z0-9-]+$/u.test(parts[5].slice(name.length + 7))
+  );
+}
+
+function serviceError(result: CommandResult, code: string, operation: string) {
+  const message = result.stderr.trim();
+  const prefix = `An error occurred (${code}) when calling the ${operation} operation: `;
+  return result.status === 254 &&
+    result.stdout.trim() === "" &&
+    !/[\r\n]/u.test(message) &&
+    message.startsWith(prefix) &&
+    message.length > prefix.length
+    ? message.slice(prefix.length)
+    : undefined;
+}
+
+function stackOutputs(stack: ObjectProperties): Map<string, string> {
+  const outputs = new Map<string, string>();
+  for (const output of rows(stack.Outputs)) {
+    const key = field(output, "OutputKey");
+    if (outputs.has(key)) {
+      throw new Error("The current stack has duplicate output keys.");
+    }
+    outputs.set(key, field(output, "OutputValue"));
+  }
+  return outputs;
+}
+
+function stableStackEvidence(stack: ObjectProperties): string {
+  return createHash("sha256")
+    .update(
+      JSON.stringify([
+        stack.StackId,
+        stack.StackStatus,
+        stack.LastUpdatedTime,
+        [...stackOutputs(stack)].sort(),
+      ]),
+    )
+    .digest("hex");
+}
+
+function reviewPlaceholder(stack: ObjectProperties): boolean {
+  return (
+    stack.StackStatus === "REVIEW_IN_PROGRESS" &&
+    (stack.Outputs === undefined ||
+      (Array.isArray(stack.Outputs) && stack.Outputs.length === 0))
   );
 }
 
 export function deployController(
   target: DeploymentTarget,
   run: RunCommand,
+  recoveryDirectory?: string,
 ): void {
   const { compiled, generation } = target;
   const runtime = compiled.runtime;
@@ -133,6 +198,108 @@ export function deployController(
   function awsObject(description: string, ...args: string[]) {
     return object(JSON.parse(commandResult(aws(...args), description)));
   }
+  function describeStack(): ObjectProperties | undefined {
+    const result = aws(
+      "cloudformation",
+      "describe-stacks",
+      "--stack-name",
+      name,
+    );
+    if (result.status !== 0) {
+      if (
+        serviceError(result, "ValidationError", "DescribeStacks") ===
+        `Stack with id ${name} does not exist`
+      ) {
+        return undefined;
+      }
+      throw new Error(
+        "Could not establish whether the deployment stack already exists.",
+      );
+    }
+    const stacks = rows(object(JSON.parse(result.stdout)).Stacks);
+    if (
+      stacks.length !== 1 ||
+      stacks[0].StackName !== name ||
+      !stackScope(field(stacks[0], "StackId"), account, region, name)
+    ) {
+      throw new Error(
+        "The current stack identity differs from the compiled deployment.",
+      );
+    }
+    return stacks[0];
+  }
+
+  function describeChangeSet(
+    stack: ObjectProperties,
+    attempt: DeploymentAttempt,
+  ): ObjectProperties | undefined {
+    const stackId = field(stack, "StackId");
+    if (attempt.stackId !== null && attempt.stackId !== stackId) {
+      throw new Error(
+        "The recovery record belongs to a different stack identity.",
+      );
+    }
+    const result = aws(
+      "cloudformation",
+      "describe-change-set",
+      "--stack-name",
+      stackId,
+      "--change-set-name",
+      attempt.changeSetId ?? attempt.name,
+    );
+    if (
+      serviceError(result, "ChangeSetNotFound", "DescribeChangeSet") !==
+      undefined
+    ) {
+      return undefined;
+    }
+    const change = object(
+      JSON.parse(commandResult(result, "Prepared change set verification")),
+    );
+    const changeSetId = field(change, "ChangeSetId");
+    const prefix = `arn:${awsPartition(region)}:cloudformation:${region}:${account}:changeSet/${attempt.name}/`;
+    if (
+      change.StackId !== stackId ||
+      change.StackName !== name ||
+      !changeSetId.startsWith(prefix) ||
+      !/^[a-zA-Z0-9-]+$/u.test(changeSetId.slice(prefix.length)) ||
+      (attempt.changeSetId !== null && attempt.changeSetId !== changeSetId)
+    ) {
+      throw new Error(
+        "The prepared CloudFormation change set targets another stack or attempt.",
+      );
+    }
+    return change;
+  }
+
+  function isApplied(
+    stack: ObjectProperties | undefined,
+    attempt: DeploymentAttempt,
+  ): boolean {
+    if (
+      stack === undefined ||
+      attempt.stackId === null ||
+      stack.StackId !== attempt.stackId ||
+      stack.StackStatus !==
+        (attempt.base === null ? "CREATE_COMPLETE" : "UPDATE_COMPLETE")
+    ) {
+      return false;
+    }
+    const outputs = stackOutputs(stack);
+    const version = outputs.get("RuntimeConfigVersionId");
+    const runtimeKey = outputs
+      .get("RuntimeConfigUri")
+      ?.match(runtimeObjectUri)?.[2];
+    return (
+      outputs.get("DeploymentIdentity") === identity &&
+      outputs.get("TrackingTableName") === table &&
+      outputs.get("RuntimeConfigSha256") === compiled.sha256 &&
+      outputs.get("DeploymentGeneration") === generation &&
+      version !== undefined &&
+      version !== "null" &&
+      runtimeKey === `runtime/${compiled.sha256}.json`
+    );
+  }
 
   if (
     awsObject("AWS caller verification", "sts", "get-caller-identity")
@@ -144,42 +311,151 @@ export function deployController(
   }
 
   const workspace = mkdtempSync(join(tmpdir(), "scaleset-deployment-"));
+  let journalPath = target.resume ? resolve(target.resume) : undefined;
   try {
     const candidateFile = join(workspace, "candidate.json");
     writeFileSync(candidateFile, compiled.json, {
       encoding: "utf8",
       mode: 0o600,
     });
-    const prior = aws(
-      "cloudformation",
-      "describe-stacks",
-      "--stack-name",
-      name,
-    );
-    let currentStackId: string | undefined;
-    let checkRetirement: (() => void) | undefined;
-    if (prior.status === 0) {
-      const stacks = rows(object(JSON.parse(prior.stdout)).Stacks);
+    const prior = describeStack();
+    let attempt = journalPath ? readAttempt(journalPath) : undefined;
+    let decision =
+      attempt && journalPath
+        ? readDecision(journalPath, attempt.name)
+        : undefined;
+    const assembly = join(workspace, "assembly");
+    const artifact = synthesizeController(compiled, generation, assembly, {
+      fargatePreflight: fargatePreflight?.environment,
+      telemetry: target.telemetry,
+      encryption,
+    });
+    const bootstrap = encryption.bootstrapAssetKeyArn
+      ? runtimeCopySource(artifact.template)
+      : undefined;
+    const checkEncryption = (assetPublished: boolean) =>
+      verifyImportedEncryption(
+        runtime,
+        encryption,
+        fargatePreflight?.quotaSource,
+        bootstrap,
+        assetPublished,
+        awsObject,
+      );
+    function templateMatches(stackId: string, changeSetId?: string): boolean {
+      const template = awsObject(
+        "CloudFormation template verification",
+        "cloudformation",
+        "get-template",
+        "--stack-name",
+        stackId,
+        "--template-stage",
+        "Original",
+        ...(changeSetId ? ["--change-set-name", changeSetId] : []),
+      ).TemplateBody;
+      return isDeepStrictEqual(
+        typeof template === "string" ? JSON.parse(template) : template,
+        artifact.template,
+      );
+    }
+    const templateSha256 = createHash("sha256")
+      .update(readFileSync(artifact.templateFullPath))
+      .digest("hex");
+    if (
+      attempt &&
+      (attempt.identity !== identity ||
+        attempt.generation !== generation ||
+        attempt.runtimeSha256 !== compiled.sha256 ||
+        attempt.templateSha256 !== templateSha256)
+    ) {
+      throw new Error(
+        "The recovery record does not match the exact reviewed deployment inputs.",
+      );
+    }
+
+    function verifyCompleted(recovery: DeploymentAttempt) {
+      const preparedFor = recovery.stackId;
+      if (!preparedFor || !journalPath)
+        throw new Error("The execution receipt is incomplete.");
+      commandResult(
+        aws(
+          "cloudformation",
+          "wait",
+          recovery.base === null
+            ? "stack-create-complete"
+            : "stack-update-complete",
+          "--stack-name",
+          preparedFor,
+        ),
+        "CloudFormation deployment",
+      );
       if (
-        stacks.length !== 1 ||
-        stacks[0].StackName !== name ||
-        !stableStackStatuses.has(field(stacks[0], "StackStatus"))
+        !isApplied(describeStack(), recovery) ||
+        !templateMatches(preparedFor)
       ) {
-        throw new Error("The current stack is absent, unstable, or ambiguous.");
-      }
-      currentStackId = field(stacks[0], "StackId");
-      if (!stackScope(currentStackId, account, region, name)) {
         throw new Error(
-          "The current stack identity differs from the compiled deployment.",
+          "The deployed stack does not confirm the exact candidate generation and digest.",
         );
       }
-      const outputs = new Map<string, string>();
-      for (const output of rows(stacks[0].Outputs)) {
-        const key = field(output, "OutputKey");
-        if (outputs.has(key))
-          throw new Error("The current stack has duplicate output keys.");
-        outputs.set(key, field(output, "OutputValue"));
+      finishAttempt(journalPath, recovery.name);
+    }
+
+    if (decision === "execute" && attempt && journalPath) {
+      if (
+        isApplied(prior, attempt) &&
+        attempt.stackId &&
+        templateMatches(attempt.stackId)
+      ) {
+        finishAttempt(journalPath, attempt.name);
+        return;
       }
+      if (
+        prior &&
+        prior.StackId === attempt.stackId &&
+        (prior.StackStatus === "CREATE_IN_PROGRESS" ||
+          prior.StackStatus === "UPDATE_IN_PROGRESS" ||
+          prior.StackStatus === "UPDATE_COMPLETE_CLEANUP_IN_PROGRESS")
+      ) {
+        const receipt = describeChangeSet(prior, attempt);
+        if (
+          receipt?.ExecutionStatus === "EXECUTE_IN_PROGRESS" ||
+          receipt?.ExecutionStatus === "EXECUTE_COMPLETE"
+        ) {
+          verifyCompleted(attempt);
+          return;
+        }
+        throw new Error(
+          "The in-progress stack cannot be attributed to the recorded change set.",
+        );
+      }
+    }
+
+    let checkRetirement: (() => void) | undefined;
+    const base =
+      prior && stableStackStatuses.has(field(prior, "StackStatus"))
+        ? stableStackEvidence(prior)
+        : null;
+    const discardedPlaceholder =
+      decision === "discard" && attempt?.base === null && prior === undefined;
+    if (
+      attempt &&
+      (attempt.base !== base ||
+        (attempt.stackId &&
+          prior?.StackId !== attempt.stackId &&
+          !discardedPlaceholder))
+    ) {
+      throw new Error(
+        "The current stack has changed since the recorded deployment attempt.",
+      );
+    }
+    if (prior && base === null && (!attempt || !reviewPlaceholder(prior))) {
+      throw new Error(
+        "The current stack is unstable or belongs to another deployment attempt.",
+      );
+    }
+
+    if (prior && base !== null) {
+      const outputs = stackOutputs(prior);
       const oldVersion = outputs.get("RuntimeConfigVersionId");
       const oldSha = outputs.get("RuntimeConfigSha256");
       const oldUri = outputs.get("RuntimeConfigUri");
@@ -192,9 +468,7 @@ export function deployController(
           "The existing tracking table key binding changed. Keep the prior key ARN and use a reviewed key migration.",
         );
       }
-      const source = oldUri?.match(
-        /^s3:\/\/([a-z0-9.-]+)\/(runtime\/[0-9a-f]{64}\.json)$/u,
-      );
+      const source = oldUri?.match(runtimeObjectUri);
       if (
         outputs.get("DeploymentIdentity") !== identity ||
         !oldVersion ||
@@ -234,7 +508,7 @@ export function deployController(
         );
       }
       const current = validateRuntime(
-        JSON.parse(currentBytes.toString("utf8")),
+        JSON.parse(decodeConfiguration(currentBytes)),
       );
       if (
         deploymentIdentity(current) !== identity ||
@@ -276,14 +550,9 @@ export function deployController(
           "Runtime retirement preflight",
         );
       };
-      checkRetirement();
-    } else {
-      const stackAbsent = `(ValidationError) when calling the DescribeStacks operation: Stack with id ${name} does not exist`;
-      if (!prior.stderr.trim().endsWith(stackAbsent)) {
-        throw new Error(
-          "Could not establish whether the deployment stack already exists.",
-        );
-      }
+    }
+
+    function checkFreshTracking() {
       const described = aws(
         "dynamodb",
         "describe-table",
@@ -292,10 +561,11 @@ export function deployController(
       );
       if (runtime.spec.tracking.table.type === "create") {
         if (
-          described.status === 0 ||
-          !described.stderr.includes(
-            "(ResourceNotFoundException) when calling the DescribeTable operation:",
-          )
+          serviceError(
+            described,
+            "ResourceNotFoundException",
+            "DescribeTable",
+          ) === undefined
         ) {
           throw new Error(
             "The new stack's tracking table is present or could not be verified absent.",
@@ -313,8 +583,8 @@ export function deployController(
         if (
           existing.TableName !== table ||
           existing.TableStatus !== "ACTIVE" ||
-          !/^arn:aws(?:-[a-z0-9-]+)?:dynamodb:/u.test(arn) ||
-          !arn.endsWith(`:${region}:${account}:table/${table}`)
+          arn !==
+            `arn:${awsPartition(region)}:dynamodb:${region}:${account}:table/${table}`
         ) {
           throw new Error(
             "The imported tracking table does not belong to the target deployment scope.",
@@ -343,88 +613,194 @@ export function deployController(
       }
     }
 
-    const assembly = join(workspace, "assembly");
-    const artifact = synthesizeController(compiled, generation, assembly, {
-      fargatePreflight: fargatePreflight?.environment,
-      telemetry: target.telemetry,
-      encryption,
-    });
-    const bootstrap = encryption.bootstrapAssetKeyArn
-      ? runtimeCopySource(artifact.template)
-      : undefined;
-    const checkEncryption = (assetPublished: boolean) =>
-      verifyImportedEncryption(
-        runtime,
-        encryption,
-        fargatePreflight?.quotaSource,
-        bootstrap,
-        assetPublished,
-        awsObject,
+    function discardPrepared(recovery: DeploymentAttempt) {
+      const current = describeStack();
+      if (
+        !current ||
+        current.StackId !== recovery.stackId ||
+        (!stableStackStatuses.has(field(current, "StackStatus")) &&
+          !reviewPlaceholder(current))
+      ) {
+        throw new Error(
+          "The original stack could not be verified for change set cleanup.",
+        );
+      }
+      const pending = describeChangeSet(current, recovery);
+      if (!pending) return;
+      if (
+        !(
+          pending.Status === "CREATE_COMPLETE" &&
+          pending.ExecutionStatus === "AVAILABLE"
+        ) &&
+        !(
+          pending.Status === "FAILED" &&
+          pending.ExecutionStatus === "UNAVAILABLE"
+        )
+      ) {
+        throw new Error("The owned change set is no longer safe to discard.");
+      }
+      commandResult(
+        aws(
+          "cloudformation",
+          "delete-change-set",
+          "--stack-name",
+          field(current, "StackId"),
+          "--change-set-name",
+          field(pending, "ChangeSetId"),
+        ),
+        "Owned CloudFormation change set cleanup",
       );
+    }
+
+    let changeSet =
+      prior && attempt ? describeChangeSet(prior, attempt) : undefined;
+    if (attempt && decision === "discard") {
+      if (!attempt.changeSetId || !attempt.stackId) {
+        throw new Error(
+          "The rejected change set has no verified cleanup receipt.",
+        );
+      }
+      if (changeSet) discardPrepared(attempt);
+      changeSet = undefined;
+    }
+    if (base === null) checkFreshTracking();
+    checkRetirement?.();
     checkEncryption(false);
-    const changeSetName = `scaleset-${randomUUID()}`;
-    commandResult(
-      run(process.execPath, [
-        cdkCli,
-        "deploy",
-        "--app",
-        assembly,
-        "--method",
-        "prepare-change-set",
-        "--change-set-name",
-        changeSetName,
-        "--require-approval",
-        "never",
-        "--no-lookups",
-        artifact.id,
-      ]),
-      "CDK change set preparation",
-    );
-    const changeSet = awsObject(
-      "Prepared change set verification",
-      "cloudformation",
-      "describe-change-set",
-      "--stack-name",
-      name,
-      "--change-set-name",
-      changeSetName,
-    );
+    if (!changeSet) {
+      if (
+        decision === "execute" ||
+        (prior && base === null && attempt?.stackId !== prior.StackId)
+      ) {
+        throw new Error(
+          "The exact change set or fresh review stack could not be recovered.",
+        );
+      }
+      const creating = attempt === undefined;
+      const retainedStack = prior ? field(prior, "StackId") : null;
+      journalPath ??= recoveryFile(recoveryDirectory);
+      attempt = {
+        identity,
+        generation,
+        runtimeSha256: compiled.sha256,
+        templateSha256,
+        base,
+        name: newChangeSetName(),
+        stackId: retainedStack,
+        changeSetId: null,
+      };
+      saveAttempt(journalPath, attempt, creating);
+      decision = undefined;
+
+      commandResult(
+        run(process.execPath, [
+          cdkCli,
+          "deploy",
+          "--app",
+          assembly,
+          "--method",
+          "prepare-change-set",
+          "--change-set-name",
+          attempt.name,
+          "--require-approval",
+          "never",
+          "--no-lookups",
+          artifact.id,
+        ]),
+        "CDK change set preparation",
+      );
+      const prepared = describeStack();
+      if (
+        !prepared ||
+        (base === null
+          ? !reviewPlaceholder(prepared)
+          : prepared.StackId !== attempt.stackId ||
+            stableStackEvidence(prepared) !== base)
+      ) {
+        throw new Error(
+          "The authoritative stack changed when preparing the change set.",
+        );
+      }
+      changeSet = describeChangeSet(prepared, attempt);
+    }
+
+    if (!changeSet || !attempt || !journalPath) {
+      throw new Error("The exact prepared change set was not confirmed.");
+    }
     const changeSetId = field(changeSet, "ChangeSetId");
     const preparedFor = field(changeSet, "StackId");
     if (
-      !stackScope(preparedFor, account, region, name) ||
-      (currentStackId && currentStackId !== preparedFor) ||
-      changeSet.Status !== "CREATE_COMPLETE" ||
-      changeSet.ExecutionStatus !== "AVAILABLE" ||
-      !changeSetId.startsWith(
-        `${preparedFor.split(":").slice(0, 5).join(":")}:changeSet/${changeSetName}/`,
-      )
+      decision === undefined &&
+      changeSet.Status === "FAILED" &&
+      changeSet.ExecutionStatus === "UNAVAILABLE"
     ) {
+      attempt = { ...attempt, stackId: preparedFor, changeSetId };
+      saveAttempt(journalPath, attempt);
+      decide(journalPath, attempt.name, "discard");
+      discardPrepared(attempt);
       throw new Error(
-        "The prepared CloudFormation change set is incomplete or targets another stack.",
+        "CloudFormation rejected the owned change set during preparation.",
       );
     }
-    checkRetirement?.();
-    checkEncryption(true);
+    if (
+      changeSet.Status !== "CREATE_COMPLETE" ||
+      changeSet.ExecutionStatus !== "AVAILABLE"
+    ) {
+      throw new Error("The owned change set is not ready for execution.");
+    }
+    if (!templateMatches(preparedFor, changeSetId)) {
+      throw new Error(
+        "The prepared CloudFormation template differs from the reviewed deployment.",
+      );
+    }
+    attempt = { ...attempt, stackId: preparedFor, changeSetId };
+    saveAttempt(journalPath, attempt);
+
+    try {
+      const current = describeStack();
+      if (
+        !current ||
+        current.StackId !== preparedFor ||
+        (base === null
+          ? !reviewPlaceholder(current)
+          : !stableStackStatuses.has(field(current, "StackStatus")) ||
+            stableStackEvidence(current) !== base)
+      ) {
+        throw new Error(
+          "The authoritative stack changed before change set execution.",
+        );
+      }
+      if (base === null) checkFreshTracking();
+      checkRetirement?.();
+      checkEncryption(true);
+    } catch (error) {
+      if (decision === undefined) {
+        decide(journalPath, attempt.name, "discard");
+        discardPrepared(attempt);
+      }
+      throw error;
+    }
+
+    decide(journalPath, attempt.name, "execute");
     commandResult(
       aws(
         "cloudformation",
         "execute-change-set",
+        "--stack-name",
+        preparedFor,
         "--change-set-name",
         changeSetId,
+        "--client-request-token",
+        attempt.name,
       ),
       "CloudFormation change set execution",
     );
-    commandResult(
-      aws(
-        "cloudformation",
-        "wait",
-        currentStackId ? "stack-update-complete" : "stack-create-complete",
-        "--stack-name",
-        preparedFor,
-      ),
-      "CloudFormation deployment",
-    );
+    verifyCompleted(attempt);
+  } catch (error) {
+    if (!journalPath) throw error;
+    const message = error instanceof Error ? error.message : String(error);
+    throw new Error(`${message} Recovery record: ${journalPath}`, {
+      cause: error,
+    });
   } finally {
     rmSync(workspace, { force: true, recursive: true });
   }

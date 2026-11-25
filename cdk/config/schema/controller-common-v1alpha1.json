@@ -32,14 +32,18 @@
     "architecture": { "enum": ["x64", "arm64"] },
     "roleArn": {
       "type": "string",
-      "pattern": "^arn:aws(?:-[a-z0-9-]+)?:iam::[0-9]{12}:role/[^\\u0009-\\u000d\\u0020\\u00a0\\u1680\\u2000-\\u200a\\u2028-\\u2029\\u202f\\u205f\\u3000\\ufeff*?]+(?![\\s\\S])"
+      "pattern": "^arn:aws(?:-[a-z0-9-]+)?:iam::[0-9]{12}:role/(?=[!-~]{1,575}(?![\\s\\S]))(?:(?:(?![/*?])[!-~])+/)*[A-Za-z0-9_+=,.@-]{1,64}(?![\\s\\S])"
     },
     "metadata": {
       "type": "object",
       "additionalProperties": false,
       "required": ["name"],
       "properties": {
-        "name": { "type": "string", "$ref": "#/$defs/name", "maxLength": 238 }
+        "name": {
+          "type": "string",
+          "$comment": "The -runner-controller suffix consumes 18 of CloudFormation's 128 characters.",
+          "pattern": "^[A-Za-z][A-Za-z0-9-]{0,109}(?![\\s\\S])"
+        }
       }
     },
     "spec": {
