@@ -84,7 +84,7 @@ public sealed class FargateNativeHandoffTests
         var quota = new FargateQuotaReader(runtime.Aws, evidence, null, aws.Clock);
         var backend = new FargateRunnerBackend(runtime, profile, aws.Profile, aws.Inspector, evidence, quota,
             [aws.Profile], new ConcurrentDictionary<string, FargateInventorySnapshot>(StringComparer.Ordinal), aws.Store,
-            aws.Journal, aws.Dispatcher, aws.Clock, FargateNativeFixture.Timing.ObservationFreshness);
+            aws.Journal, aws.Dispatcher, aws.Clock, FargateNativeFixture.Timing);
         var inventory = await backend.ReadAsync(owner, token);
         Assert.True(inventory.IsComplete);
         var resource = Assert.Single(inventory.Resources);
