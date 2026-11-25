@@ -227,6 +227,78 @@ test("checks exact current and candidate bytes before preparation and again befo
   ]);
 });
 
+test("the protected deploy rechecks the published bootstrap object's exact key before execution", () => {
+  const key = `arn:aws:kms:${region}:${account}:key/00000000-0000-0000-0000-000000000001`;
+  for (const matches of [true, false]) {
+    const cloud = fixture();
+    const steps: string[] = [];
+    const run = (program: string, args: string[]) => {
+      if (args.includes("get-bucket-encryption")) {
+        steps.push("bucket");
+        assert.ok(!cloud.steps.includes("prepare"));
+        assert.equal(option(args, "--expected-bucket-owner"), account);
+        return ok({
+          ServerSideEncryptionConfiguration: {
+            Rules: [
+              {
+                ApplyServerSideEncryptionByDefault: {
+                  SSEAlgorithm: "aws:kms",
+                  KMSMasterKeyID: key,
+                },
+              },
+            ],
+          },
+        });
+      }
+      if (args.includes("describe-key")) {
+        steps.push("key");
+        assert.equal(option(args, "--key-id"), key);
+        return ok({
+          KeyMetadata: {
+            Arn: key,
+            Enabled: true,
+            KeyState: "Enabled",
+            KeySpec: "SYMMETRIC_DEFAULT",
+            KeyUsage: "ENCRYPT_DECRYPT",
+            KeyManager: "CUSTOMER",
+          },
+        });
+      }
+      if (args.includes("head-object")) {
+        steps.push("object");
+        assert.ok(cloud.steps.includes("prepare"));
+        assert.ok(!cloud.steps.includes("execute"));
+        assert.equal(option(args, "--expected-bucket-owner"), account);
+        assert.match(option(args, "--key"), /^[a-f0-9]{64}\.json$/u);
+        return ok({
+          ServerSideEncryption: "aws:kms",
+          SSEKMSKeyId: matches ? key : key.replace(/1$/u, "2"),
+        });
+      }
+      return cloud.run(program, args);
+    };
+    const deploy = () =>
+      deployController(
+        {
+          compiled: candidate,
+          generation: "2",
+          encryption: { bootstrapAssetKeyArn: key },
+        },
+        run,
+      );
+    if (matches) deploy();
+    else
+      assert.throws(deploy, /CDK bootstrap source asset must use the pinned/u);
+    assert.deepEqual(
+      steps,
+      matches
+        ? ["bucket", "key", "object", "key"]
+        : ["bucket", "key", "object"],
+    );
+    assert.equal(cloud.steps.includes("execute"), matches);
+  }
+});
+
 test("explicit Fargate evidence reaches the deployment artifact after early validation", () => {
   const evidence = JSON.stringify({
     profiles: {

@@ -14,6 +14,11 @@ import {
 } from "./deployment-input.ts";
 import type { ControllerDeploymentEnvironment } from "./deployment-input.ts";
 import { validateFargatePreflight } from "./fargate-preflight.ts";
+import { resolveImportedEncryption } from "./imported-encryption.ts";
+import {
+  runtimeCopySource,
+  verifyImportedEncryption,
+} from "./imported-encryption-preflight.ts";
 
 type Compiled = ReturnType<typeof compileConfig>;
 type ObjectProperties = Record<string, unknown>;
@@ -109,7 +114,12 @@ export function deployController(
   const fargatePreflight = validateFargatePreflight(
     runtime,
     target.fargatePreflight,
-  )?.environment;
+  );
+  const encryption = resolveImportedEncryption(
+    target.encryption,
+    runtime,
+    Boolean(fargatePreflight?.quotaSource),
+  );
   resolveControllerTelemetry(target.telemetry, runtime.spec.aws);
   const aws = (...args: string[]) =>
     run("aws", [
@@ -174,6 +184,14 @@ export function deployController(
       const oldSha = outputs.get("RuntimeConfigSha256");
       const oldUri = outputs.get("RuntimeConfigUri");
       const oldGeneration = outputs.get("DeploymentGeneration");
+      if (
+        outputs.has("TrackingTableKmsKeyArn") &&
+        outputs.get("TrackingTableKmsKeyArn") !== encryption.trackingTableKeyArn
+      ) {
+        throw new Error(
+          "The existing tracking table key binding changed. Keep the prior key ARN and use a reviewed key migration.",
+        );
+      }
       const source = oldUri?.match(
         /^s3:\/\/([a-z0-9.-]+)\/(runtime\/[0-9a-f]{64}\.json)$/u,
       );
@@ -327,9 +345,23 @@ export function deployController(
 
     const assembly = join(workspace, "assembly");
     const artifact = synthesizeController(compiled, generation, assembly, {
-      fargatePreflight,
+      fargatePreflight: fargatePreflight?.environment,
       telemetry: target.telemetry,
+      encryption,
     });
+    const bootstrap = encryption.bootstrapAssetKeyArn
+      ? runtimeCopySource(artifact.template)
+      : undefined;
+    const checkEncryption = (assetPublished: boolean) =>
+      verifyImportedEncryption(
+        runtime,
+        encryption,
+        fargatePreflight?.quotaSource,
+        bootstrap,
+        assetPublished,
+        awsObject,
+      );
+    checkEncryption(false);
     const changeSetName = `scaleset-${randomUUID()}`;
     commandResult(
       run(process.execPath, [
@@ -373,6 +405,7 @@ export function deployController(
       );
     }
     checkRetirement?.();
+    checkEncryption(true);
     commandResult(
       aws(
         "cloudformation",

@@ -28,15 +28,28 @@ exports.copy = async (event) => {
   const copySource = [SourceBucket, ...SourceKey.split("/")]
     .map(encodeURIComponent)
     .join("/");
-  const result = await client.send(
-    new CopyObjectCommand({
-      Bucket: DestinationBucket,
-      CopySource: copySource,
-      Key: DestinationKey,
-      ExpectedBucketOwner: Account,
-      ExpectedSourceBucketOwner: Account,
-    }),
-  );
+  let result;
+  try {
+    result = await client.send(
+      new CopyObjectCommand({
+        Bucket: DestinationBucket,
+        CopySource: copySource,
+        Key: DestinationKey,
+        ExpectedBucketOwner: Account,
+        ExpectedSourceBucketOwner: Account,
+      }),
+    );
+  } catch (error) {
+    if (
+      error?.name === "AccessDenied" ||
+      error?.name === "KMS.AccessDeniedException"
+    ) {
+      throw new Error(
+        "Runtime asset copy access denied. Verify the copy role's exact source and destination access and, for a customer-managed bootstrap key, configure bootstrapAssetKeyArn and allow S3-mediated decryption.",
+      );
+    }
+    throw error;
+  }
   const versionId = result.VersionId;
   if (
     typeof versionId !== "string" ||

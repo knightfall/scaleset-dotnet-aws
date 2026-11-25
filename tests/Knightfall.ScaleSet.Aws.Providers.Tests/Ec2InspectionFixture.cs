@@ -110,11 +110,12 @@ internal sealed class Ec2InspectionFixture : IDisposable
 
     internal static string Template(long version = 12, bool encrypted = true, string tokens = "required", string imageId = ImageId,
         string protocol = "v1", bool byName = false, string extra = "", string rootDevice = RootDevice,
-        string? endpoint = "enabled", string? instanceType = "m7i.large")
+        string? endpoint = "enabled", string? instanceType = "m7i.large", string? ebsKey = null)
     {
         string profile = byName ? $"<name>{RoleName}</name>" : $"<arn>{ProfileArn}</arn>";
         string endpointElement = endpoint is null ? string.Empty : $"<httpEndpoint>{endpoint}</httpEndpoint>";
         string instanceTypeElement = instanceType is null ? string.Empty : $"<instanceType>{instanceType}</instanceType>";
+        string key = ebsKey is null ? string.Empty : $"<kmsKeyId>{ebsKey}</kmsKeyId>";
         return FormattableString.Invariant($"""
             <DescribeLaunchTemplateVersionsResponse xmlns="{Namespace}">
               <requestId>template-1</requestId>
@@ -126,7 +127,7 @@ internal sealed class Ec2InspectionFixture : IDisposable
                   <iamInstanceProfile>{profile}</iamInstanceProfile>
                   <metadataOptions>{endpointElement}<httpTokens>{tokens}</httpTokens></metadataOptions>
                   <blockDeviceMappingSet><item><deviceName>{rootDevice}</deviceName>
-                    <ebs><encrypted>{(encrypted ? "true" : "false")}</encrypted></ebs></item></blockDeviceMappingSet>
+                    <ebs><encrypted>{(encrypted ? "true" : "false")}</encrypted>{key}</ebs></item></blockDeviceMappingSet>
                   <tagSpecificationSet><item><resourceType>instance</resourceType><tagSet><item>
                     <key>scaleset-aws:bootstrap-protocol</key><value>{protocol}</value>
                   </item></tagSet></item></tagSpecificationSet>

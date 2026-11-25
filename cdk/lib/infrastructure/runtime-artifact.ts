@@ -6,13 +6,20 @@ import * as s3 from "aws-cdk-lib/aws-s3";
 import * as staging from "aws-cdk-lib/aws-s3-assets";
 import * as cr from "aws-cdk-lib/custom-resources";
 import { Construct } from "constructs";
+import { s3ObjectDecrypt } from "./imported-encryption.ts";
 
 export class RuntimeArtifact extends Construct {
   readonly uri: string;
   readonly versionId: string;
   readonly objectArn: string;
 
-  constructor(scope: Construct, id: string, inputPath: string, sha256: string) {
+  constructor(
+    scope: Construct,
+    id: string,
+    inputPath: string,
+    sha256: string,
+    sourceKeyArn?: string,
+  ) {
     super(scope, id);
     const asset = new staging.Asset(this, "Source", { path: inputPath });
     const bucket = new s3.Bucket(this, "Bucket", {
@@ -41,12 +48,15 @@ export class RuntimeArtifact extends Construct {
       timeout: Duration.seconds(60),
       code: lambda.Code.fromInline(code),
     });
+    const sourceArn = asset.bucket.arnForObjects(asset.s3ObjectKey);
     copy.addToRolePolicy(
       new iam.PolicyStatement({
         actions: ["s3:GetObject"],
-        resources: [asset.bucket.arnForObjects(asset.s3ObjectKey)],
+        resources: [sourceArn],
       }),
     );
+    if (sourceKeyArn)
+      copy.addToRolePolicy(s3ObjectDecrypt(this, sourceKeyArn, sourceArn));
     copy.addToRolePolicy(
       new iam.PolicyStatement({
         actions: ["s3:PutObject"],

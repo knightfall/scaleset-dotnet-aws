@@ -5,9 +5,10 @@ import { readControllerTelemetry } from "../lib/infrastructure/controller-teleme
 import { deployController } from "../lib/infrastructure/deploy-controller.ts";
 import { deploymentArguments } from "../lib/infrastructure/deployment-input.ts";
 import { fargatePreflightEnvironmentName } from "../lib/infrastructure/fargate-preflight.ts";
+import { readImportedEncryption } from "../lib/infrastructure/imported-encryption.ts";
 
 try {
-  const { config, generation, telemetry } = deploymentArguments(
+  const { config, generation, telemetry, encryption } = deploymentArguments(
     process.argv.slice(2),
   );
   const compiled = compileConfig(readFileSync(config, "utf8"));
@@ -27,6 +28,7 @@ try {
       generation,
       fargatePreflight: process.env[fargatePreflightEnvironmentName],
       telemetry: readControllerTelemetry(telemetry, compiled.runtime.spec.aws),
+      encryption: readImportedEncryption(encryption),
     },
     (program, args) => {
       const result = spawnSync(program, args, {

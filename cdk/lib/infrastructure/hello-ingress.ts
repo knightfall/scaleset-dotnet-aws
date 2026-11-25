@@ -4,6 +4,7 @@ import type { ITable } from "aws-cdk-lib/aws-dynamodb";
 import * as iam from "aws-cdk-lib/aws-iam";
 import * as lambda from "aws-cdk-lib/aws-lambda";
 import type { Construct } from "constructs";
+import { trackingTableDecrypt } from "./imported-encryption.ts";
 
 export function helloIngress(
   scope: Construct,
@@ -11,6 +12,7 @@ export function helloIngress(
   table: ITable,
   bootstrapRole: iam.IRole,
   reservedConcurrency: number,
+  tableKeyArn?: string,
 ) {
   const stack = Stack.of(scope);
   const active = reservedConcurrency > 0;
@@ -40,6 +42,10 @@ export function helloIngress(
   });
   const dependencies = [broker, endpoint];
   if (!active) return { dependencies, statements: [] };
+  if (tableKeyArn)
+    broker.addToRolePolicy(
+      trackingTableDecrypt(scope, tableKeyArn, table.tableName),
+    );
 
   broker.addToRolePolicy(
     new iam.PolicyStatement({

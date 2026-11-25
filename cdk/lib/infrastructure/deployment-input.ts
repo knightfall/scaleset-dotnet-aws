@@ -5,6 +5,7 @@ import type { ControllerTelemetrySettings } from "./controller-telemetry.ts";
 export interface ControllerDeploymentEnvironment {
   readonly fargatePreflight?: string;
   readonly telemetry?: ControllerTelemetrySettings;
+  readonly encryption?: unknown;
 }
 
 const maximumGeneration = 9223372036854775807n;
@@ -27,6 +28,7 @@ export function deploymentArguments(argv: string[]) {
       config: { type: "string" },
       generation: { type: "string" },
       telemetry: { type: "string" },
+      encryption: { type: "string" },
     },
   });
   if (!values.config || !values.generation) {
@@ -39,6 +41,7 @@ export function deploymentArguments(argv: string[]) {
     config: values.config,
     generation: values.generation,
     telemetry: values.telemetry,
+    encryption: values.encryption,
   };
 }
 

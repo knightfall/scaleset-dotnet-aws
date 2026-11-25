@@ -101,7 +101,7 @@ app="node bin/controller.ts --config '$source_yaml' --generation $generation --t
 )
 ```
 
-Verify the CDK bootstrap resources are approved in the target account and Region. Review any indicated replacement against the deployed resource IDs and the eventual CloudFormation change set. Record the reviewed commit, inputs, diff, and operator decision. [CDK bootstrap](https://docs.aws.amazon.com/cdk/v2/guide/ref-cli-cmd-bootstrap.html) · [CDK template diff](https://docs.aws.amazon.com/cdk/v2/guide/ref-cli-cmd-diff.html)
+Verify the CDK bootstrap resources are approved in the target account and Region. For customer-managed encryption, supply the same reviewed `--encryption <path>` input to synth and the protected deployment. Review any indicated replacement against the deployed resource IDs and the eventual CloudFormation change set. Record the reviewed commit, inputs, diff, and operator decision. [Imported encryption prerequisites](profile-bindings.md#qualify-imported-encryption-keys) · [CDK bootstrap](https://docs.aws.amazon.com/cdk/v2/guide/ref-cli-cmd-bootstrap.html) · [CDK template diff](https://docs.aws.amazon.com/cdk/v2/guide/ref-cli-cmd-diff.html)
 
 - [ ] The controller service has desired count one, private `awsvpc` subnets, no public IP, a read-only filesystem, and a 90-second task stop timeout. The deployment settings prevent overlapping service-managed controller tasks during an ordinary rollout. `/healthz` is the task health check.
 - [ ] The ECR digest, controller cluster, network, tracking table, runtime object key/version contract, role ARNs, and enabled-provider queue rules match the candidate binding.

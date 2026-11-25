@@ -8,6 +8,24 @@ namespace Knightfall.ScaleSet.Aws.Providers.Tests;
 public sealed class Ec2PreflightTests
 {
     [Theory]
+    [InlineData(null, Ec2PreflightStatus.Verified)]
+    [InlineData("alias/aws/ebs", Ec2PreflightStatus.Verified)]
+    [InlineData("alias/custom-ebs", Ec2PreflightStatus.EbsKeyUnqualified)]
+    [InlineData("12345678-1234-1234-1234-123456789abc", Ec2PreflightStatus.EbsKeyUnqualified)]
+    public async Task UnqualifiedExplicitEbsKeyHoldsNewStartsWithoutAddingKmsReads(string? key, Ec2PreflightStatus expected)
+    {
+        var token = TestContext.Current.CancellationToken;
+        var config = await ConfigurationAsync(token, "12");
+        using var cloud = new Ec2InspectionFixture { TemplateResponse = Template(ebsKey: key) };
+
+        var result = await cloud.Inspector.ResolvePreflightAsync(config, ProfileId, token);
+
+        Assert.Equal(expected, result.Status);
+        Assert.Equal(expected == Ec2PreflightStatus.Verified, result.IsReady);
+        Assert.DoesNotContain(cloud.Requests, request => request["Action"] is "DescribeKey" or "RunInstances");
+    }
+
+    [Theory]
     [InlineData("missing", Ec2PreflightStatus.TemplateUnavailable)]
     [InlineData("wrong-version", Ec2PreflightStatus.TemplateIdentityMismatch)]
     [InlineData("imds-v1", Ec2PreflightStatus.ImdsV2Required)]
