@@ -17,6 +17,8 @@ required in each target environment.
 
 - [Implementation plan](docs/implementation-plan.md): architecture, configuration,
   lifecycle rules, and verification boundaries.
+- Track fixes, dependencies, and the review gate in the
+  [v0.1.0-alpha.2 remediation plan](docs/releases/v0.1.0-alpha.2-remediation.md).
 - [OpenTelemetry integration plan](docs/opentelemetry-integration.md): signal
   contracts, per-profile visibility, OTLP configuration, and acceptance evidence.
 - [Released SDK baseline](docs/dependency-baseline.md): exact package version,
