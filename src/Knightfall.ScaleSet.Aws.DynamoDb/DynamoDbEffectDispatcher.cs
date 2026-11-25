@@ -111,8 +111,8 @@ public sealed partial class DynamoDbEffectDispatcher
             return EffectDispatchStatus.OwnershipUnavailable;
         }
         var effect = await _journal.ReadAsync(profile, intentId, token).ConfigureAwait(false);
-        bool rearm = effect is { Entry.State: EffectState.Settled, Entry.Resolution.Kind: EffectResolutionKind.AbandonedBeforeSend,
-            Entry.Envelope.Request: FargateStopEffectRequest { Incarnation: not null } };
+        bool unsentStop = effect?.Entry.IsUnsentFargateStop() == true;
+        bool rearm = unsentStop && effect?.Entry.State == EffectState.Settled;
         if (effect is null || (effect.Entry.State == EffectState.Settled && !rearm))
         {
             return EffectDispatchStatus.NotPlanned;
@@ -137,13 +137,19 @@ public sealed partial class DynamoDbEffectDispatcher
         {
             return EffectDispatchStatus.StalePlan;
         }
+        bool rebind = unsentStop && catalog?.AppliedGeneration > envelope.Generation;
         if (envelope.IntentId != EffectIntentIdentity.ForAllocation(envelope.Request) ||
-            catalog is null || catalog.AppliedGeneration != envelope.Generation ||
+            catalog is null || (catalog.AppliedGeneration != envelope.Generation && !rebind) ||
             catalog.Binding.ScaleSetId is not > 0 ||
             catalog.State is not (CatalogProfileState.Active or CatalogProfileState.Draining) ||
             RequestAllocation(envelope.Request, catalog.Binding) is not { } allocationId)
         {
             return EffectDispatchStatus.Ineligible;
+        }
+        if (rebind)
+        {
+            envelope = EffectEnvelope.Create(profile, intentId, catalog.AppliedGeneration, envelope.Request,
+                envelope.EarliestPossibleFirstSend, envelope.ProviderReplayDeadline);
         }
         if (envelope.Request is FargateLaunchEffectRequest { OwnershipTags: not null } fargateLaunch &&
             ((firstSendDeadline is null && readFirstLaunch is null) ||
@@ -260,17 +266,20 @@ public sealed partial class DynamoDbEffectDispatcher
         }
         var guard = new EffectDispatchGuard(catalog, index!, allocationId, allocation?.Revision, Ec2Lineage: lineage,
             FargateStopAdmission: stopAdmission, FargateFirstLaunch: fargateAdmission);
-        if (rearm)
+        if (rearm || rebind)
         {
-            var restored = await _journal.RearmAbandonedFargateStopAsync(lease, effect, guard, token).ConfigureAwait(false);
-            if (restored != LifecycleWriteOutcome.Committed)
+            Guid transition = Guid.NewGuid();
+            var restored = await _journal.ReplanUnsentFargateStopAsync(lease, effect, envelope, guard, transition,
+                sendWindow.UpperUtcNow, token).ConfigureAwait(false);
+            if (restored is not (LifecycleWriteOutcome.Committed or LifecycleWriteOutcome.Conflict or LifecycleWriteOutcome.Indeterminate))
             {
                 return DispatchOutcome(restored);
             }
             var planned = await _journal.ReadAsync(profile, intentId, token).ConfigureAwait(false);
-            if (planned is not { Entry.State: EffectState.Planned } || !planned.Entry.Envelope.Matches(envelope))
+            if (planned is not { Entry.State: EffectState.Planned } || planned.Revision != checked(effect.Revision + 1) ||
+                planned.TransitionId != transition || !planned.Entry.Envelope.Matches(envelope))
             {
-                return EffectDispatchStatus.Conflict;
+                return restored == LifecycleWriteOutcome.Committed ? EffectDispatchStatus.Conflict : DispatchOutcome(restored);
             }
             effect = planned;
             index = await _store.ReadEffectIndexAsync(profile, token).ConfigureAwait(false);

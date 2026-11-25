@@ -157,6 +157,21 @@ public sealed class EffectJournalEntry
         Resolution is { Kind: EffectResolutionKind.AbandonedBeforeSend } evidence && ValidAbandonment(evidence)
             ? Plan(Envelope) : null;
 
+    internal bool IsUnsentFargateStop()
+    {
+        if (Envelope.Request is not FargateStopEffectRequest { Incarnation: not null } || EarlierSendUncertain)
+        {
+            return false;
+        }
+        return State switch
+        {
+            EffectState.Planned => Attempt is null,
+            EffectState.Settled when Resolution is { Kind: EffectResolutionKind.CanceledBeforeSend } => Attempt is null,
+            EffectState.Settled when Resolution is { Kind: EffectResolutionKind.AbandonedBeforeSend } abandoned => ValidAbandonment(abandoned),
+            _ => false,
+        };
+    }
+
     private EffectJournalEntry Settle(EffectEvidence evidence) =>
         new(Envelope, EffectState.Settled,
             _body with

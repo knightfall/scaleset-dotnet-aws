@@ -33,9 +33,13 @@ public sealed class FargateNativeHandoffTests
     private const long SecondJob = 512;
 
     [Theory]
-    [InlineData(true)]
-    [InlineData(false)]
-    public async Task FargateDrainOrStartupTimeoutRevokesTheExactUnconsumedOfferAndStopsOnce(bool drain)
+    [InlineData(true, null, false)]
+    [InlineData(false, null, false)]
+    [InlineData(false, null, true)]
+    [InlineData(true, EffectState.Planned, false)]
+    [InlineData(true, EffectState.Settled, false)]
+    public async Task FargateDrainOrStartupTimeoutRevokesTheExactUnconsumedOfferAndStopsOnce(bool drain,
+        EffectState? inheritedStop, bool raceAfterBegin)
     {
         var token = TestContext.Current.CancellationToken;
         using var aws = await FargateNativeFixture.CreateAsync(token);
@@ -62,6 +66,27 @@ public sealed class FargateNativeHandoffTests
         var coordinator = new ControllerJitCoordinator(aws.Store, new AwsBootstrapPrincipalResolver(aws.Iam),
             new GitHubJitHandoff(aws.Store, aws.Clock, JitTiming), NullLogger<ControllerJitCoordinator>.Instance);
         _ = await OfferAsync(aws, ownership, coordinator, task, github, token);
+
+        var original = await ReadExecutorAsync(aws, task, token);
+        var identity = Assert.IsType<FargateExecutorIdentity>(original.Binding.Provider);
+        var request = new FargateStopEffectRequest(task.Identity.AllocationId, identity.ClusterArn,
+            original.Binding.ResourceArn, identity.TaskDefinitionArn, original.Binding.Incarnation);
+        string intentId = EffectIntentIdentity.ForAllocation(request)!;
+        if (inheritedStop is { } oldState)
+        {
+            var oldCatalog = Assert.IsType<CatalogProfile>(await aws.Store.ReadCatalogProfileAsync(aws.Profile, token));
+            await PublishCoverageAsync(owner, aws.Clock.Now);
+            Assert.Equal(LifecycleWriteOutcome.Committed, await aws.Store.CloseFargateAdmissionAsync(owner, oldCatalog,
+                original, FargateNativeFixture.Timing.ObservationFreshness, token));
+            var priorPlan = EffectEnvelope.Create(aws.Profile, intentId, oldCatalog.AppliedGeneration, request, aws.Clock.Now, null);
+            Assert.Equal(LifecycleWriteOutcome.Committed, await aws.Journal.PlanAsync(owner, priorPlan, Guid.NewGuid(), token));
+            if (oldState == EffectState.Settled)
+            {
+                Assert.Equal(LifecycleWriteOutcome.Committed, (await aws.Dispatcher.CancelUnstartedPassAsync(owner, aws.Profile, null, token)).Outcome);
+                Assert.Equal(EffectResolutionKind.CanceledBeforeSend, (await aws.Journal.ReadAsync(aws.Profile, intentId, token))?.Entry.Resolution?.Kind);
+            }
+            Assert.Equal(oldState, (await aws.Journal.ReadAsync(aws.Profile, intentId, token))?.Entry.State);
+        }
 
         var runtime = drain ? aws.ConfigurationFor(aws.DefinitionArn, drainingWarmReserve: true) : aws.Configuration;
         var profile = Assert.Single(runtime.Profiles);
@@ -91,11 +116,36 @@ public sealed class FargateNativeHandoffTests
         Assert.Equal(task.Executor.Binding, resource.Binding);
         Assert.Equal(LifecycleWriteOutcome.Committed, await aws.Store.ObserveResourceAsync(owner.Fence, task.Executor.Binding,
             Assert.IsType<ExecutorResourceObservation>(resource.Observation), token));
-        var durable = await aws.Store.ReadExecutorInventoryAsync(aws.Profile, token);
-        Assert.Equal(LifecycleWriteOutcome.Committed, await aws.Store.PublishExecutorInventoryAsync(aws.Profile, owner.Fence,
-            durable.Revision, new ExecutorInventoryObservation(inventory.ObservedAt, IsComplete: true, BackendCapacityCeiling: 1), token));
+        await PublishCoverageAsync(owner, inventory.ObservedAt);
         var authority = new ActiveControllerAuthority(owner, aws.Clock.Proof());
-        await backend.CleanupAsync(authority, catalog, await ReadExecutorAsync(aws, task, token), CancellationToken.None, token);
+        if (raceAfterBegin)
+        {
+            var running = await ReadExecutorAsync(aws, task, token);
+            Assert.Equal(LifecycleWriteOutcome.Committed, await aws.Store.CloseFargateAdmissionAsync(owner, catalog,
+                running, FargateNativeFixture.Timing.ObservationFreshness, token));
+            var plan = EffectEnvelope.Create(aws.Profile, intentId, catalog.AppliedGeneration, request, aws.Clock.Now, null);
+            Assert.Equal(LifecycleWriteOutcome.Committed, await aws.Journal.PlanAsync(owner, plan, Guid.NewGuid(), token));
+            var pause = aws.Table.Wire.PauseAfterNextSuccessfulTransactionWrite(LifecycleKey.Operation(aws.Profile, intentId));
+            var firstCleanup = CleanupAsync();
+            try
+            {
+                await pause.Captured.WaitAsync(TimeSpan.FromSeconds(10), token);
+                await WriteBalanceAsync(1);
+            }
+            finally
+            {
+                pause.Resume();
+            }
+            await firstCleanup;
+            var held = Assert.IsType<EffectJournalSnapshot>(await aws.Journal.ReadAsync(aws.Profile, intentId, token));
+            Assert.Equal(EffectResolutionKind.AbandonedBeforeSend, held.Entry.Resolution?.Kind);
+            await CleanupAsync();
+            Assert.Equal(held.TransitionId, (await aws.Journal.ReadAsync(aws.Profile, intentId, token))?.TransitionId);
+            Assert.DoesNotContain(aws.Wire.Requests, call => call.Operation == "StopTask");
+            await WriteBalanceAsync(0);
+        }
+
+        await CleanupAsync();
         var stopped = await ReadExecutorAsync(aws, task, token);
         Assert.Equal(ExecutorResourceState.IrreversiblyTerminated, stopped.State.Resource?.State);
         Assert.Equal(FargateAdmissionClosure.OfferRevoked, stopped.State.AdmissionClosure);
@@ -103,6 +153,28 @@ public sealed class FargateNativeHandoffTests
         await backend.CleanupAsync(authority, catalog, stopped, CancellationToken.None, token);
         Assert.Single(aws.Wire.Requests, request => request.Operation == "StopTask");
         Assert.Equal("STOPPED", (await aws.ReadNativeTaskAsync(task.Identity.ResourceArn, token)).LastStatus);
+        var settled = Assert.IsType<EffectJournalSnapshot>(await aws.Journal.ReadAsync(aws.Profile, intentId, token));
+        Assert.Equal((catalog.AppliedGeneration, EffectResolutionKind.Applied), (settled.Entry.Envelope.Generation, settled.Entry.Resolution?.Kind));
+        Assert.Equal(request, settled.Entry.Envelope.Request);
+
+        async Task CleanupAsync() => await backend.CleanupAsync(authority, catalog, await ReadExecutorAsync(aws, task, token),
+            CancellationToken.None, token);
+
+        async Task PublishCoverageAsync(ControllerLease lease, DateTimeOffset observedAt)
+        {
+            var durable = await aws.Store.ReadExecutorInventoryAsync(aws.Profile, token);
+            Assert.Equal(LifecycleWriteOutcome.Committed, await aws.Store.PublishExecutorInventoryAsync(aws.Profile, lease.Fence,
+                durable.Revision, new ExecutorInventoryObservation(observedAt, IsComplete: true, BackendCapacityCeiling: 1), token));
+        }
+
+        async Task WriteBalanceAsync(int held)
+        {
+            var key = LifecycleKey.Admission(aws.Profile);
+            var current = await aws.Store.ReadRecordAsync(key, token);
+            string payload = FormattableString.Invariant($$"""{"heldCount":{{held}}}""");
+            Assert.Equal(LifecycleWriteOutcome.Committed, await aws.Store.WriteRecordsAsync(owner.Fence, Guid.NewGuid(),
+                [new LifecycleRecordWrite(key, current?.Revision, payload)], token));
+        }
     }
 
     [Fact(Timeout = 75_000)]

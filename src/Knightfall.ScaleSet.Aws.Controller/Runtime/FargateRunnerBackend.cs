@@ -227,7 +227,9 @@ internal sealed class FargateRunnerBackend(
                 return;
             }
         }
-        else if (existing.Entry.State != EffectState.Planned || existing.Entry.Envelope.Request != request)
+        else if (existing.Entry.Envelope.Request != request || existing.Entry is not
+            ({ State: EffectState.Planned } or
+             { State: EffectState.Settled, Resolution.Kind: EffectResolutionKind.AbandonedBeforeSend or EffectResolutionKind.CanceledBeforeSend }))
         {
             return;
         }
