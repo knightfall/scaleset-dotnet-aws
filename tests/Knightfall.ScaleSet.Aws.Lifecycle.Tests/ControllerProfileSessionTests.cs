@@ -335,6 +335,231 @@ public sealed class ControllerProfileSessionTests
         }
     }
 
+    [Theory]
+    [InlineData("Replacement")]
+    [InlineData("AcknowledgementUnauthorized")]
+    [InlineData("RefreshUnauthorized")]
+    [InlineData("BindingMismatch")]
+    [InlineData("CloseUnauthorized")]
+    [InlineData("CloseNotFound")]
+    [InlineData("CloseResponseLost")]
+    public async Task RecoveredStorageRotatesOnlyAfterDefinitiveQueueGetRejection(string outcome)
+    {
+        using var budget = CancellationTokenSource.CreateLinkedTokenSource(TestContext.Current.CancellationToken);
+        budget.CancelAfter(TimeSpan.FromMinutes(2));
+        var token = budget.Token;
+        using var table = await MiniStackTable.CreateAsync(token);
+        var clock = new ContractClock();
+        var store = new DynamoDbLifecycleStore(table.Client, table.Name, clock);
+        var config = await ConfigurationAsync(token);
+        var profile = config.Profiles.Single(profile => profile.Id == FirstProfile);
+        using var ownership = await SetupAuthorityAsync(store, config, clock, token);
+        var current = Assert.IsType<ActiveControllerAuthority>(ownership.ReadAuthority());
+        var key = new LifecycleProfile(current.Lease.Deployment, FirstProfile);
+        var checkpointKey = LifecycleKey.Checkpoint(key, GitHubWire.SessionId);
+        var inventory = new ExecutorInventoryObservation(clock.Now, IsComplete: true, BackendCapacityCeiling: 2, BackendLaunchHeadroom: 2);
+        Assert.Equal(LifecycleWriteOutcome.Committed, await store.PublishExecutorInventoryAsync(key, current.Lease.Fence, null, inventory, token));
+        var storageDenied = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var oldUnauthorized = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var held = new TaskCompletionSource<GitHubListenerLaneResult>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var newPollAcknowledged = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        string sessionPath = SessionPath(profile);
+        string closePath = sessionPath + $"/{GitHubWire.SessionId:D}";
+        const string oldQueue = "/old-queue";
+        const string newQueue = "/replacement-queue";
+        int oldPolls = 0;
+        int replacementPolls = 0;
+
+        using var previousWire = new GitHubWire(async (request, cancellation) =>
+        {
+            string path = request.Uri.AbsolutePath;
+            if (request.Method == HttpMethod.Post && path == sessionPath)
+            {
+                using var body = JsonDocument.Parse(request.Body!);
+                return SessionResponse(GitHubWire.SessionId, body.RootElement.GetProperty("ownerName").GetString()!, oldQueue);
+            }
+            if (request.Method == HttpMethod.Get && path == oldQueue)
+            {
+                int poll = Interlocked.Increment(ref oldPolls);
+                if (poll == 1)
+                {
+                    Assert.DoesNotContain("lastMessageId", request.Uri.Query, StringComparison.Ordinal);
+                    return Delivery(9);
+                }
+                Assert.Contains("lastMessageId=9", request.Uri.Query, StringComparison.Ordinal);
+                if (poll == 2)
+                {
+                    table.Wire.DenyGetItem(checkpointKey);
+                    return new HttpResponseMessage(HttpStatusCode.Accepted);
+                }
+                return poll == 3 && outcome == "AcknowledgementUnauthorized"
+                    ? Delivery(10) : new HttpResponseMessage(HttpStatusCode.Unauthorized);
+            }
+            if (request.Method == HttpMethod.Patch && path == closePath)
+            {
+                if (outcome is "AcknowledgementUnauthorized" or "RefreshUnauthorized")
+                {
+                    return new HttpResponseMessage(HttpStatusCode.Unauthorized);
+                }
+                var active = Assert.IsType<SessionRecord>(await store.ReadSessionAsync(key, cancellation));
+                Assert.Equal(GitHubWire.SessionId, active.SessionId);
+                return SessionResponse(GitHubWire.SessionId, active.OwnerName, oldQueue);
+            }
+            if (request.Method == HttpMethod.Delete && path == oldQueue + "/9")
+            {
+                return new HttpResponseMessage(HttpStatusCode.NoContent);
+            }
+            if (request.Method == HttpMethod.Delete && (path == oldQueue + "/10" || path == closePath))
+            {
+                return new HttpResponseMessage(HttpStatusCode.Unauthorized);
+            }
+            return FixtureLookup(request, profile);
+        });
+        using var candidateWire = new GitHubWire(async (request, cancellation) =>
+        {
+            string path = request.Uri.AbsolutePath;
+            if (request.Method == HttpMethod.Delete && path == closePath)
+            {
+                var closing = Assert.IsType<SessionRecord>(await store.ReadSessionAsync(key, cancellation));
+                Assert.Equal((SessionPhase.Closing, SessionCloseKind.OwnedClient, GitHubWire.SessionId, current.Lease.Fence),
+                    (closing.Phase, closing.CloseKind, closing.SessionId, closing.Owner));
+                Assert.Equal((key, GitHubRoutingIdentity.Scope(Scope), GitHubWire.SetId),
+                    (closing.Binding.Profile, closing.Binding.ScopeIdentity, closing.Binding.ScaleSetId));
+                return outcome switch
+                {
+                    "CloseUnauthorized" => new HttpResponseMessage(HttpStatusCode.Unauthorized),
+                    "CloseNotFound" => new HttpResponseMessage(HttpStatusCode.NotFound),
+                    "CloseResponseLost" => throw new HttpRequestException("Synthetic lost exact session-close response."),
+                    _ => new HttpResponseMessage(HttpStatusCode.NoContent),
+                };
+            }
+            if (request.Method == HttpMethod.Post && path == sessionPath)
+            {
+                var opening = Assert.IsType<SessionRecord>(await store.ReadSessionAsync(key, cancellation));
+                Assert.Equal(SessionPhase.OpenIntent, opening.Phase);
+                Assert.Equal(GitHubWire.SessionId, opening.PriorSessionId);
+                Assert.Equal(current.Lease.Fence, opening.Owner);
+                using var body = JsonDocument.Parse(request.Body!);
+                return SessionResponse(SecondSession, body.RootElement.GetProperty("ownerName").GetString()!, newQueue);
+            }
+            if (request.Method == HttpMethod.Get && path == newQueue)
+            {
+                if (Interlocked.Increment(ref replacementPolls) == 1)
+                {
+                    Assert.DoesNotContain("lastMessageId", request.Uri.Query, StringComparison.Ordinal);
+                    return Delivery(19, requestId: 73);
+                }
+                Assert.Contains("lastMessageId=19", request.Uri.Query, StringComparison.Ordinal);
+                newPollAcknowledged.TrySetResult();
+                await Task.Delay(Timeout.InfiniteTimeSpan, cancellation);
+            }
+            if (request.Method == HttpMethod.Post && path == SetPath(profile) + "/acquirejobs")
+            {
+                Assert.Equal(73, Assert.Single(Assert.IsType<int[]>(JsonSerializer.Deserialize<int[]>(request.Body!))));
+                return GitHubWire.Json(HttpStatusCode.OK, """{"count":1,"value":[73]}""");
+            }
+            if (request.Method == HttpMethod.Delete && path == newQueue + "/19")
+            {
+                return new HttpResponseMessage(HttpStatusCode.NoContent);
+            }
+            return FixtureLookup(request, outcome == "BindingMismatch" && path == SetPath(profile)
+                ? config.Profiles.Single(profile => profile.Id == SecondProfile) : profile, SetPath(profile));
+        });
+        using var previousHttp = new HttpClient(previousWire, disposeHandler: false);
+        using var candidateHttp = new HttpClient(candidateWire, disposeHandler: false);
+        using var aws = CreateSecretWire(config);
+        using var replacementAws = CreateSecretWire(config, "abcdef0123456789abcdef0123456789", "ghp_FixtureReplacementNeverValid");
+        using var sdk = new AmazonSecretsManagerClient(AwsWireTransport.Credentials, aws.Configure(new AmazonSecretsManagerConfig()));
+        using var replacementSdk = new AmazonSecretsManagerClient(AwsWireTransport.Credentials, replacementAws.Configure(new AmazonSecretsManagerConfig()));
+        var secrets = new GitHubSecretLoader(sdk);
+        var clients = new GitHubScaleSetClientFactory(httpClient: previousHttp, timeProvider: clock);
+        var rotation = new GitHubCredentialRotator(new GitHubSecretLoader(replacementSdk),
+            new GitHubScaleSetClientFactory(httpClient: candidateHttp, timeProvider: clock));
+        await using var session = new ControllerProfileSession(config, profile, 1, ownership, store, secrets, clients,
+            new GitHubScaleSetRegistration(store, clock, Timing.WriteReserve, Timing.SessionSendWindow),
+            new GitHubListenerSupervisor(store, clock, Timing, rotation), rotation,
+            new GitHubCredentialCooldown(clock, Timing.UnauthorizedCooldown), clock);
+        session.ListenerHealthChanged = () =>
+        {
+            switch (session.ListenerResult)
+            {
+                case { Status: GitHubListenerLaneStatus.StorageRejected }:
+                    storageDenied.TrySetResult();
+                    break;
+                case { Status: GitHubListenerLaneStatus.Failed, Failure.StatusCode: 401 }:
+                    oldUnauthorized.TrySetResult();
+                    break;
+                case { Status: GitHubListenerLaneStatus.RecoveryRequired or GitHubListenerLaneStatus.RecoveryCredentialRejected } result:
+                    held.TrySetResult(result);
+                    break;
+            }
+        };
+
+        Assert.Equal(GitHubWire.SetId, (await session.EnsureRegisteredAsync(token))?.ScaleSetId);
+        await storageDenied.Task.WaitAsync(PollObservationBudget, token);
+        var original = Assert.IsType<SessionRecord>(await store.ReadSessionAsync(key, token));
+        var checkpointStore = new GitHubListenerCheckpointStore(store, Assert.IsType<OwnedSessionFence>(original.Fence), clock);
+        clock.Now = clock.Now.AddSeconds(61);
+        table.Wire.RestoreGetItem();
+        if (outcome is "AcknowledgementUnauthorized" or "RefreshUnauthorized")
+        {
+            Assert.Equal(401, (await held.Task.WaitAsync(PollObservationBudget, token)).Failure?.StatusCode);
+            Assert.Empty(replacementAws.Requests);
+            Assert.Empty(candidateWire.Requests);
+        }
+        else
+        {
+            await oldUnauthorized.Task.WaitAsync(PollObservationBudget, token);
+            clock.Now = clock.Now.AddSeconds(20);
+            if (outcome == "Replacement")
+            {
+                await newPollAcknowledged.Task.WaitAsync(PollObservationBudget, token);
+                Assert.True(session.IsListenerAvailable);
+                Assert.Single(candidateWire.Requests, request => request.Method == HttpMethod.Post &&
+                    request.Uri.AbsolutePath == SetPath(profile) + "/acquirejobs");
+                Assert.Single(candidateWire.Requests, request => request.Method == HttpMethod.Delete && request.Uri.AbsolutePath == newQueue + "/19");
+            }
+            else
+            {
+                var failure = await held.Task.WaitAsync(PollObservationBudget, token);
+                Assert.Equal(outcome switch { "CloseUnauthorized" => 401, "CloseNotFound" => 404, _ => (int?)null }, failure.Failure?.StatusCode);
+                Assert.False(session.IsListenerAvailable);
+                Assert.DoesNotContain(candidateWire.Requests, request => request.Method == HttpMethod.Post && request.Uri.AbsolutePath == sessionPath);
+            }
+        }
+        await session.CancelPollsAsync(token);
+        await session.JoinMutatorsAsync(token);
+        var durable = Assert.IsType<SessionRecord>(await store.ReadSessionAsync(key, token));
+        Assert.Equal(original.Binding, durable.Binding);
+        Assert.Equal(current.Lease.Fence, durable.Owner);
+        Assert.Equal(outcome == "Replacement" ? SecondSession : GitHubWire.SessionId, durable.SessionId);
+        Assert.Equal(outcome.StartsWith("Close", StringComparison.Ordinal) ? SessionPhase.Closing : SessionPhase.Active, durable.Phase);
+        Assert.DoesNotContain(previousWire.Requests, request => request.Method == HttpMethod.Delete && request.Uri.AbsolutePath == closePath);
+        if (outcome == "Replacement" || outcome.StartsWith("Close", StringComparison.Ordinal))
+        {
+            Assert.Single(candidateWire.Requests, request => request.Method == HttpMethod.Delete && request.Uri.AbsolutePath == closePath);
+        }
+        else
+        {
+            Assert.DoesNotContain(candidateWire.Requests, request => request.Method == HttpMethod.Delete && request.Uri.AbsolutePath == closePath);
+        }
+        if (outcome is "AcknowledgementUnauthorized" or "RefreshUnauthorized" or "BindingMismatch")
+        {
+            var checkpoint = Assert.IsType<ScaleSetListenerCheckpoint>(await checkpointStore.ReadAsync(checkpointStore.SessionKey, token));
+            Assert.Equal(9L, checkpoint.LastAcknowledgedMessageId);
+            if (outcome == "AcknowledgementUnauthorized")
+            {
+                Assert.Equal(ScaleSetListenerPendingPhase.Acknowledging, checkpoint.Pending?.Phase);
+                Assert.Equal(10L, checkpoint.Pending?.Delivery.Message?.MessageId);
+                Assert.Single(previousWire.Requests, request => request.Method == HttpMethod.Delete && request.Uri.AbsolutePath == oldQueue + "/10");
+            }
+            else
+            {
+                Assert.Null(checkpoint.Pending);
+            }
+        }
+    }
+
     private static HttpResponseMessage Delivery(long messageId, long? requestId = null) => GitHubWire.Json(HttpStatusCode.OK,
         JsonSerializer.Serialize(new
         {
@@ -387,12 +612,38 @@ public sealed class ControllerProfileSessionTests
         Assert.Empty(wire.Requests);
     }
 
-    private static AwsWireTransport CreateSecretWire(RuntimeConfiguration configuration) => new(_ => AwsWireTransport.Json(JsonSerializer.Serialize(new
+    private static HttpResponseMessage SessionResponse(Guid sessionId, string ownerName, string queue) =>
+        GitHubWire.Json(HttpStatusCode.OK, JsonSerializer.Serialize(new
+        {
+            sessionId, ownerName,
+            messageQueueUrl = "https://" + GitHubWire.QueueHost + queue,
+            messageQueueAccessToken = GitHubWire.QueueToken,
+            statistics = new { totalAssignedJobs = 0 },
+        }));
+
+    private static HttpResponseMessage FixtureLookup(GitHubRequest request, RunnerProfile profile, string? setPath = null) =>
+        (request.Method, request.Uri.AbsolutePath) switch
+        {
+            (var method, GroupsPath) when method == HttpMethod.Get => GitHubWire.Json(HttpStatusCode.OK, JsonSerializer.Serialize(new
+            {
+                count = 1, value = new[] { new { id = GroupId(profile), name = profile.GitHub.RunnerGroup } },
+            })),
+            (var method, SetsPath) when method == HttpMethod.Get => GitHubWire.Json(HttpStatusCode.OK, JsonSerializer.Serialize(new
+            {
+                count = 1, value = new[] { SetBody(profile) },
+            })),
+            (var method, var path) when method == HttpMethod.Get && path == (setPath ?? SetPath(profile)) =>
+                GitHubWire.Json(HttpStatusCode.OK, JsonSerializer.Serialize(SetBody(profile))),
+            _ => throw new InvalidOperationException("Unexpected fixture GitHub operation."),
+        };
+
+    private static AwsWireTransport CreateSecretWire(RuntimeConfiguration configuration, string version = "0123456789abcdef0123456789abcdef",
+        string token = "ghp_FixtureOnlyNeverValid") => new(_ => AwsWireTransport.Json(JsonSerializer.Serialize(new
     {
         ARN = configuration.GitHub["engineering"].SecretArn,
-        VersionId = "0123456789abcdef0123456789abcdef",
+        VersionId = version,
         VersionStages = CurrentStage,
-        SecretString = JsonSerializer.Serialize(new { token = "ghp_FixtureOnlyNeverValid" }),
+        SecretString = JsonSerializer.Serialize(new { token }),
     })));
 
     private static object SetBody(RunnerProfile profile) => new

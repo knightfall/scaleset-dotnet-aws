@@ -401,6 +401,12 @@ internal sealed class ControllerProfileSession : IAsyncDisposable
                     PublishListenerResult(stepped);
                     return;
                 }
+                if (recovering && stepped is { Status: GitHubListenerLaneStatus.Failed, Failure.StatusCode: 401 } &&
+                    !lane.PollCredentialRejected)
+                {
+                    PublishListenerResult(stepped with { Status = GitHubListenerLaneStatus.RecoveryRequired });
+                    return;
+                }
                 if (stepped.Status == GitHubListenerLaneStatus.StorageRejected || (recovering && stepped is not
                     { Status: GitHubListenerLaneStatus.Stepped, Step.Status: ScaleSetListenerStepStatus.Initialized or
                         ScaleSetListenerStepStatus.EmptyPoll or ScaleSetListenerStepStatus.MessageAcknowledged }))
@@ -430,17 +436,23 @@ internal sealed class ControllerProfileSession : IAsyncDisposable
 
         async Task<GitHubListenerLaneResult> PollOnceAsync(CancellationToken attemptToken)
         {
-            // Resume the retained pump before rotating the credential. It owns the
-            // uncertain checkpoint write and any proof that an ACK was never sent.
-            if (!recovering && _clock.GetUtcNow() >= rotation)
+            // Only an actual queue GET can establish that the retained pump reached a
+            // fresh poll after settling its local checkpoint work and prior ACK.
+            if ((!recovering || lane.PollCredentialRejected) && _clock.GetUtcNow() >= rotation)
             {
-                var rotated = await lane.RotateAsync(attemptToken).ConfigureAwait(false);
+                var rotated = recovering
+                    ? await lane.RotateAfterUnauthorizedPollAsync(attemptToken).ConfigureAwait(false)
+                    : await lane.RotateAsync(attemptToken).ConfigureAwait(false);
                 rotation = _clock.GetUtcNow() + RotationInterval;
-                if (rotated.Status == GitHubListenerLaneStatus.StorageRejected)
+                if (rotated.Status == GitHubListenerLaneStatus.StorageRejected ||
+                    (recovering && rotated.Status is GitHubListenerLaneStatus.RecoveryRequired or GitHubListenerLaneStatus.RecoveryCredentialRejected))
                 {
                     return rotated;
                 }
-                PublishListenerResult(rotated);
+                if (!recovering)
+                {
+                    PublishListenerResult(rotated);
+                }
             }
             return await lane.StepAsync(attemptToken).ConfigureAwait(false);
         }
@@ -486,6 +498,7 @@ internal sealed class ControllerProfileSession : IAsyncDisposable
         GitHubListenerLaneStatus.OwnershipUnavailable => "listener_ownership_unavailable",
         GitHubListenerLaneStatus.StorageUnavailable => "listener_storage_unavailable",
         GitHubListenerLaneStatus.StorageRejected => "listener_storage_rejected",
+        GitHubListenerLaneStatus.RecoveryCredentialRejected => "listener_credential_rejected",
         GitHubListenerLaneStatus.Stopped => "listener_stopped",
         _ => null,
     };

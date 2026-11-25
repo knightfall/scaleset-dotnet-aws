@@ -66,7 +66,8 @@ and [package consumer example](https://github.com/knightfall/scaleset.NET/tree/v
 
 | Situation | Required controller behaviour |
 | --- | --- |
-| Same session client is still open | Await the previous step and reconstruct the pump with that client and the exact key. Resume the stored phase before polling. |
+| Same session client and pump are still open | Await the previous step and resume the retained pump with the same exact client and key. Settle the stored phase before polling. |
+| The retained pump reaches a queue GET that definitively returns HTTP 401 after storage recovery | Verify the settled checkpoint and exact current owner and binding. Validate the replacement credential and journal an owned-session close. Adopt the credential after the exact DELETE succeeds and retirement is durable. |
 | Previous process/client is lost | After fencing the previous owner, journal retirement and call `ScaleSetClient.DeleteMessageSessionAsync(scaleSetId, sessionId, token)` with administration credentials for the configured target. Successful completion confirms retirement of that exact session. |
 | Retirement succeeds | Reconcile and retain old unresolved delivery/reservation evidence, then create an independently authorized replacement with a new session key, initial statistics, and absent cursor. |
 | Acknowledgement or retirement is ambiguous | Preserve uncertainty and stop the affected lane pending reconciliation or independent retirement evidence. A 400/404 or local elapsed time is not sufficient proof. Never carry the old cursor or DELETE to a replacement session. |

@@ -24,6 +24,7 @@ public sealed partial class GitHubListenerLane : IDisposable
     private IMessageSession? _ownedSession;
     private OwnedSessionFence? _ownedFence;
     private GitHubListenerCheckpointStore? _checkpoint;
+    private ObservedMessageSession? _observedSession;
     private ScaleSetListenerPump? _pump;
     private KnownSessionResponse? _known;
     private GitHubScaleSetConnection? _validatedCandidate;
@@ -54,6 +55,8 @@ public sealed partial class GitHubListenerLane : IDisposable
 
     public GitHubListenerLaneResult? LastResult { get; private set; }
 
+    public bool PollCredentialRejected => _observedSession?.PollCredentialRejected == true;
+
     public DateTimeOffset? ReadCredentialCooldown() =>
         Volatile.Read(ref _stopping) == 0 && !_definition.OwnershipLost.IsCancellationRequested
             ? _cooldown.Read(_connection.SecretArn) : null;
@@ -69,6 +72,10 @@ public sealed partial class GitHubListenerLane : IDisposable
                 return Report(new GitHubListenerLaneResult(GitHubListenerLaneStatus.Stopped));
             }
             _definition.OwnershipLost.ThrowIfCancellationRequested();
+            if (_observedSession is { } observed)
+            {
+                observed.PollCredentialRejected = false;
+            }
             using var administration = CancellationTokenSource.CreateLinkedTokenSource(stoppingToken, _definition.OwnershipLost);
             if (await EnsureSessionAsync(administration.Token).ConfigureAwait(false) is { } waiting)
             {
@@ -106,7 +113,13 @@ public sealed partial class GitHubListenerLane : IDisposable
         }
     }
 
-    public async Task<GitHubListenerLaneResult> RotateAsync(CancellationToken cancellationToken)
+    public Task<GitHubListenerLaneResult> RotateAsync(CancellationToken cancellationToken) =>
+        RotateAsync(recoveringRejectedPoll: false, cancellationToken);
+
+    public Task<GitHubListenerLaneResult> RotateAfterUnauthorizedPollAsync(CancellationToken cancellationToken) =>
+        RotateAsync(recoveringRejectedPoll: true, cancellationToken);
+
+    private async Task<GitHubListenerLaneResult> RotateAsync(bool recoveringRejectedPoll, CancellationToken cancellationToken)
     {
         await _serial.WaitAsync(cancellationToken).ConfigureAwait(false);
         using var profileTelemetry = TelemetryProfileScope.Enter(_telemetryProfile);
@@ -123,9 +136,20 @@ public sealed partial class GitHubListenerLane : IDisposable
 
             using var administration = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _definition.OwnershipLost);
             var token = administration.Token;
-            if (await ReadOwnershipAsync(token).ConfigureAwait(false) is not { } ownership ||
-                (_checkpoint is not null && await _checkpoint.ReadAsync(_checkpoint.SessionKey, token).ConfigureAwait(false) is { Pending: not null }) ||
-                SendWindow(ownership) is not { } window)
+            if (await ReadOwnershipAsync(token).ConfigureAwait(false) is not { } ownership)
+            {
+                return Report(new GitHubListenerLaneResult(GitHubListenerLaneStatus.Waiting));
+            }
+            var checkpoint = _checkpoint is { } checkpointStore
+                ? await checkpointStore.ReadAsync(checkpointStore.SessionKey, token).ConfigureAwait(false) : null;
+            if (checkpoint is { Pending: not null } ||
+                (recoveringRejectedPoll && (!PollCredentialRejected || _ownedFence is not { } fence || !MatchesCurrentSession(fence) ||
+                    checkpoint is not { InitialStatisticsCompleted: true })))
+            {
+                return Report(new GitHubListenerLaneResult(recoveringRejectedPoll
+                    ? GitHubListenerLaneStatus.RecoveryRequired : GitHubListenerLaneStatus.Waiting));
+            }
+            if (SendWindow(ownership) is not { } window)
             {
                 return Report(new GitHubListenerLaneResult(GitHubListenerLaneStatus.Waiting));
             }
@@ -141,13 +165,19 @@ public sealed partial class GitHubListenerLane : IDisposable
                 {
                     _cooldown.Record(_connection.SecretArn, rateLimited);
                 }
-                return Report(new GitHubListenerLaneResult(result.Status == GitHubCredentialRotationStatus.CandidateRejected
-                    ? GitHubListenerLaneStatus.CredentialRejected : GitHubListenerLaneStatus.CredentialUnchanged, Failure: result.Failure));
+                var status = result.Status switch
+                {
+                    GitHubCredentialRotationStatus.CandidateRejected when recoveringRejectedPoll => GitHubListenerLaneStatus.RecoveryCredentialRejected,
+                    GitHubCredentialRotationStatus.CandidateRejected => GitHubListenerLaneStatus.CredentialRejected,
+                    _ => GitHubListenerLaneStatus.CredentialUnchanged,
+                };
+                return Report(new GitHubListenerLaneResult(status, Failure: result.Failure));
             }
 
             try
             {
-                if (_ownedSession is not null && await CloseOwnedAsync(ownership, token).ConfigureAwait(false) is { } waiting)
+                if (_ownedSession is not null &&
+                    await CloseOwnedAsync(ownership, token, recoveringRejectedPoll ? candidate : null).ConfigureAwait(false) is { } waiting)
                 {
                     return Report(waiting);
                 }
@@ -358,7 +388,8 @@ public sealed partial class GitHubListenerLane : IDisposable
             ? null : new GitHubListenerLaneResult(GitHubListenerLaneStatus.RecoveryRequired);
     }
 
-    private async Task<GitHubListenerLaneResult?> CloseOwnedAsync(GitHubRegistrationLease ownership, CancellationToken cancellationToken)
+    private async Task<GitHubListenerLaneResult?> CloseOwnedAsync(
+        GitHubRegistrationLease ownership, CancellationToken cancellationToken, GitHubScaleSetConnection? validatedAdministrator = null)
     {
         var durable = await _store.ReadSessionAsync(_binding.Profile, cancellationToken).ConfigureAwait(false);
         if (_ownedSession is not { } session || _ownedFence is not { } fence || durable is null || durable.Fence != fence ||
@@ -366,11 +397,12 @@ public sealed partial class GitHubListenerLane : IDisposable
         {
             return new GitHubListenerLaneResult(GitHubListenerLaneStatus.OwnershipUnavailable);
         }
-        return await BeginRetirementAsync(ownership, durable, session, cancellationToken).ConfigureAwait(false);
+        return await BeginRetirementAsync(ownership, durable, session, cancellationToken, validatedAdministrator).ConfigureAwait(false);
     }
 
     private async Task<GitHubListenerLaneResult?> BeginRetirementAsync(
-        GitHubRegistrationLease ownership, SessionRecord durable, IMessageSession? owned, CancellationToken cancellationToken)
+        GitHubRegistrationLease ownership, SessionRecord durable, IMessageSession? owned, CancellationToken cancellationToken,
+        GitHubScaleSetConnection? validatedAdministrator = null)
     {
         if (SendWindow(ownership) is not { } window)
         {
@@ -384,7 +416,17 @@ public sealed partial class GitHubListenerLane : IDisposable
             return new GitHubListenerLaneResult(GitHubListenerLaneStatus.RecoveryRequired);
         }
         ClearPump();
-        await _connection.RetireSessionAsync(permission, owned, cancellationToken).ConfigureAwait(false);
+        try
+        {
+            await (validatedAdministrator ?? _connection).RetireSessionAsync(
+                permission, owned, cancellationToken, useAdministratorForOwnedClose: validatedAdministrator is not null).ConfigureAwait(false);
+        }
+        catch (Exception error) when (validatedAdministrator is not null && IsLaneFailure(error))
+        {
+            // The close intent is durable and the exact response is uncertain. Keep it held.
+            _recoveryRequired = true;
+            return new GitHubListenerLaneResult(GitHubListenerLaneStatus.RecoveryRequired, Failure: GitHubOperationException.From(error));
+        }
         _known = new KnownSessionResponse(permission, null);
         return await ConfirmKnownAsync(cancellationToken).ConfigureAwait(false)
             ? null : new GitHubListenerLaneResult(GitHubListenerLaneStatus.RecoveryRequired);
@@ -427,7 +469,8 @@ public sealed partial class GitHubListenerLane : IDisposable
         var execution = new GitHubListenerExecutionPolicy(_store, fence, _checkpoint.SessionKey, _cooldown, _connection.SecretArn,
             ReadOwnershipAsync, token => ReadPollCapacityAsync(handler, token), _clock, _timing.WriteReserve, _definition.OwnershipLost);
         var options = new ScaleSetListenerPumpOptions(_checkpoint.SessionKey, _definition.OwnershipLost);
-        _pump = new ScaleSetListenerPump(new ObservedMessageSession(session, _clock), options, _checkpoint, handler, execution, _clock);
+        _observedSession = new ObservedMessageSession(session, _clock);
+        _pump = new ScaleSetListenerPump(_observedSession, options, _checkpoint, handler, execution, _clock);
     }
 
     private void ClearPump()
@@ -435,6 +478,7 @@ public sealed partial class GitHubListenerLane : IDisposable
         _ownedSession = null;
         _ownedFence = null;
         _checkpoint = null;
+        _observedSession = null;
         _pump = null;
     }
 
