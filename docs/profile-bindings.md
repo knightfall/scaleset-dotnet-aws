@@ -153,4 +153,6 @@ Verify that the active controller task role can read only the configured full Gi
 
 Use only the secret ARN in the YAML. The GitHub App secret JSON has `clientId`, a positive integer `installationId`, and `privateKey`. The enterprise PAT form has `token` and belongs to an enterprise scope. Populate these values through the authorized secret-management workflow.
 
+When a full Fargate warm reserve serves an offered job, the controller checks membership in the bound scale set and confirms that the exact runner is online and idle through the scoped GitHub REST runner endpoint. Qualification should verify this read for a JIT runner using the configured repository or organization App installation, or enterprise PAT. An unavailable or inconclusive read leaves the warm slot unavailable for admission. [GitHub REST runner status](https://docs.github.com/en/enterprise-cloud@latest/rest/actions/self-hosted-runners)
+
 Keep the tested target and authentication scope with the release record. The template's GitHub App binding needs its own target qualification. The released SDK's existing live evidence covers GitHub.com repository scope with a personal-account credential. [Released SDK qualification](dependency-baseline.md#session-recovery-and-qualification-boundary)
