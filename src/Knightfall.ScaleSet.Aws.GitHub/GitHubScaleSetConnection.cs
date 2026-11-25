@@ -40,7 +40,7 @@ public sealed class GitHubScaleSetClientFactory(
         {
             string identity = GitHubRoutingIdentity.Scope(version.Target.SourceUri.AbsoluteUri);
             return new GitHubScaleSetConnection(version.CreateClient(options, httpClient, timeProvider),
-                identity, version, timeProvider ?? TimeProvider.System);
+                identity, version, timeProvider ?? TimeProvider.System, httpClient);
         }
         catch (Exception error)
         {
@@ -53,11 +53,14 @@ public sealed partial class GitHubScaleSetConnection : IGitHubScaleSetRemote, ID
 {
     private readonly ScaleSetClient _client;
     private readonly TimeProvider _clock;
+    private readonly GitHubRunnerAvailability _availability;
 
-    internal GitHubScaleSetConnection(ScaleSetClient client, string scopeIdentity, GitHubSecretVersion version, TimeProvider clock)
+    internal GitHubScaleSetConnection(ScaleSetClient client, string scopeIdentity, GitHubSecretVersion version,
+        TimeProvider clock, HttpClient? httpClient)
     {
         _client = client;
         _clock = clock;
+        _availability = version.CreateRunnerAvailability(httpClient, clock, client.UserAgent);
         ScopeIdentity = scopeIdentity;
         int separator = scopeIdentity.IndexOf('/');
         ScopeUrl = "https://" + scopeIdentity[..separator] + "/" +

@@ -72,8 +72,7 @@ public sealed class GitHubSecretLoader
                 "invalid-secret-response", "Secrets Manager did not return the exact current text credential version.");
         }
 
-        var credentials = ParseCredentials(response.SecretString, settings.AuthType);
-        return new GitHubSecretVersion(settings.SecretArn, response.VersionId, settings.AuthType, target, credentials);
+        return ParseVersion(response.SecretString, settings, response.VersionId, target);
     }
 
     private static GitHubTarget ValidateTarget(GitHubConnectionConfiguration settings)
@@ -102,7 +101,7 @@ public sealed class GitHubSecretLoader
         return target;
     }
 
-    private static ScaleSetCredentials ParseCredentials(string secret, GitHubAuthType authType)
+    private static GitHubSecretVersion ParseVersion(string secret, GitHubConnectionConfiguration settings, string versionId, GitHubTarget target)
     {
         try
         {
@@ -113,10 +112,12 @@ public sealed class GitHubSecretLoader
                 throw InvalidPayload();
             }
 
-            return authType switch
+            return settings.AuthType switch
             {
-                GitHubAuthType.GitHubApp when root.GetPropertyCount() == 3 => ParseAppCredentials(root),
-                GitHubAuthType.EnterprisePat when root.GetPropertyCount() == 1 => ParseEnterprisePat(root),
+                GitHubAuthType.GitHubApp when root.GetPropertyCount() == 3 =>
+                    new GitHubSecretVersion(settings.SecretArn, versionId, target, ParseAppCredentials(root)),
+                GitHubAuthType.EnterprisePat when root.GetPropertyCount() == 1 =>
+                    new GitHubSecretVersion(settings.SecretArn, versionId, target, ParseEnterprisePat(root)),
                 _ => throw InvalidPayload(),
             };
         }
@@ -126,7 +127,7 @@ public sealed class GitHubSecretLoader
         }
     }
 
-    private static ScaleSetCredentials ParseAppCredentials(JsonElement root)
+    private static GitHubAppAuthorization ParseAppCredentials(JsonElement root)
     {
         if (!root.TryGetProperty("installationId", out var installation) ||
             installation.ValueKind != JsonValueKind.Number ||
@@ -135,11 +136,11 @@ public sealed class GitHubSecretLoader
             throw InvalidPayload();
         }
 
-        return ScaleSetCredentials.FromGitHubApp(
-            RequiredText(root, "clientId"), installationId, RequiredText(root, "privateKey"));
+        return new GitHubAppAuthorization(RequiredText(root, "clientId"), installationId,
+            new PemGitHubAppJwtProvider(RequiredText(root, "privateKey")));
     }
 
-    private static ScaleSetCredentials ParseEnterprisePat(JsonElement root)
+    private static string ParseEnterprisePat(JsonElement root)
     {
         const string prefix = "ghp_";
         string token = RequiredText(root, "token");
@@ -150,7 +151,7 @@ public sealed class GitHubSecretLoader
             throw InvalidPayload();
         }
 
-        return ScaleSetCredentials.FromPersonalAccessToken(token);
+        return token;
     }
 
     private static string RequiredText(JsonElement root, string propertyName)
