@@ -12,6 +12,7 @@ using Knightfall.ScaleSet.Aws.DynamoDb;
 using Knightfall.ScaleSet.Aws.GitHub;
 using Knightfall.ScaleSet.Aws.SdkContract.Tests.Aws;
 using Knightfall.ScaleSet.Aws.SdkContract.Tests.GitHub;
+using ScaleSet.Listener;
 using Xunit;
 
 namespace Knightfall.ScaleSet.Aws.Lifecycle.Tests;
@@ -28,6 +29,7 @@ public sealed class ControllerProfileSessionTests
     private const string SuccessorTask = "arn:aws:ecs:us-east-1:000000000000:task/controller/00000000000000000000000000000002";
     private static readonly Guid SecondSession = Guid.Parse("51688c9f-f017-4a9a-b59f-77ed34074c1c");
     private static readonly string[] CurrentStage = ["AWSCURRENT"];
+    private static readonly string[] OfferLabels = ["linux"];
     private static readonly GitHubListenerTiming Timing = new(TimeSpan.FromSeconds(5), TimeSpan.FromSeconds(25), TimeSpan.FromSeconds(15));
     private static readonly TimeSpan PollObservationBudget = TimeSpan.FromSeconds(30);
 
@@ -36,7 +38,12 @@ public sealed class ControllerProfileSessionTests
     [InlineData("AccessDeniedException")]
     [InlineData("ExpiredTokenException")]
     [InlineData("ClientFailure")]
-    public async Task IndependentLanesReportStorageFaultsAndExplicitShutdownClosesOnlyExactSessions(string? storageFailure)
+    [InlineData("RotationRejected")]
+    [InlineData("UnexpectedPollFailure")]
+    [InlineData("UnexpectedAcknowledgementFailure")]
+    [InlineData("PermanentRejection")]
+    [InlineData("ReplacedOwner")]
+    public async Task IndependentLanesRecoverOnlyWithExactSessionCursorAndOwner(string? failure)
     {
         using var budget = CancellationTokenSource.CreateLinkedTokenSource(TestContext.Current.CancellationToken);
         // Table setup and earlier requests can consume most of the budget on a shared CI runner.
@@ -52,11 +59,20 @@ public sealed class ControllerProfileSessionTests
         string deployment = ControllerLeaseRecoveryCoordinator.DeploymentKey(config);
         var firstKey = new LifecycleProfile(deployment, FirstProfile);
         var secondKey = new LifecycleProfile(deployment, SecondProfile);
+        var checkpointKey = LifecycleKey.Checkpoint(firstKey, GitHubWire.SessionId);
+        var current = Assert.IsType<ActiveControllerAuthority>(ownership.ReadAuthority());
+        var inventory = new ExecutorInventoryObservation(clock.Now, IsComplete: true, BackendCapacityCeiling: 2, BackendLaunchHeadroom: 2);
+        Assert.Equal(LifecycleWriteOutcome.Committed, await store.PublishExecutorInventoryAsync(firstKey, current.Lease.Fence, null, inventory, token));
+        Assert.Equal(LifecycleWriteOutcome.Committed, await store.PublishExecutorInventoryAsync(secondKey, current.Lease.Fence, null, inventory, token));
         var firstPoll = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var secondPoll = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var firstRecovered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var firstFault = new TaskCompletionSource<GitHubListenerLaneStatus>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var firstHeld = new TaskCompletionSource<GitHubListenerLaneStatus>(TaskCreationOptions.RunContinuationsAsynchronously);
         int firstPolls = 0;
+        int firstCheckpointReadsAtFault = 0;
+        bool deniesCheckpoint = failure is "AccessDeniedException" or "RotationRejected" or "PermanentRejection" or "ReplacedOwner";
+        bool ambiguousAck = failure == "UnexpectedAcknowledgementFailure";
 
         using var wire = new GitHubWire(async (request, cancellation) =>
         {
@@ -100,28 +116,74 @@ public sealed class ControllerProfileSessionTests
             {
                 if (path == "/" + FirstProfile)
                 {
-                    if (Interlocked.Increment(ref firstPolls) == 1 && storageFailure is not null)
+                    switch (Interlocked.Increment(ref firstPolls))
                     {
-                        var checkpoint = LifecycleKey.Checkpoint(firstKey, GitHubWire.SessionId);
-                        if (storageFailure == "ClientFailure")
-                        {
-                            table.Wire.FailNextGetItem(checkpoint, new AmazonClientException("Synthetic SDK client fault."));
-                        }
-                        else
-                        {
-                            table.Wire.FailNextGetItem(checkpoint, HttpStatusCode.Forbidden, storageFailure);
-                        }
-                        firstPoll.TrySetResult();
-                        return new HttpResponseMessage(HttpStatusCode.Accepted);
+                        case 1:
+                            if (ambiguousAck)
+                            {
+                                firstPoll.TrySetResult();
+                            }
+                            return Delivery(1);
+                        case 2:
+                            Assert.Contains("lastMessageId=1", request.Uri.Query, StringComparison.Ordinal);
+                            firstPoll.TrySetResult();
+                            if (failure == "UnexpectedPollFailure")
+                            {
+                                throw new InvalidOperationException("Synthetic unexpected poll fault.");
+                            }
+                            if (deniesCheckpoint)
+                            {
+                                Volatile.Write(ref firstCheckpointReadsAtFault, CheckpointReads());
+                                table.Wire.DenyGetItem(checkpointKey);
+                                if (failure == "RotationRejected")
+                                {
+                                    clock.Now = clock.Now.AddSeconds(61);
+                                }
+                            }
+                            else if (failure == "ClientFailure")
+                            {
+                                table.Wire.FailNextGetItem(checkpointKey, new AmazonClientException("Synthetic SDK client fault."));
+                            }
+                            else if (failure == "ExpiredTokenException")
+                            {
+                                table.Wire.FailNextGetItem(checkpointKey, HttpStatusCode.Forbidden, failure);
+                            }
+                            return new HttpResponseMessage(HttpStatusCode.Accepted);
+                        case 3:
+                            Assert.Contains("lastMessageId=1", request.Uri.Query, StringComparison.Ordinal);
+                            return Delivery(2, requestId: 71);
+                        case 4:
+                            Assert.Contains("lastMessageId=2", request.Uri.Query, StringComparison.Ordinal);
+                            firstRecovered.TrySetResult();
+                            break;
+                        default:
+                            throw new InvalidOperationException("A suspended fixture poll was duplicated.");
                     }
-                    firstPoll.TrySetResult();
-                    firstRecovered.TrySetResult();
                 }
                 else
                 {
+                    if (!request.Uri.Query.Contains("lastMessageId=11", StringComparison.Ordinal))
+                    {
+                        return Delivery(11, requestId: 81);
+                    }
                     secondPoll.TrySetResult();
                 }
                 await Task.Delay(Timeout.InfiniteTimeSpan, cancellation);
+            }
+            if (request.Method == HttpMethod.Post && (path == SetPath(firstProfile) + "/acquirejobs" || path == SetPath(secondProfile) + "/acquirejobs"))
+            {
+                int requestId = path == SetPath(firstProfile) + "/acquirejobs" ? 71 : 81;
+                Assert.Equal(requestId, Assert.Single(Assert.IsType<int[]>(JsonSerializer.Deserialize<int[]>(request.Body!))));
+                return GitHubWire.Json(HttpStatusCode.OK, JsonSerializer.Serialize(new { count = 1, value = new[] { requestId } }));
+            }
+            if (request.Method == HttpMethod.Delete && request.Uri.Host == GitHubWire.QueueHost)
+            {
+                if (ambiguousAck && path == "/" + FirstProfile + "/1")
+                {
+                    throw new InvalidOperationException("Synthetic lost acknowledgement response.");
+                }
+                Assert.Contains(path, new[] { "/" + FirstProfile + "/1", "/" + FirstProfile + "/2", "/" + SecondProfile + "/11" });
+                return new HttpResponseMessage(HttpStatusCode.NoContent);
             }
             if (request.Method == HttpMethod.Delete && (path == SessionPath(firstProfile) + $"/{GitHubWire.SessionId:D}" ||
                                                         path == SessionPath(secondProfile) + $"/{SecondSession:D}"))
@@ -143,56 +205,121 @@ public sealed class ControllerProfileSessionTests
         await using var second = new ControllerProfileSession(config, secondProfile, 1, ownership, store, secrets, clients, registration, supervisor, rotation, cooldown, clock);
         first.ListenerHealthChanged = () =>
         {
-            if (first.ListenerResult?.Status is GitHubListenerLaneStatus.StorageRejected or GitHubListenerLaneStatus.StorageUnavailable)
+            var status = first.ListenerResult?.Status;
+            if (status is GitHubListenerLaneStatus.StorageRejected or GitHubListenerLaneStatus.StorageUnavailable or GitHubListenerLaneStatus.Failed)
             {
-                firstFault.TrySetResult(first.ListenerResult.Status);
+                firstFault.TrySetResult(status.Value);
+            }
+            if (status is GitHubListenerLaneStatus.RecoveryRequired or GitHubListenerLaneStatus.OwnershipUnavailable)
+            {
+                firstHeld.TrySetResult(status.Value);
             }
         };
 
         var firstBinding = Assert.IsType<GitHubScaleSetBinding>(await first.EnsureRegisteredAsync(token));
         await ObservePollAsync(firstPoll.Task, FirstProfile, first);
+        if (failure is not null)
+        {
+            var expected = deniesCheckpoint ? GitHubListenerLaneStatus.StorageRejected : failure switch
+            {
+                "ExpiredTokenException" or "ClientFailure" => GitHubListenerLaneStatus.StorageUnavailable,
+                _ => GitHubListenerLaneStatus.Failed,
+            };
+            Assert.Equal(expected, await firstFault.Task.WaitAsync(PollObservationBudget, token));
+        }
         Assert.Equal(SecondSet, (await second.EnsureRegisteredAsync(token))?.ScaleSetId);
         await ObservePollAsync(secondPoll.Task, SecondProfile, second);
-        if (storageFailure is not null)
+        Assert.True(second.IsListenerAvailable);
+        Assert.Single(wire.Requests, request => request.Method == HttpMethod.Post && request.Uri.AbsolutePath == SetPath(secondProfile) + "/acquirejobs");
+
+        if (deniesCheckpoint)
         {
-            bool rejected = storageFailure == "AccessDeniedException";
-            Assert.Equal(rejected ? GitHubListenerLaneStatus.StorageRejected : GitHubListenerLaneStatus.StorageUnavailable,
-                await firstFault.Task.WaitAsync(PollObservationBudget, token));
-            if (rejected)
+            using var retryBudget = new CancellationTokenSource(PollObservationBudget);
+            using var wait = CancellationTokenSource.CreateLinkedTokenSource(retryBudget.Token, token);
+            while (CheckpointReads() <= Volatile.Read(ref firstCheckpointReadsAtFault) + 1)
             {
-                await first.JoinMutatorsAsync(token);
-                Assert.False(first.IsListenerAvailable);
-                Assert.Equal(1, Volatile.Read(ref firstPolls));
-                Assert.False(firstRecovered.Task.IsCompleted);
+                await Task.Delay(TimeSpan.FromMilliseconds(20), wait.Token);
             }
-            else
-            {
-                await ObservePollAsync(firstRecovered.Task, FirstProfile, first);
-                Assert.Equal(2, Volatile.Read(ref firstPolls));
-            }
-            Assert.True(second.IsListenerAvailable);
-            Assert.Equal(GitHubWire.SessionId, (await store.ReadSessionAsync(firstKey, token))?.SessionId);
+            Assert.False(first.IsListenerAvailable);
+            Assert.Equal("listener_storage_rejected", first.ListenerFailure);
+            Assert.Equal(2, Volatile.Read(ref firstPolls));
         }
+
+        if (failure == "ReplacedOwner")
+        {
+            var successorClock = new ContractClock { Now = current.Lease.ValidUntil.AddSeconds(2) };
+            var successorStore = new DynamoDbLifecycleStore(table.Client, table.Name, successorClock);
+            var successor = await successorStore.TryAcquireLeaseAsync(deployment, "successor", SuccessorTask,
+                ControllerLease.CurrentWriterProtocol, successorClock.Now, successorClock.Now.AddMinutes(5), token);
+            Assert.Equal(LifecycleWriteOutcome.Committed, successor.Outcome);
+            table.Wire.RestoreGetItem();
+            Assert.Equal(GitHubListenerLaneStatus.OwnershipUnavailable, await firstHeld.Task.WaitAsync(PollObservationBudget, token));
+            Assert.False(first.IsListenerAvailable);
+            Assert.Equal(2, Volatile.Read(ref firstPolls));
+            await ownership.EndAuthorityAsync();
+            await first.JoinMutatorsAsync(token);
+            await second.JoinMutatorsAsync(token);
+            await first.CloseOwnedSessionsAsync(token);
+            await second.CloseOwnedSessionsAsync(token);
+            Assert.Equal(SessionPhase.Active, (await store.ReadSessionAsync(firstKey, token))?.Phase);
+            Assert.DoesNotContain(wire.Requests, request => request.Method == HttpMethod.Delete && request.Uri.Host == GitHubWire.ServiceHost);
+            return;
+        }
+
+        bool permanent = failure == "PermanentRejection";
+        if (ambiguousAck)
+        {
+            Assert.Equal(GitHubListenerLaneStatus.RecoveryRequired, await firstHeld.Task.WaitAsync(PollObservationBudget, token));
+            Assert.False(first.IsListenerAvailable);
+            var session = Assert.IsType<SessionRecord>(await store.ReadSessionAsync(firstKey, token));
+            var checkpoint = new GitHubListenerCheckpointStore(store, Assert.IsType<OwnedSessionFence>(session.Fence), clock);
+            var saved = Assert.IsType<ScaleSetListenerCheckpoint>(await checkpoint.ReadAsync(checkpoint.SessionKey, token));
+            Assert.Null(saved.LastAcknowledgedMessageId);
+            Assert.Equal(ScaleSetListenerPendingPhase.Acknowledging, saved.Pending?.Phase);
+            Assert.Equal(1L, saved.Pending?.Delivery.Message?.MessageId);
+            Assert.Equal(1, Volatile.Read(ref firstPolls));
+            Assert.Single(wire.Requests, request => request.Method == HttpMethod.Delete && request.Uri.AbsolutePath == "/" + FirstProfile + "/1");
+        }
+        else if (!permanent)
+        {
+            table.Wire.RestoreGetItem();
+            await ObservePollAsync(firstRecovered.Task, FirstProfile, first);
+            Assert.True(first.IsListenerAvailable);
+            Assert.Equal(4, Volatile.Read(ref firstPolls));
+            Assert.Single(wire.Requests, request => request.Method == HttpMethod.Post && request.Uri.AbsolutePath == SetPath(firstProfile) + "/acquirejobs");
+        }
+
+        Assert.Single(wire.Requests, request => request.Method == HttpMethod.Post && request.Uri.AbsolutePath == SessionPath(firstProfile));
+        Assert.Equal(GitHubWire.SessionId, (await store.ReadSessionAsync(firstKey, token))?.SessionId);
         Assert.Equal(firstBinding, await first.EnsureRegisteredAsync(token));
         var reconciliation = Assert.IsType<GitHubScaleSetConnection>(await first.GetConnectionAsync(token));
         Assert.Equal(firstBinding, (await reconciliation.LookupAsync(firstProfile.GitHub, firstBinding, token)).Binding);
         Assert.Equal(4, wire.Requests.Count(request => request.Uri.AbsolutePath == "/actions/runner-registration"));
 
         await Task.WhenAll(first.StopAdmissionsAsync(token), second.StopAdmissionsAsync(token));
+        if (permanent)
+        {
+            await first.JoinMutatorsAsync(token).WaitAsync(PollObservationBudget, token);
+            Assert.Equal(2, Volatile.Read(ref firstPolls));
+        }
         int requests = table.Wire.Requests.Count;
         Assert.Equal(new ListenerCapacity(0, 0, IsReady: false), await first.ReadListenerCapacityAsync(token));
         Assert.Equal(requests, table.Wire.Requests.Count);
         await Task.WhenAll(first.CancelPollsAsync(token), second.CancelPollsAsync(token));
         await Task.WhenAll(first.JoinMutatorsAsync(token), second.JoinMutatorsAsync(token));
-        Assert.DoesNotContain(wire.Requests, request => request.Method == HttpMethod.Delete);
+        Assert.DoesNotContain(wire.Requests, request => request.Method == HttpMethod.Delete && request.Uri.Host == GitHubWire.ServiceHost);
 
         await Task.WhenAll(first.CloseOwnedSessionsAsync(token), second.CloseOwnedSessionsAsync(token));
         Assert.Equal(SessionPhase.Retired, (await store.ReadSessionAsync(firstKey, token))?.Phase);
         Assert.Equal(SessionPhase.Retired, (await store.ReadSessionAsync(secondKey, token))?.Phase);
-        var deletes = wire.Requests.Where(request => request.Method == HttpMethod.Delete).Select(request => request.Uri.AbsolutePath).ToArray();
+        var deletes = wire.Requests.Where(request => request.Method == HttpMethod.Delete && request.Uri.Host == GitHubWire.ServiceHost)
+            .Select(request => request.Uri.AbsolutePath).ToArray();
         Assert.Equal(2, deletes.Length);
         Assert.Contains(SessionPath(firstProfile) + $"/{GitHubWire.SessionId:D}", deletes);
         Assert.Contains(SessionPath(secondProfile) + $"/{SecondSession:D}", deletes);
+
+        int CheckpointReads() => table.Wire.Requests.Count(call => call.Operation == "GetItem" &&
+            call.Request.GetProperty("Key").GetProperty("SK").GetProperty("S").GetString() == checkpointKey.SortKey);
 
         async Task ObservePollAsync(Task observation, string profile, ControllerProfileSession session)
         {
@@ -207,6 +334,17 @@ public sealed class ControllerProfileSessionTests
             }
         }
     }
+
+    private static HttpResponseMessage Delivery(long messageId, long? requestId = null) => GitHubWire.Json(HttpStatusCode.OK,
+        JsonSerializer.Serialize(new
+        {
+            messageId,
+            messageType = "RunnerScaleSetJobMessages",
+            body = requestId is long offered
+                ? JsonSerializer.Serialize(new[] { new { messageType = "JobAvailable", runnerRequestId = offered, requestLabels = OfferLabels } })
+                : "[]",
+            statistics = new { totalAssignedJobs = 0 },
+        }));
 
     [Theory]
     [InlineData(false)]

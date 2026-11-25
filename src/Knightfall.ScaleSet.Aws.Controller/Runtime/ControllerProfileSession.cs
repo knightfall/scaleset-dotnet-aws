@@ -1,3 +1,4 @@
+using Amazon.Runtime;
 using Knightfall.ScaleSet.Aws.Core.Catalog;
 using Knightfall.ScaleSet.Aws.Core.Configuration;
 using Knightfall.ScaleSet.Aws.Core.Lifecycle;
@@ -11,7 +12,10 @@ namespace Knightfall.ScaleSet.Aws.Controller.Runtime;
 
 internal sealed class ControllerProfileSession : IAsyncDisposable
 {
+    private const int MaximumUnexpectedPollFailures = 4;
+    private const int MaximumPollRecoveryDelaySeconds = 30;
     private static readonly TimeSpan PollRetry = TimeSpan.FromSeconds(1);
+    private static readonly TimeSpan PollRecoveryReadBudget = TimeSpan.FromSeconds(5);
     private static readonly TimeSpan RotationInterval = TimeSpan.FromMinutes(1);
     private static readonly TimeSpan DemandFreshness = TimeSpan.FromMinutes(10);
     private static readonly TimeSpan LogFlushGrace = TimeSpan.FromSeconds(30);
@@ -91,10 +95,9 @@ internal sealed class ControllerProfileSession : IAsyncDisposable
 
     internal bool RequiresListenerHealth => _profile.State == RunnerProfileState.Active;
 
-    internal bool IsListenerAvailable => ReadCredentialCooldown() is null &&
-        ListenerResult is not { Status: GitHubListenerLaneStatus.RecoveryRequired or GitHubListenerLaneStatus.Failed or
-            GitHubListenerLaneStatus.OwnershipUnavailable or GitHubListenerLaneStatus.StorageUnavailable or
-            GitHubListenerLaneStatus.StorageRejected or GitHubListenerLaneStatus.Stopped };
+    internal bool IsListenerAvailable => ListenerFailure is null && ReadCredentialCooldown() is null;
+
+    internal string? ListenerFailure => DescribeListenerFailure(ListenerResult?.Status);
 
     internal DateTimeOffset? ReadCredentialCooldown()
     {
@@ -345,48 +348,147 @@ internal sealed class ControllerProfileSession : IAsyncDisposable
     private async Task PollAsync(GitHubListenerLane lane)
     {
         using var cancellation = CancellationTokenSource.CreateLinkedTokenSource(_polls.Token, _ownership.OwnershipLost);
+        using var recoveryCancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellation.Token, _admissions.Token);
         var token = cancellation.Token;
         var rotation = _clock.GetUtcNow() + RotationInterval;
+        bool recovering = false;
+        int retrySeconds = 1;
+        int unexpectedFailures = 0;
         try
         {
             while (!token.IsCancellationRequested)
             {
+                var attemptToken = recovering ? recoveryCancellation.Token : token;
+                if (recovering)
+                {
+                    await Task.Delay(TimeSpan.FromSeconds(retrySeconds), _clock, attemptToken).ConfigureAwait(false);
+                    retrySeconds = Math.Min(retrySeconds * 2, MaximumPollRecoveryDelaySeconds);
+                }
                 if (ReadCredentialCooldown() is not null)
                 {
-                    await Task.Delay(PollRetry, _clock, token).ConfigureAwait(false);
+                    if (!recovering)
+                    {
+                        await Task.Delay(PollRetry, _clock, token).ConfigureAwait(false);
+                    }
                     continue;
                 }
-                if (_clock.GetUtcNow() >= rotation)
+
+                GitHubListenerLaneResult stepped;
+                try
                 {
-                    var rotated = await lane.RotateAsync(token).ConfigureAwait(false);
-                    PublishListenerResult(rotated);
-                    if (rotated.Status == GitHubListenerLaneStatus.StorageRejected)
+                    if (recovering && await ReadRecoveryHoldAsync(attemptToken).ConfigureAwait(false) is { } held)
                     {
+                        PublishListenerResult(held);
+                        continue;
+                    }
+                    stepped = await PollOnceAsync(attemptToken).ConfigureAwait(false);
+                }
+                catch (Exception) when (!attemptToken.IsCancellationRequested)
+                {
+                    if (++unexpectedFailures >= MaximumUnexpectedPollFailures)
+                    {
+                        PublishListenerResult(new GitHubListenerLaneResult(GitHubListenerLaneStatus.RecoveryRequired));
                         return;
                     }
-                    rotation = _clock.GetUtcNow() + RotationInterval;
+                    RecordPollFailure();
+                    recovering = true;
+                    continue;
                 }
 
-                var stepped = await lane.StepAsync(token).ConfigureAwait(false);
-                PublishListenerResult(stepped);
-                if (stepped.Status is GitHubListenerLaneStatus.Stopped or GitHubListenerLaneStatus.StorageRejected)
+                if (stepped.Status == GitHubListenerLaneStatus.Stopped || stepped.Step?.Status is
+                    ScaleSetListenerStepStatus.RecoveryRequired or ScaleSetListenerStepStatus.CheckpointConflict)
                 {
+                    PublishListenerResult(stepped);
                     return;
                 }
+                if (stepped.Status == GitHubListenerLaneStatus.StorageRejected || (recovering && stepped is not
+                    { Status: GitHubListenerLaneStatus.Stepped, Step.Status: ScaleSetListenerStepStatus.Initialized or
+                        ScaleSetListenerStepStatus.EmptyPoll or ScaleSetListenerStepStatus.MessageAcknowledged }))
+                {
+                    // A deferred operation did not establish current authority over this session.
+                    if (DescribeListenerFailure(stepped.Status) is not null)
+                    {
+                        PublishListenerResult(stepped);
+                    }
+                    recovering = true;
+                    continue;
+                }
+
+                recovering = false;
+                retrySeconds = 1;
+                unexpectedFailures = 0;
+                PublishListenerResult(stepped);
                 if (stepped.Step?.Status is not (ScaleSetListenerStepStatus.MessageAcknowledged or ScaleSetListenerStepStatus.Initialized))
                 {
                     await Task.Delay(PollRetry, _clock, token).ConfigureAwait(false);
                 }
             }
         }
-        catch (OperationCanceledException) when (token.IsCancellationRequested)
+        catch (OperationCanceledException) when (recoveryCancellation.IsCancellationRequested)
         {
         }
-        catch (Exception)
+
+        async Task<GitHubListenerLaneResult> PollOnceAsync(CancellationToken attemptToken)
         {
-            RecordPollFailure();
+            // Resume the retained pump before rotating the credential. It owns the
+            // uncertain checkpoint write and any proof that an ACK was never sent.
+            if (!recovering && _clock.GetUtcNow() >= rotation)
+            {
+                var rotated = await lane.RotateAsync(attemptToken).ConfigureAwait(false);
+                rotation = _clock.GetUtcNow() + RotationInterval;
+                if (rotated.Status == GitHubListenerLaneStatus.StorageRejected)
+                {
+                    return rotated;
+                }
+                PublishListenerResult(rotated);
+            }
+            return await lane.StepAsync(attemptToken).ConfigureAwait(false);
         }
     }
+
+    private async Task<GitHubListenerLaneResult?> ReadRecoveryHoldAsync(CancellationToken cancellationToken)
+    {
+        using var deadline = new CancellationTokenSource(PollRecoveryReadBudget, _clock);
+        using var attempt = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, deadline.Token);
+        try
+        {
+            var catalog = await ReadCatalogAsync(allowClosing: false, attempt.Token).ConfigureAwait(false);
+            cancellationToken.ThrowIfCancellationRequested();
+            if (deadline.IsCancellationRequested)
+            {
+                return new GitHubListenerLaneResult(GitHubListenerLaneStatus.StorageUnavailable);
+            }
+            return catalog is not null && _binding is { } binding && MatchesBound(catalog, binding)
+                ? null : new GitHubListenerLaneResult(GitHubListenerLaneStatus.OwnershipUnavailable);
+        }
+        catch (OperationCanceledException) when (deadline.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
+        {
+            return new GitHubListenerLaneResult(GitHubListenerLaneStatus.StorageUnavailable);
+        }
+        catch (AmazonServiceException)
+        {
+            return new GitHubListenerLaneResult(GitHubListenerLaneStatus.StorageRejected);
+        }
+        catch (InvalidDataException)
+        {
+            return new GitHubListenerLaneResult(GitHubListenerLaneStatus.RecoveryRequired);
+        }
+        catch (IOException)
+        {
+            return new GitHubListenerLaneResult(GitHubListenerLaneStatus.StorageUnavailable);
+        }
+    }
+
+    private static string? DescribeListenerFailure(GitHubListenerLaneStatus? status) => status switch
+    {
+        GitHubListenerLaneStatus.RecoveryRequired => "listener_recovery_required",
+        GitHubListenerLaneStatus.Failed => "listener_poll_failed",
+        GitHubListenerLaneStatus.OwnershipUnavailable => "listener_ownership_unavailable",
+        GitHubListenerLaneStatus.StorageUnavailable => "listener_storage_unavailable",
+        GitHubListenerLaneStatus.StorageRejected => "listener_storage_rejected",
+        GitHubListenerLaneStatus.Stopped => "listener_stopped",
+        _ => null,
+    };
 
     private void RecordPollFailure() =>
         PublishListenerResult(new GitHubListenerLaneResult(GitHubListenerLaneStatus.Failed,
