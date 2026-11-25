@@ -762,6 +762,9 @@ function verifyTaskRole(
   verifyGrants(statements, "iam:PassRole", [
     ...scope(ec2Roles, {
       StringEquals: { "iam:PassedToService": "ec2.amazonaws.com" },
+      ArnLike: {
+        "iam:AssociatedResourceArn": `arn:aws:ec2:*:${account}:instance/*`,
+      },
     }),
     ...scope(fargateRoles, {
       StringEquals: { "iam:PassedToService": "ecs-tasks.amazonaws.com" },
@@ -825,7 +828,8 @@ function verifyEc2Writes(
     const exact = { "ec2:LaunchTemplate": template };
     const request = profileTags(profile, "RequestTag");
     const exit = profileTags(profile, "ResourceTag");
-    plans.push(...scope([template, ...subnets, ...groups]));
+    plans.push(...scope([template]));
+    plans.push(...scope([...subnets, ...groups], { ArnEquals: exact }));
     plans.push(
       ...scope(
         [
