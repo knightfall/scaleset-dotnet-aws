@@ -72,6 +72,67 @@ public sealed class ControllerAuthorityAdapterTests
         Assert.Equal(authority.Lease, await store.ReadLeaseAsync(deployment, cancellation));
     }
 
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task OldClusterWithoutCleanReleaseRemainsFencedAfterRestart(bool cleanRelease)
+    {
+        var cancellation = TestContext.Current.CancellationToken;
+        using var table = await MiniStackTable.CreateAsync(cancellation);
+        var clock = new FixtureClock();
+        var configuration = await LoadConfigurationAsync(cancellation);
+        var store = new DynamoDbLifecycleStore(table.Client, table.Name, clock);
+        var observer = new TaskObserver { Status = ControllerTaskFenceStatus.Stopped };
+        string deployment = ControllerLeaseRecoveryCoordinator.DeploymentKey(configuration);
+        string predecessorTask = OldTask.Replace("task/engineering-dev-controller/", "task/prior-controller/", StringComparison.Ordinal);
+        var acquired = await store.TryAcquireLeaseAsync(deployment, "old", predecessorTask, ControllerLease.CurrentWriterProtocol,
+            clock.Now, clock.Now + LeaseDuration, cancellation);
+        var promoted = await new ControllerLeaseRecoveryCoordinator(store, observer, clock, Reserve)
+            .TryActivateAsync(Assert.IsType<ControllerLease>(acquired.Lease), configuration, Observation(clock).Clock, [], cancellation);
+        var predecessor = Assert.IsType<ControllerLease>(promoted.Lease);
+        Assert.Equal(ControllerLeaseMode.Active, predecessor.Mode);
+        if (cleanRelease)
+        {
+            Assert.Equal(LifecycleWriteOutcome.Committed, (await store.ReleaseLeaseAsync(predecessor, clock.Now, cancellation)).Outcome);
+        }
+
+        clock.Now = predecessor.ValidUntil.AddSeconds(2);
+        int recoveries = 0;
+        Task<bool> Recover(ControllerLease lease, ControllerClockEvidence proof, CancellationToken token)
+        {
+            token.ThrowIfCancellationRequested();
+            Assert.Equal(predecessor.OwnerTaskArn, lease.PreviousOwner?.OwnerTaskArn);
+            Assert.True(lease.PreviousOwner?.CleanRelease);
+            Assert.True(proof.TryGetUpperBound(clock.Now, lease.ValidUntil, Reserve, out _));
+            recoveries++;
+            return Task.FromResult(true);
+        }
+
+        var adapter = new ControllerAuthorityAdapter(configuration, store, observer, clock, LeaseDuration, Reserve);
+        using var ownership = await adapter.TryActivateAsync(Observation(clock), Recover, cancellation);
+        if (cleanRelease)
+        {
+            Assert.Equal(ControllerLeaseMode.Active, ownership?.ReadAuthority()?.Lease.Mode);
+            Assert.Equal(1, recoveries);
+        }
+        else
+        {
+            Assert.Null(ownership);
+            var held = Assert.IsType<ControllerLease>(await store.ReadLeaseAsync(deployment, cancellation));
+            Assert.Equal(ControllerLeaseMode.RecoveryOnly, held.Mode);
+            Assert.Equal(predecessorTask, held.RequiredFencingTaskArn);
+            clock.Now = held.ValidUntil.AddSeconds(2);
+            var restarted = new ControllerAuthorityAdapter(configuration, store, observer, clock, LeaseDuration, Reserve);
+            var replacement = Observation(clock) with { TaskArn = NewTask[..^1] + "e" };
+            Assert.Null(await restarted.TryActivateAsync(replacement, UnexpectedRecovery, cancellation));
+            var next = Assert.IsType<ControllerLease>(await store.ReadLeaseAsync(deployment, cancellation));
+            Assert.Equal((held.Epoch + 1, replacement.TaskArn, predecessorTask, ControllerLeaseMode.RecoveryOnly),
+                (next.Epoch, next.OwnerTaskArn, next.RequiredFencingTaskArn, next.Mode));
+            Assert.Equal(0, recoveries);
+        }
+        Assert.DoesNotContain(predecessorTask, observer.Reads);
+    }
+
     [Fact]
     public async Task LostAcquisitionReplyUsesExactOwnedTransitionAndExpiredClockCannotPromote()
     {

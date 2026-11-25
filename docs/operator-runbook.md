@@ -189,7 +189,61 @@ dotnet run --project "$controller_project" --configuration Release --no-build --
 
 Roll back by deploying compatible known-good inputs as a **new, higher generation**. Compare current catalog and profile grants against the candidate before the deploy. Keep intervening profiles and bindings until their own retirement gates clear. Preserve tombstones and choose a new profile identity if the old profile is retired. Verify the writer protocol, data schema, CPU architecture, image digest, and runtime bytes before starting the replacement.
 
-On an abrupt exit, record the exact predecessor task ARN, current lease epoch, unresolved effect or acknowledgement IDs, and latest authorized attempt times. Allow the successor to acquire recovery-only authority, verify the exact predecessor is `STOPPED` in the configured cluster, use the trusted clock bound, and settle effects by authoritative readback. Use a verified clean handover before moving the controller cluster. If an unclean move leaves the predecessor outside the new role's exact lookup scope, hold activation and use a separately reviewed isolation and recovery procedure. Keep ambiguous acknowledgements and runner registrations held. A new session opens with a fresh cursor after confirmed retirement of the exact prior session. [Recovery and target boundaries](emulator-boundaries.md)
+On an abrupt exit, allow the successor to acquire recovery-only authority in the
+same ECS cluster. The successor requires an exact `STOPPED` observation for each
+unclean predecessor and a current clock bound before reading back ambiguous
+effects. An orderly release preserves the lease record and carries the clean
+handover into the successor. Keep ambiguous acknowledgements and runner
+registrations held. A new session opens with a fresh cursor after confirmed
+retirement of the exact prior session. [Recovery and target boundaries](emulator-boundaries.md)
+
+Protected deployment keeps the resolved controller cluster and its CDK
+ownership fixed, preserving the existing `ecs:DescribeTasks` scope. Cluster
+aliases can change if they resolve to the same cluster and ownership. To change
+an EC2 supervisor binding, drain and tombstone the existing profile with its
+original grants, pinned Launch Template version, AMI, role and qualification
+evidence intact. Qualify the replacement under a fresh profile ID before taking
+new work. A cluster migration, including a move through dry-run, requires a
+separately reviewed transition that preserves the predecessor lookup.
+
+### Isolate a predecessor whose ECS task is unavailable
+
+1. Hold active deployments and admissions. Keep the tracking table and the
+   last verified runtime generation. Use a consistent read from the deployed
+   table with `PK=ENV#<account>:<region>:<environment>` and `SK=LEASE`.
+   Record the exact deployment key, lease owner/task ARN, epoch, revision,
+   transition ID, previous owner and required fencing task. Record unresolved
+   effect and acknowledgement IDs, latest authorized attempt deadlines and the
+   exact prior GitHub sessions.
+   Save identifiers and evidence references without credential values.
+2. Use the original account and Region to describe each exact task in the cluster
+   named in its ARN. Save the request identity, matching response, timestamps and
+   the old cluster and role bindings. Have the AWS owner restore the operator's
+   scoped read access if the permission check failed. If ECS still reports the
+   exact task as `STOPPED` and the deployed controller has that read scope, use
+   the ordinary recovery path. Capture this promptly because stopped task
+   history is limited.
+   [ECS DescribeTasks](https://docs.aws.amazon.com/AmazonECS/latest/APIReference/API_DescribeTasks.html)
+3. If the exact task remains unavailable, record any pre-existing ECS task-state
+   capture with the exact task ARN, cluster ARN, AWS account, event ID, timestamp
+   and terminal status. Verify the capture provenance and access with an
+   independent AWS reviewer. If terminal evidence is missing, have the AWS owner
+   isolate the predecessor's mutation authority, including credential
+   reacquisition and existing sessions. Have the GitHub owner independently
+   verify isolation of the predecessor's mutation credentials and exact prior
+   session. Retain audited evidence of effective isolation on both surfaces,
+   including what must stay disabled, credential and session scope, and any
+   shared identities affected. A changed secret value alone leaves previously
+   issued credentials unresolved. [ECS event capture](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/task-lifecycle-events.html) · [IAM role session revocation](https://docs.aws.amazon.com/IAM/latest/UserGuide/id_roles_use_revoke-sessions.html) · [GitHub App installation endpoints](https://docs.github.com/en/rest/apps/installations)
+4. Keep the decision and evidence IDs in the recovery record for each exact task
+   and lease, with an evidence validity window and independent approval. Submit
+   the record for a separately qualified cutover if the published controller
+   still cannot obtain `STOPPED`. The current runtime consumes direct ECS task
+   observations. Unavailable, wrong-cluster or stale observations keep the lease
+   in recovery-only mode across restart. Keep possibly sent operations and
+   sessions held until authoritative readback and the exact-session retirement
+   path settle their outcomes. Preserve the lease and journal throughout the
+   incident.
 
 ### Recover from a DynamoDB backup
 

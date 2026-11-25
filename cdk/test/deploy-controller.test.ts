@@ -58,6 +58,8 @@ function fixture({
   wrongBody = false,
   changedVersion = false,
   expectedFargatePreflight = undefined as string | undefined,
+  deployed = prior,
+  proposed = candidate,
 } = {}) {
   const steps: string[] = [];
   let count = 0;
@@ -75,19 +77,19 @@ function fixture({
       );
       assert.equal(
         readFileSync(option(args, "--current-config"), "utf8"),
-        prior.json,
+        deployed.json,
       );
       assert.equal(
         readFileSync(option(args, "--config"), "utf8"),
-        candidate.json,
+        proposed.json,
       );
-      assert.equal(option(args, "--current-sha256"), prior.sha256);
-      assert.equal(option(args, "--sha256"), candidate.sha256);
+      assert.equal(option(args, "--current-sha256"), deployed.sha256);
+      assert.equal(option(args, "--sha256"), proposed.sha256);
       assert.equal(option(args, "--current-generation"), "1");
       assert.equal(option(args, "--generation"), "2");
       count++;
       return (count === 1 && deniedBefore) || (count === 2 && deniedAfter)
-        ? failure("tombstone missing")
+        ? failure("deployment preflight refused the binding")
         : ok();
     }
     if (program === process.execPath) {
@@ -106,10 +108,7 @@ function fixture({
       const compiled = JSON.parse(
         readFileSync(`${assembly}/Controller.template.json`, "utf8"),
       );
-      assert.equal(
-        compiled.Outputs.RuntimeConfigSha256.Value,
-        candidate.sha256,
-      );
+      assert.equal(compiled.Outputs.RuntimeConfigSha256.Value, proposed.sha256);
       assert.equal(compiled.Outputs.DeploymentGeneration.Value, "2");
       const task = Object.values(compiled.Resources).find(
         (resource) =>
@@ -148,9 +147,9 @@ function fixture({
       const outputs = {
         DeploymentIdentity: environment,
         TrackingTableName: wrongTable ? "some-other-table" : table,
-        RuntimeConfigUri: `s3://prior-assets/runtime/${prior.sha256}.json`,
+        RuntimeConfigUri: `s3://prior-assets/runtime/${deployed.sha256}.json`,
         RuntimeConfigVersionId: version,
-        RuntimeConfigSha256: prior.sha256,
+        RuntimeConfigSha256: deployed.sha256,
         DeploymentGeneration: "1",
       };
       return ok({
@@ -177,7 +176,7 @@ function fixture({
       steps.push("source");
       assert.equal(option(args, "--version-id"), version);
       assert.equal(option(args, "--expected-bucket-owner"), account);
-      writeFileSync(args.at(-1)!, wrongBody ? candidate.json : prior.json);
+      writeFileSync(args.at(-1)!, wrongBody ? proposed.json : deployed.json);
       return ok({ VersionId: changedVersion ? "another-version" : version });
     }
     if (args.includes("describe-change-set")) {
@@ -274,6 +273,56 @@ test("a denied preflight before or after preparing never executes the change set
     );
     assert.equal(cloud.steps.includes("prepare"), permittedPreparation);
     assert.ok(!cloud.steps.includes("execute"));
+  }
+});
+
+test("the protected deploy holds an alpha.1 hosting move or STATUS grant removal with a retained table", () => {
+  const { spec } = prior.runtime;
+  const ec2 = spec.profiles[1];
+  assert.ok(ec2.provisioner.type === "ec2");
+  const qualified = {
+    ...ec2,
+    provisioner: {
+      ...ec2.provisioner,
+      statusQualification: {
+        imageId: "ami-0123456789abcdef0",
+        roleId: "AROAFIXTUREBOOTSTRAP01",
+        evidenceSha256: "b".repeat(64),
+      },
+    },
+  };
+  const retained = {
+    ...spec,
+    tracking: { table: { type: "import", name: table } },
+    profiles: [qualified],
+  };
+  const compile = (configuration: object) =>
+    compileConfig(
+      JSON.stringify({
+        ...prior.runtime,
+        kind: "RunnerController",
+        spec: configuration,
+      }),
+    );
+  const deployed = compile(retained);
+  for (const changed of [
+    {
+      ...retained,
+      controller: {
+        ...spec.controller,
+        hosting: { ...spec.controller.hosting, cluster: "runner-shell" },
+      },
+    },
+    { ...retained, profiles: [ec2] },
+  ]) {
+    const proposed = compile(changed);
+    const cloud = fixture({ deployed, proposed, deniedBefore: true });
+    assert.throws(
+      () =>
+        deployController({ compiled: proposed, generation: "2" }, cloud.run),
+      /retirement preflight failed/u,
+    );
+    assert.deepEqual(cloud.steps, ["identity", "stack", "source", "preflight"]);
   }
 });
 

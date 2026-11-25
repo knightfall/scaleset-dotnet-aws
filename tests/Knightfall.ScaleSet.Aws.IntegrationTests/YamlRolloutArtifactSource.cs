@@ -63,6 +63,12 @@ internal sealed class YamlRolloutArtifactSource(DirectoryInfo repository, Direct
         string Normalize(string text) => text.Replace("111122223333", Account, StringComparison.Ordinal)
             .Replace("ap-southeast-2", Region, StringComparison.Ordinal);
         string original = Normalize(fixture[ec2..shell]);
+        original += """
+                statusQualification:
+                  imageId: ami-0123456789abcdef0
+                  roleId: AROAFIXTUREBOOTSTRAP01
+                  evidenceSha256: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+        """ + "\n";
         string adjusted = original.Replace("maxRunners: 16", "maxRunners: 18", StringComparison.Ordinal);
         string added = Normalize(fixture[shell..arm]);
         string draining = added.Replace("state: active", "state: draining", StringComparison.Ordinal);

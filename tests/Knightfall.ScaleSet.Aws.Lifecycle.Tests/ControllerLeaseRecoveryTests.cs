@@ -106,6 +106,17 @@ public sealed class ControllerLeaseRecoveryTests
         var first = await AcquireAsync(store, configuration, clock, "first", MiniStackTable.FirstTask, cancellation);
         var initial = await recovery.TryActivateAsync(first, configuration, ClockProof(clock), [], cancellation);
         Assert.Equal(LeaseActivationStatus.Activated, initial.Status);
+        var current = Assert.IsType<ControllerLease>(initial.Lease);
+        var profile = new LifecycleProfile(current.Deployment, Assert.Single(configuration.Profiles).Id);
+        var journal = new DynamoDbEffectJournal(store, clock);
+        var envelope = EffectEnvelope.Create(profile, "session-retire", 1,
+            new GitHubSessionRetireEffectRequest("https://example.ghe.com/engineering/tools", 42, Guid.NewGuid()), clock.Now, null);
+        Assert.Equal(LifecycleWriteOutcome.Committed, await journal.PlanAsync(current, envelope, Guid.NewGuid(), cancellation));
+        var planned = Assert.IsType<EffectJournalSnapshot>(await journal.ReadAsync(profile, envelope.IntentId, cancellation));
+        Assert.Equal(LifecycleWriteOutcome.Committed, (await journal.BeginAsync(current, planned, Guid.NewGuid(), Guid.NewGuid(),
+            clock.Now, clock.Now.AddSeconds(40), Reserve, cancellation)).Outcome);
+        var executing = Assert.IsType<EffectJournalSnapshot>(await journal.ReadAsync(profile, envelope.IntentId, cancellation));
+        Assert.Equal(EffectState.Executing, executing.Entry.State);
 
         clock.Now = first.ValidUntil.AddSeconds(2);
         var second = await AcquireAsync(store, configuration, clock, "second", TaskTwo, cancellation);
@@ -133,8 +144,31 @@ public sealed class ControllerLeaseRecoveryTests
         Assert.Equal(third, await store.ReadLeaseAsync(third.Deployment, cancellation));
 
         observer.Statuses[first.OwnerTaskArn] = ControllerTaskFenceStatus.Unknown;
-        Assert.Equal(LeaseActivationStatus.Activated,
-            (await recovery.TryActivateAsync(third, configuration, ClockProof(clock), [immediate, oldest], cancellation)).Status);
+        var wrongCluster = oldest with { TaskArn = oldest.TaskArn.Replace("task/controller/", "task/wrong-cluster/", StringComparison.Ordinal) };
+        var restarted = new ControllerLeaseRecoveryCoordinator(new DynamoDbLifecycleStore(table.Client, table.Name, clock), observer, clock, Reserve);
+        Assert.Equal(LeaseActivationStatus.PriorTaskUnisolated,
+            (await restarted.TryActivateAsync(third, configuration, ClockProof(clock), [immediate, wrongCluster], cancellation)).Status);
+        var stale = oldest with { ObservedAt = clock.Now.AddMinutes(-1), ValidUntil = clock.Now };
+        int observations = 0;
+        Task<EffectEvidence?> Observe(EffectJournalSnapshot requested, CancellationToken token)
+        {
+            token.ThrowIfCancellationRequested();
+            Assert.Equal(executing.TransitionId, requested.TransitionId);
+            observations++;
+            return Task.FromResult<EffectEvidence?>(new EffectEvidence(EffectResolutionKind.Absent, envelope.Sha256, envelope.Target, clock.Now));
+        }
+        Assert.Equal(LifecycleWriteOutcome.LeaseRejected, await restarted.ResolveFencedEffectAsync(third, executing,
+            Guid.NewGuid(), ClockProof(clock), [immediate, stale], Observe, cancellation));
+        Assert.Equal(0, observations);
+        Assert.Equal(LeaseActivationStatus.ProfileRecoveryPending,
+            (await restarted.TryActivateAsync(third, configuration, ClockProof(clock), [immediate, oldest], cancellation)).Status);
+        Assert.Equal(LifecycleWriteOutcome.Committed, await restarted.ResolveFencedEffectAsync(third, executing,
+            Guid.NewGuid(), ClockProof(clock), [immediate, oldest], Observe, cancellation));
+        Assert.Equal(1, observations);
+        var recovered = await restarted.TryActivateAsync(third, configuration, ClockProof(clock), [immediate, oldest], cancellation);
+        Assert.Equal(LeaseActivationStatus.Activated, recovered.Status);
+        Assert.Equal((third.Fence, ControllerLeaseMode.Active), (recovered.Lease?.Fence, recovered.Lease?.Mode));
+        Assert.Null(recovered.Lease?.RequiredFencingTaskArn);
     }
 
     [Fact]
