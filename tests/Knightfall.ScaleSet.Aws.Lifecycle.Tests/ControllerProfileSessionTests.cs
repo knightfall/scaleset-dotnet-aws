@@ -29,6 +29,7 @@ public sealed class ControllerProfileSessionTests
     private static readonly Guid SecondSession = Guid.Parse("51688c9f-f017-4a9a-b59f-77ed34074c1c");
     private static readonly string[] CurrentStage = ["AWSCURRENT"];
     private static readonly GitHubListenerTiming Timing = new(TimeSpan.FromSeconds(5), TimeSpan.FromSeconds(25), TimeSpan.FromSeconds(15));
+    private static readonly TimeSpan PollObservationBudget = TimeSpan.FromSeconds(30);
 
     [Theory]
     [InlineData(null)]
@@ -38,7 +39,8 @@ public sealed class ControllerProfileSessionTests
     public async Task IndependentLanesReportStorageFaultsAndExplicitShutdownClosesOnlyExactSessions(string? storageFailure)
     {
         using var budget = CancellationTokenSource.CreateLinkedTokenSource(TestContext.Current.CancellationToken);
-        budget.CancelAfter(TimeSpan.FromSeconds(30));
+        // Table setup and earlier requests can consume most of the budget on a shared CI runner.
+        budget.CancelAfter(TimeSpan.FromMinutes(2));
         var token = budget.Token;
         using var table = await MiniStackTable.CreateAsync(token);
         var clock = new ContractClock();
@@ -148,22 +150,14 @@ public sealed class ControllerProfileSessionTests
         };
 
         var firstBinding = Assert.IsType<GitHubScaleSetBinding>(await first.EnsureRegisteredAsync(token));
-        await firstPoll.Task.WaitAsync(token);
+        await ObservePollAsync(firstPoll.Task, FirstProfile, first);
         Assert.Equal(SecondSet, (await second.EnsureRegisteredAsync(token))?.ScaleSetId);
-        try
-        {
-            await secondPoll.Task.WaitAsync(TimeSpan.FromSeconds(15), token);
-        }
-        catch (TimeoutException)
-        {
-            Assert.Fail($"Second lane {second.ListenerResult?.Status}, operations: " +
-                string.Join(", ", wire.Requests.Select(request => request.Method + " " + request.Uri.AbsolutePath)));
-        }
+        await ObservePollAsync(secondPoll.Task, SecondProfile, second);
         if (storageFailure is not null)
         {
             bool rejected = storageFailure == "AccessDeniedException";
             Assert.Equal(rejected ? GitHubListenerLaneStatus.StorageRejected : GitHubListenerLaneStatus.StorageUnavailable,
-                await firstFault.Task.WaitAsync(token));
+                await firstFault.Task.WaitAsync(PollObservationBudget, token));
             if (rejected)
             {
                 await first.JoinMutatorsAsync(token);
@@ -173,7 +167,7 @@ public sealed class ControllerProfileSessionTests
             }
             else
             {
-                await firstRecovered.Task.WaitAsync(token);
+                await ObservePollAsync(firstRecovered.Task, FirstProfile, first);
                 Assert.Equal(2, Volatile.Read(ref firstPolls));
             }
             Assert.True(second.IsListenerAvailable);
@@ -199,6 +193,19 @@ public sealed class ControllerProfileSessionTests
         Assert.Equal(2, deletes.Length);
         Assert.Contains(SessionPath(firstProfile) + $"/{GitHubWire.SessionId:D}", deletes);
         Assert.Contains(SessionPath(secondProfile) + $"/{SecondSession:D}", deletes);
+
+        async Task ObservePollAsync(Task observation, string profile, ControllerProfileSession session)
+        {
+            try
+            {
+                await observation.WaitAsync(PollObservationBudget, token);
+            }
+            catch (TimeoutException)
+            {
+                Assert.Fail($"No poll from {profile} within {PollObservationBudget}. Lane status is {session.ListenerResult?.Status}. " +
+                    string.Join(", ", wire.Requests.Select(request => request.Method + " " + request.Uri.AbsolutePath)));
+            }
+        }
     }
 
     [Theory]
