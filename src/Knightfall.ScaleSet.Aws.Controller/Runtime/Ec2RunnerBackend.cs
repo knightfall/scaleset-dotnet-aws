@@ -219,8 +219,8 @@ internal sealed class Ec2RunnerBackend(
             await store.ReadJitHandoffAsync(key, Guid.ParseExact(executor.Binding.AllocationId, "D"), cancellationToken).ConfigureAwait(false) is not { } handoff ||
             handoff.Identity.ResourceArn != executor.Binding.ResourceArn || handoff.Identity.Incarnation != executor.Binding.Incarnation ||
             !handoff.Identity.AwsUserId.StartsWith(qualification.RoleId + ":", StringComparison.Ordinal) ||
-            await store.ReadEc2BootstrapStatusAsync(handoff, cancellationToken).ConfigureAwait(false) is not { Exited: true } confirmed ||
-            confirmed.QualificationSha256 != qualification.EvidenceSha256 || confirmed.RunnerId != exit.RunnerId ||
+            await store.ReadEc2BootstrapStatusAsync(handoff, qualification.EvidenceSha256, cancellationToken).ConfigureAwait(false)
+                is not { Exited: true } confirmed || confirmed.RunnerId != exit.RunnerId ||
             confirmed.ObservedAt != exit.ObservedAt)
         {
             return false;

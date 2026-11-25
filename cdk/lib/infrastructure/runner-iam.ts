@@ -305,6 +305,23 @@ export function ec2SupervisorStatusPolicy(table: ITable) {
     conditions: {
       "ForAllValues:StringEquals": {
         "dynamodb:LeadingKeys": ["STATUS#${aws:userid}"],
+        "dynamodb:Attributes": [
+          "PK",
+          "SK",
+          "awsUserId",
+          "resourceArn",
+          "helloSha256",
+          "offerId",
+          "runnerId",
+          "sequence",
+          "observedAt",
+          "exited",
+          "payload",
+          "qualificationSha256",
+        ],
+      },
+      StringEqualsIfExists: {
+        "dynamodb:ReturnValues": ["NONE", "ALL_OLD"],
       },
       ArnLike: {
         "ec2:SourceInstanceARN": stack.formatArn({
@@ -317,6 +334,7 @@ export function ec2SupervisorStatusPolicy(table: ITable) {
       NumericEquals: { "ec2:RoleDelivery": "2.0" },
       Null: {
         "dynamodb:LeadingKeys": "false",
+        "dynamodb:Attributes": "false",
         "dynamodb:EnclosingOperation": "true",
       },
     },

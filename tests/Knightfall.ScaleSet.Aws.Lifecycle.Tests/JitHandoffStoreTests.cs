@@ -482,13 +482,97 @@ public sealed class JitHandoffStoreTests
         var client = new DynamoDbEc2BootstrapStatusClient(table.Client, table.Name, Ec2UserId, Ec2Arn, clock);
         var ready = new JitEc2BootstrapStatus(new string('a', 64), RunnerId, 1, Exited: false, clock.Now);
         Assert.Equal(LifecycleWriteOutcome.Committed, await client.PublishAsync(recipient.Hello, ready, cancellation));
-        Assert.Equal(LifecycleWriteOutcome.Conflict, await client.PublishAsync(recipient.Hello, ready, cancellation));
+        Assert.Equal(LifecycleWriteOutcome.Committed, await client.PublishAsync(recipient.Hello, ready, cancellation));
         var exit = ready with { Sequence = 2, Exited = true };
         Assert.Equal(LifecycleWriteOutcome.Committed, await client.PublishAsync(recipient.Hello, exit, cancellation));
-        Assert.Equal(LifecycleWriteOutcome.Conflict, await client.PublishAsync(recipient.Hello, ready with { Sequence = 3 }, cancellation));
+        Assert.Equal(LifecycleWriteOutcome.Conflict, await client.PublishAsync(recipient.Hello, ready, cancellation));
         var row = await table.ReadAsync(LifecycleKey.Status(Ec2UserId), cancellation);
         Assert.True(row["exited"].BOOL);
         Assert.Equal("2", row["sequence"].N);
+    }
+
+    [Fact]
+    public async Task LostStatusWriteResponseRequiresExactConditionalReadback()
+    {
+        var token = TestContext.Current.CancellationToken;
+        using var table = await MiniStackTable.CreateAsync(token);
+        using var recipient = JitRecipientKey.Create();
+        var clock = new ContractClock { Now = MiniStackTable.Now };
+        var client = new DynamoDbEc2BootstrapStatusClient(table.Client, table.Name, Ec2UserId, Ec2Arn, clock);
+        var ready = new JitEc2BootstrapStatus(new string('a', 64), RunnerId, 1, Exited: false, clock.Now)
+        {
+            QualificationSha256 = new string('b', 64),
+        };
+        var key = LifecycleKey.Status(Ec2UserId);
+        Assert.Equal(LifecycleWriteOutcome.Committed, await client.PublishAsync(recipient.Hello, ready, token));
+        var exit = ready with { Sequence = 2, Exited = true, ObservedAt = clock.Now.AddSeconds(1) };
+        table.Wire.Clear();
+        Assert.Equal(LifecycleWriteOutcome.Indeterminate, await client.PublishAsync(recipient.Hello, exit, token));
+        Assert.Empty(table.Wire.Requests);
+
+        clock.Now = exit.ObservedAt;
+        table.Wire.DropNextSuccessfulStatusWriteResponse(key);
+        Assert.Equal(LifecycleWriteOutcome.Indeterminate, await client.PublishAsync(recipient.Hello, exit, token));
+        clock.Now -= TimeSpan.FromSeconds(1);
+        Assert.Equal(LifecycleWriteOutcome.Indeterminate, await client.PublishAsync(recipient.Hello, exit, token));
+        clock.Now = exit.ObservedAt.AddSeconds(1);
+        Assert.Equal(LifecycleWriteOutcome.Committed, await client.PublishAsync(recipient.Hello, exit, token));
+        var identical = table.Wire.Requests.ToArray();
+        Assert.Equal(2, identical.Length);
+        Assert.Equal(identical[0].Request.GetRawText(), identical[1].Request.GetRawText());
+        Assert.Equal("ALL_OLD", identical[1].Request.GetProperty("ReturnValuesOnConditionCheckFailure").GetString());
+        Assert.Equal(LifecycleWriteOutcome.Conflict,
+            await client.PublishAsync(recipient.Hello, exit with { QualificationSha256 = new string('c', 64) }, token));
+        Assert.Equal(LifecycleWriteOutcome.Conflict,
+            await client.PublishAsync(recipient.Hello, exit with { ObservedAt = clock.Now }, token));
+        var row = await table.ReadAsync(key, token);
+        Assert.Equal(exit, DynamoDbEc2BootstrapStatusClient.DecodeStatus(key, row, Ec2UserId, Ec2Arn, BootstrapItems.HelloDigest(recipient.Hello)));
+    }
+
+    [Fact]
+    public async Task StatusReaderHoldsMalformedMismatchedAndFutureEvidenceButReportsStorageOutages()
+    {
+        var token = TestContext.Current.CancellationToken;
+        using var table = await MiniStackTable.CreateAsync(token);
+        using var recipient = JitRecipientKey.Create();
+        var clock = new ContractClock { Now = MiniStackTable.Now };
+        var identity = new JitHandoffIdentity("fixture", ProfileId, "github.com/enterprises/engineering", 84,
+            Guid.NewGuid(), Ec2Arn, Guid.NewGuid(), Ec2UserId);
+        var handoff = new JitHandoffSnapshot(identity, recipient.Hello, BootstrapItems.HelloDigest(recipient.Hello),
+            "fixture-runner", JitHandoffState.Offered, RunnerId, null, Guid.NewGuid(), 1, Guid.NewGuid());
+        var store = new DynamoDbLifecycleStore(table.Client, table.Name, clock);
+        var key = LifecycleKey.Status(Ec2UserId);
+        Assert.Null(await store.ReadEc2BootstrapStatusAsync(handoff, token));
+
+        var client = new DynamoDbEc2BootstrapStatusClient(table.Client, table.Name, Ec2UserId, Ec2Arn, clock);
+        var status = new JitEc2BootstrapStatus(handoff.OfferId, RunnerId, 1, Exited: false, clock.Now);
+        Assert.Equal(LifecycleWriteOutcome.Committed, await client.PublishAsync(recipient.Hello, status, token));
+        Assert.Equal(status, await store.ReadEc2BootstrapStatusAsync(handoff, token));
+        Assert.Null(await store.ReadEc2BootstrapStatusAsync(handoff, new string('b', 64), token));
+        Assert.Null(await store.ReadEc2BootstrapStatusAsync(handoff with { RunnerId = RunnerId + 1 }, token));
+        clock.Now -= TimeSpan.FromSeconds(1);
+        Assert.Null(await store.ReadEc2BootstrapStatusAsync(handoff, token));
+        clock.Now = status.ObservedAt;
+
+        var row = await table.ReadAsync(key, token);
+        var malformed = new Dictionary<string, AttributeValue>(row, StringComparer.Ordinal)
+        {
+            ["payload"] = new() { S = "{" },
+        };
+        await table.Client.PutItemAsync(table.Name, malformed, token);
+        Assert.Null(await store.ReadEc2BootstrapStatusAsync(handoff, token));
+        malformed = new Dictionary<string, AttributeValue>(row, StringComparer.Ordinal)
+        {
+            ["exited"] = new() { S = "false" },
+        };
+        await table.Client.PutItemAsync(table.Name, malformed, token);
+        Assert.Null(await store.ReadEc2BootstrapStatusAsync(handoff, token));
+        malformed = new Dictionary<string, AttributeValue>(row, StringComparer.Ordinal) { ["GSI1PK"] = new() { S = "fixture" } };
+        await table.Client.PutItemAsync(table.Name, malformed, token);
+        Assert.Null(await store.ReadEc2BootstrapStatusAsync(handoff, token));
+
+        table.Wire.FailNextGetItem(key, System.Net.HttpStatusCode.ServiceUnavailable, "ServiceUnavailable");
+        await Assert.ThrowsAsync<IOException>(() => store.ReadEc2BootstrapStatusAsync(handoff, token));
     }
 
     internal static async Task<TestContextFixture> CreateFixtureAsync(

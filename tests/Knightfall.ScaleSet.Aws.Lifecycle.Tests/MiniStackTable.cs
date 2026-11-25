@@ -188,6 +188,7 @@ internal sealed class MiniStackWire : DelegatingHandler
     private int _dropTransactionBeforeSend;
     private int _dropSuccessfulTransaction;
     private int _dropSuccessfulBootstrapDelete;
+    private LifecycleKey? _dropSuccessfulStatusWrite;
     private TransactionBarrier? _transactionBarrier;
     private PausedRequest? _pausedRead;
     private PausedRequest? _pausedWrite;
@@ -212,6 +213,8 @@ internal sealed class MiniStackWire : DelegatingHandler
     internal void DropNextSuccessfulTransactionResponse() => Interlocked.Exchange(ref _dropSuccessfulTransaction, 1);
 
     internal void DropNextSuccessfulBootstrapDeleteResponse() => Interlocked.Exchange(ref _dropSuccessfulBootstrapDelete, 1);
+
+    internal void DropNextSuccessfulStatusWriteResponse(LifecycleKey key) => Interlocked.Exchange(ref _dropSuccessfulStatusWrite, key);
 
     internal void HoldNextTwoTransactions() => _transactionBarrier = new TransactionBarrier();
 
@@ -320,6 +323,14 @@ internal sealed class MiniStackWire : DelegatingHandler
         {
             actual.Dispose();
             throw new HttpRequestException("Lost response after MiniStack deleted the bootstrap offer.",
+                new SocketException((int)SocketError.ConnectionReset));
+        }
+        if (operation == "PutItem" && actual.IsSuccessStatusCode && _dropSuccessfulStatusWrite is { } statusKey &&
+            MatchesKey(call.Request.GetProperty("Item"), statusKey) &&
+            ReferenceEquals(Interlocked.CompareExchange(ref _dropSuccessfulStatusWrite, null, statusKey), statusKey))
+        {
+            actual.Dispose();
+            throw new HttpRequestException("Lost response after MiniStack committed the status.",
                 new SocketException((int)SocketError.ConnectionReset));
         }
 

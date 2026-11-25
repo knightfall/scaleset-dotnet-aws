@@ -210,8 +210,7 @@ internal sealed class ControllerProfileReconciler(
             current.Identity.Incarnation == binding.Incarnation &&
             profile.Provisioner is Ec2ProvisionerConfiguration { StatusQualification: { } ec2 } &&
             current.Identity.AwsUserId.StartsWith(ec2.RoleId + ":", StringComparison.Ordinal) &&
-            await store.ReadEc2BootstrapStatusAsync(current, cancellationToken).ConfigureAwait(false) is { } status &&
-            status.QualificationSha256 == qualification)
+            await store.ReadEc2BootstrapStatusAsync(current, qualification, cancellationToken).ConfigureAwait(false) is { } status)
         {
             var observation = new ExecutorProcessObservation(status.RunnerId,
                 status.Exited ? ExecutorProcessState.Exited : ExecutorProcessState.Ready, status.ObservedAt, Guid.NewGuid());

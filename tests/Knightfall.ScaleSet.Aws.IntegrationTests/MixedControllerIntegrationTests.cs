@@ -2,6 +2,7 @@ using System.Net;
 using System.Text;
 using System.Text.Json;
 using System.Web;
+using Amazon.DynamoDBv2.Model;
 using Knightfall.ScaleSet.Aws.Core.Configuration;
 using Knightfall.ScaleSet.Aws.Core.Lifecycle;
 using Knightfall.ScaleSet.Aws.DynamoDb;
@@ -207,7 +208,7 @@ public sealed class MixedControllerIntegrationTests(ITestOutputHelper output)
         using var deadline = CancellationTokenSource.CreateLinkedTokenSource(TestContext.Current.CancellationToken);
         deadline.CancelAfter(TimeSpan.FromSeconds(mode == "mixed" ? 160 : 35));
         var token = deadline.Token;
-        await using var fixture = await MixedRuntimeFixture.CreateAsync(mode, token);
+        await using var fixture = await MixedRuntimeFixture.CreateAsync(mode, token, qualifyFirstEc2: mode == "mixed");
         string deployment = ControllerLeaseRecoveryCoordinator.DeploymentKey(fixture.Configuration);
         string firstTask = await fixture.StartControllerTaskAsync(token);
         string? secondTask = mode == "mixed" ? await fixture.StartControllerTaskAsync(token) : null;
@@ -281,6 +282,10 @@ public sealed class MixedControllerIntegrationTests(ITestOutputHelper output)
                 Assert.Equal(ControllerLeaseMode.Active, owner.Mode);
 
                 var firstJob = await StartSimulatedJobAsync(fixture, deployment, ec2[0], 8_334_500_001, token);
+                var malformedStatus = await SeedMalformedSupervisorStatusAsync(fixture, firstJob, token);
+                int afterMalformed = fixture.Cloud.Calls.Length;
+                await WaitAsync(() => Task.FromResult(ReadSupervisorStatus(fixture.Cloud.Calls.Skip(afterMalformed), malformedStatus)),
+                    "the qualified EC2 supervisor status read", token);
                 var secondJob = await StartSimulatedJobAsync(fixture, deployment, fargate[0], 8_334_500_002, token);
                 // Wire ACK, persisted job starts and a new lease heartbeat occur with failed exports.
                 await WaitAsync(async () => (await fixture.Store.ReadLeaseAsync(deployment, token))?.ValidUntil > owner.ValidUntil,
@@ -289,7 +294,8 @@ public sealed class MixedControllerIntegrationTests(ITestOutputHelper output)
                 int restoredAt = receiver.Requests.Count;
                 await WaitAsync(() => Task.FromResult(ActiveProfiles(receiver, restoredAt, firstJob, secondJob)), "OTLP metrics recovery", token);
 
-                await AssertUncleanTakeoverAsync(fixture, first, secondTask, deployment, ec2[1], firstJob, secondJob, receiver, token);
+                await AssertUncleanTakeoverAsync(fixture, first, secondTask, deployment, ec2[1], firstJob, secondJob,
+                    malformedStatus, receiver, token);
             }
             else
             {
@@ -314,8 +320,8 @@ public sealed class MixedControllerIntegrationTests(ITestOutputHelper output)
     }
 
     private async Task AssertUncleanTakeoverAsync(MixedRuntimeFixture fixture, MixedControllerProcess first, string secondTask,
-        string deployment, RunnerProfile launchProfile, ExecutorSnapshot ec2Job, ExecutorSnapshot fargateJob, OtlpLoopback receiver,
-        CancellationToken token)
+        string deployment, RunnerProfile launchProfile, ExecutorSnapshot ec2Job, ExecutorSnapshot fargateJob,
+        LifecycleKey malformedStatus, OtlpLoopback receiver, CancellationToken token)
     {
         var setup = Assert.IsType<Ec2ProvisionerConfiguration>(launchProfile.Provisioner);
         fixture.Cloud.HoldNextEc2Launch(setup.LaunchTemplateId);
@@ -398,6 +404,14 @@ public sealed class MixedControllerIntegrationTests(ITestOutputHelper output)
 
             await WaitAsync(() => Task.FromResult(ActiveProfiles(receiver, beforePromotion, ec2Job, fargateJob)), "successor active capacity metrics", token);
             AssertTelemetry(fixture, receiver.Requests, held, ec2Job, fargateJob, formerInstance);
+            Assert.True(ReadSupervisorStatus(fixture.Cloud.Calls.Skip(priorCalls), malformedStatus));
+            var otherFargate = fixture.Configuration.Profiles.Single(profile =>
+                profile.Provisioner is FargateProvisionerConfiguration && profile.Id != fargateJob.Binding.Profile.ProfileId);
+            await StartSimulatedJobAsync(fixture, deployment, launchProfile, 8_334_500_004, token);
+            await StartSimulatedJobAsync(fixture, deployment, otherFargate, 8_334_500_005, token);
+            var heldExecutor = Assert.IsType<ExecutorSnapshot>(await fixture.Store.ReadExecutorAsync(ec2Job.Binding.Profile,
+                ec2Job.Binding.AllocationId, token));
+            Assert.Null(heldExecutor.State.Process);
             Assert.Equal(launchCalls, fixture.Cloud.Calls.Count(IsRunnerMutation));
         }
         finally
@@ -416,6 +430,35 @@ public sealed class MixedControllerIntegrationTests(ITestOutputHelper output)
             Assert.DoesNotContain(fixture.Cloud.Calls.Skip(priorCalls), IsRunnerMutation);
         }
     }
+
+    private static async Task<LifecycleKey> SeedMalformedSupervisorStatusAsync(MixedRuntimeFixture fixture,
+        ExecutorSnapshot executor, CancellationToken token)
+    {
+        var handoff = Assert.IsType<JitHandoffSnapshot>(await fixture.Store.ReadJitHandoffAsync(executor.Binding.Profile,
+            Guid.ParseExact(executor.Binding.AllocationId, "D"), token));
+        var key = LifecycleKey.Status(handoff.Identity.AwsUserId);
+        var observed = TimeProvider.System.GetUtcNow();
+        await fixture.Table.Client.PutItemAsync(fixture.Table.Name, new Dictionary<string, AttributeValue>(StringComparer.Ordinal)
+        {
+            ["PK"] = new() { S = key.PartitionKey },
+            ["SK"] = new() { S = key.SortKey },
+            ["awsUserId"] = new() { S = handoff.Identity.AwsUserId },
+            ["resourceArn"] = new() { S = handoff.Identity.ResourceArn },
+            ["helloSha256"] = new() { S = handoff.HelloSha256 },
+            ["offerId"] = new() { S = handoff.OfferId },
+            ["runnerId"] = new() { N = FormattableString.Invariant($"{handoff.RunnerId}") },
+            ["sequence"] = new() { N = "2" },
+            ["observedAt"] = new() { N = FormattableString.Invariant($"{observed.ToUnixTimeMilliseconds()}") },
+            ["exited"] = new() { BOOL = true },
+            ["payload"] = new() { S = "{" },
+            ["qualificationSha256"] = new() { S = DirectEc2Fixture.StatusQualificationDigest },
+        }, token);
+        return key;
+    }
+
+    private static bool ReadSupervisorStatus(IEnumerable<MixedCloudCall> calls, LifecycleKey key) =>
+        calls.Any(call => call is { Service: "dynamodb", Operation: "GetItem" } &&
+            call.Request.Contains(key.PartitionKey, StringComparison.Ordinal));
 
     private static async Task<ExecutorSnapshot> StartSimulatedJobAsync(MixedRuntimeFixture fixture, string deployment, RunnerProfile profile,
         long requestId, CancellationToken token)

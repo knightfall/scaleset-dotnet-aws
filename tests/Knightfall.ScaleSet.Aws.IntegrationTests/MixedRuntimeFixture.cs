@@ -54,14 +54,15 @@ internal sealed class MixedRuntimeFixture : IAsyncDisposable
     private string ControllerSubnet { get; set; } = null!;
 
     internal static async Task<MixedRuntimeFixture> CreateAsync(string mode, CancellationToken token,
-        bool sharedFargateCluster = false, long remainingFargateCpuUnits = 32_768, int? warmFargateMaximum = null)
+        bool sharedFargateCluster = false, long remainingFargateCpuUnits = 32_768, int? warmFargateMaximum = null,
+        bool qualifyFirstEc2 = false)
     {
         var cloud = await MixedControllerCloud.StartAsync(token);
         MixedRuntimeFixture? fixture = null;
         try
         {
             fixture = new MixedRuntimeFixture(cloud, await MiniStackTable.CreateAsync(token));
-            await fixture.SeedAsync(mode, sharedFargateCluster, remainingFargateCpuUnits, warmFargateMaximum, token);
+            await fixture.SeedAsync(mode, sharedFargateCluster, remainingFargateCpuUnits, warmFargateMaximum, qualifyFirstEc2, token);
             return fixture;
         }
         catch
@@ -79,7 +80,7 @@ internal sealed class MixedRuntimeFixture : IAsyncDisposable
     }
 
     private async Task SeedAsync(string mode, bool sharedFargateCluster, long remainingFargateCpuUnits, int? warmFargateMaximum,
-        CancellationToken token)
+        bool qualifyFirstEc2, CancellationToken token)
     {
         string raw = await File.ReadAllTextAsync(Path.Combine(AppContext.BaseDirectory, "mixed-ec2-fargate.json"), token);
         var root = JsonNode.Parse(raw.Replace("111122223333", MixedControllerCloud.Account, StringComparison.Ordinal)
@@ -149,6 +150,16 @@ internal sealed class MixedRuntimeFixture : IAsyncDisposable
                 provisioner["instanceProfileArn"] = source.InstanceProfileArn;
                 provisioner["bootstrapRoleArn"] = role.Arn;
                 roleId = role.RoleId;
+                if (qualifyFirstEc2)
+                {
+                    provisioner["statusQualification"] = new JsonObject
+                    {
+                        ["imageId"] = DirectEc2Fixture.LinuxImage,
+                        ["roleId"] = roleId,
+                        ["evidenceSha256"] = DirectEc2Fixture.StatusQualificationDigest,
+                    };
+                    qualifyFirstEc2 = false;
+                }
             }
             else
             {

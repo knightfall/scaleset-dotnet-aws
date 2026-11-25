@@ -126,6 +126,21 @@ public sealed partial class DynamoDbLifecycleStore
 
     private async Task<Dictionary<string, AttributeValue>?> ReadItemAsync(LifecycleKey key, CancellationToken cancellationToken)
     {
+        var item = await ReadItemAttributesAsync(key, cancellationToken).ConfigureAwait(false);
+        if (item is null)
+        {
+            return null;
+        }
+        RequireKey(item, key.PartitionKey, key.SortKey);
+        if (key.Deployment is string deployment && Text(item, "deployment") != deployment)
+        {
+            throw InvalidRecord();
+        }
+        return item;
+    }
+
+    private async Task<Dictionary<string, AttributeValue>?> ReadItemAttributesAsync(LifecycleKey key, CancellationToken cancellationToken)
+    {
         var request = new GetItemRequest
         {
             TableName = _tableName,
@@ -134,17 +149,7 @@ public sealed partial class DynamoDbLifecycleStore
         };
         var reply = await ReadWithOutageMappingAsync(token => _client.GetItemAsync(request, token), cancellationToken).ConfigureAwait(false);
 
-        if (reply.Item is not { Count: > 0 } item)
-        {
-            return null;
-        }
-
-        RequireKey(item, key.PartitionKey, key.SortKey);
-        if (key.Deployment is string deployment && Text(item, "deployment") != deployment)
-        {
-            throw InvalidRecord();
-        }
-        return item;
+        return reply.Item is { Count: > 0 } item ? item : null;
     }
 
     private async Task<BasePage> ReadBasePageAsync(

@@ -1,5 +1,4 @@
 using System.Security.Cryptography;
-using System.Text.Json;
 using Amazon.DynamoDBv2.Model;
 using Knightfall.ScaleSet.Aws.Core.Catalog;
 using Knightfall.ScaleSet.Aws.Core.Lifecycle;
@@ -341,7 +340,11 @@ public sealed partial class DynamoDbLifecycleStore
         return true;
     }
 
-    public async Task<JitEc2BootstrapStatus?> ReadEc2BootstrapStatusAsync(JitHandoffSnapshot handoff, CancellationToken cancellationToken)
+    public Task<JitEc2BootstrapStatus?> ReadEc2BootstrapStatusAsync(JitHandoffSnapshot handoff, CancellationToken cancellationToken) =>
+        ReadEc2BootstrapStatusAsync(handoff, null, cancellationToken);
+
+    public async Task<JitEc2BootstrapStatus?> ReadEc2BootstrapStatusAsync(
+        JitHandoffSnapshot handoff, string? requiredQualification, CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(handoff);
         if (handoff.State != JitHandoffState.Offered || handoff.RunnerId is not long runnerId)
@@ -351,34 +354,23 @@ public sealed partial class DynamoDbLifecycleStore
         var identity = handoff.Identity;
         BootstrapItems.RequirePrincipal(identity.AwsUserId, identity.ResourceArn, ec2Only: true);
         var key = LifecycleKey.Status(identity.AwsUserId);
-        var row = await ReadItemAsync(key, cancellationToken).ConfigureAwait(false);
+        using var observation = DynamoDbDiagnostics.StartHandoff("ec2-status", _timeProvider);
+        var row = await ReadItemAttributesAsync(key, cancellationToken).ConfigureAwait(false);
         if (row is null)
         {
+            observation.CompleteStatusRead("not_available");
             return null;
         }
-        try
+        var status = DynamoDbEc2BootstrapStatusClient.DecodeStatus(key, row, identity.AwsUserId, identity.ResourceArn,
+            handoff.HelloSha256);
+        if (status is null || status.RunnerId != runnerId || status.OfferId != handoff.OfferId ||
+            (requiredQualification is not null && status.QualificationSha256 != requiredQualification) ||
+            status.ObservedAt > _timeProvider.GetUtcNow())
         {
-            BootstrapItems.RequireKey(key, row);
-            var status = BootstrapItems.Deserialize<JitEc2BootstrapStatus>(BootstrapItems.Text(row, "payload")) with
-            {
-                // Keep the payload readable by a controller rolled back to the original STATUS contract.
-                QualificationSha256 = row.ContainsKey("qualificationSha256") ? BootstrapItems.Text(row, "qualificationSha256") : null,
-            };
-            DynamoDbEc2BootstrapStatusClient.ValidateStatus(status);
-            return status.RunnerId == runnerId && status.OfferId == handoff.OfferId &&
-                BootstrapItems.Text(row, "helloSha256") == handoff.HelloSha256 &&
-                BootstrapItems.Text(row, "awsUserId") == identity.AwsUserId &&
-                BootstrapItems.Text(row, "resourceArn") == identity.ResourceArn &&
-                BootstrapItems.Text(row, "offerId") == status.OfferId &&
-                BootstrapItems.Integer(row, "runnerId") == status.RunnerId &&
-                BootstrapItems.Integer(row, "sequence") == status.Sequence &&
-                BootstrapItems.Integer(row, "observedAt") == status.ObservedAt.ToUnixTimeMilliseconds() &&
-                row.TryGetValue("exited", out var exited) && exited.BOOL == status.Exited &&
-                status.ObservedAt <= _timeProvider.GetUtcNow() ? status : null;
+            observation.CompleteStatusRead("rejected");
+            return null;
         }
-        catch (Exception error) when (error is JsonException or ArgumentException)
-        {
-            throw InvalidRecord();
-        }
+        observation.CompleteStatusRead("confirmed");
+        return status;
     }
 }

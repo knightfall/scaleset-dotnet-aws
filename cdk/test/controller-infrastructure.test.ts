@@ -743,6 +743,23 @@ test("only an active qualified EC2 role receives the supervisor STATUS policy", 
   assert.equal(statement.Action, "dynamodb:PutItem");
   assert.deepEqual(statement.Condition["ForAllValues:StringEquals"], {
     "dynamodb:LeadingKeys": ["STATUS#${aws:userid}"],
+    "dynamodb:Attributes": [
+      "PK",
+      "SK",
+      "awsUserId",
+      "resourceArn",
+      "helloSha256",
+      "offerId",
+      "runnerId",
+      "sequence",
+      "observedAt",
+      "exited",
+      "payload",
+      "qualificationSha256",
+    ],
+  });
+  assert.deepEqual(statement.Condition.StringEqualsIfExists, {
+    "dynamodb:ReturnValues": ["NONE", "ALL_OLD"],
   });
   assert.deepEqual(statement.Condition.NumericEquals, {
     "ec2:RoleDelivery": "2.0",
@@ -753,6 +770,7 @@ test("only an active qualified EC2 role receives the supervisor STATUS policy", 
   );
   assert.deepEqual(statement.Condition.Null, {
     "dynamodb:LeadingKeys": "false",
+    "dynamodb:Attributes": "false",
     "dynamodb:EnclosingOperation": "true",
   });
   assert.doesNotMatch(
