@@ -436,16 +436,18 @@ internal sealed class ControllerProfileSession : IAsyncDisposable
 
         async Task<GitHubListenerLaneResult> PollOnceAsync(CancellationToken attemptToken)
         {
-            // Only an actual queue GET can establish that the retained pump reached a
-            // fresh poll after settling its local checkpoint work and prior ACK.
-            if ((!recovering || lane.PollCredentialRejected) && _clock.GetUtcNow() >= rotation)
+            // Check a sessionless lane before its first resumed mutation. An owned
+            // session requires a definitive queue GET after the pump settled its ACK.
+            if ((recovering && !lane.HasRetainedSession) ||
+                ((!recovering || lane.PollCredentialRejected) && _clock.GetUtcNow() >= rotation))
             {
                 var rotated = recovering
-                    ? await lane.RotateAfterUnauthorizedPollAsync(attemptToken).ConfigureAwait(false)
+                    ? await lane.RotateDuringRecoveryAsync(attemptToken).ConfigureAwait(false)
                     : await lane.RotateAsync(attemptToken).ConfigureAwait(false);
                 rotation = _clock.GetUtcNow() + RotationInterval;
                 if (rotated.Status == GitHubListenerLaneStatus.StorageRejected ||
-                    (recovering && rotated.Status is GitHubListenerLaneStatus.RecoveryRequired or GitHubListenerLaneStatus.RecoveryCredentialRejected))
+                    (recovering && rotated.Status is not (GitHubListenerLaneStatus.Waiting or
+                        GitHubListenerLaneStatus.CredentialAdopted or GitHubListenerLaneStatus.CredentialUnchanged)))
                 {
                     return rotated;
                 }
