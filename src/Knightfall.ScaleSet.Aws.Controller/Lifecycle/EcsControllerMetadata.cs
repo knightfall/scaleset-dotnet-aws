@@ -19,14 +19,7 @@ public sealed class EcsControllerMetadata : IDisposable
     private static readonly TimeSpan MaximumSkew = TimeSpan.FromSeconds(1);
     private static readonly JsonDocumentOptions JsonOptions = new() { MaxDepth = 16, AllowDuplicateProperties = false };
 
-    private readonly HttpClient _http = new(new SocketsHttpHandler
-    {
-        AllowAutoRedirect = false,
-        UseProxy = false,
-        ConnectTimeout = TimeSpan.FromSeconds(1),
-        MaxResponseHeadersLength = 16,
-    }) { Timeout = Timeout.InfiniteTimeSpan };
-
+    private readonly HttpClient _http;
     private readonly TimeProvider _clock;
     private readonly Uri? _taskEndpoint;
     private readonly string _clusterName;
@@ -36,7 +29,8 @@ public sealed class EcsControllerMetadata : IDisposable
     {
     }
 
-    internal EcsControllerMetadata(RuntimeConfiguration configuration, TimeProvider clock, string? metadataEndpoint, bool allowLoopback)
+    internal EcsControllerMetadata(RuntimeConfiguration configuration, TimeProvider clock, string? metadataEndpoint, bool allowLoopback,
+        HttpMessageHandler? transport = null)
     {
         ArgumentNullException.ThrowIfNull(configuration);
         ArgumentNullException.ThrowIfNull(clock);
@@ -44,6 +38,13 @@ public sealed class EcsControllerMetadata : IDisposable
         _clusterName = ClusterArn[(ClusterArn.LastIndexOf('/') + 1)..];
         _taskEndpoint = ParseTaskEndpoint(metadataEndpoint, allowLoopback);
         _clock = clock;
+        _http = new HttpClient(transport ?? new SocketsHttpHandler
+        {
+            AllowAutoRedirect = false,
+            UseProxy = false,
+            ConnectTimeout = TimeSpan.FromSeconds(1),
+            MaxResponseHeadersLength = 16,
+        }) { Timeout = Timeout.InfiniteTimeSpan };
     }
 
     public string ClusterArn { get; }
@@ -122,7 +123,8 @@ public sealed class EcsControllerMetadata : IDisposable
 
             return ParseAuthority(document.RootElement, now, elapsed);
         }
-        catch (OperationCanceledException) when (reportTimeout && timeout.IsCancellationRequested)
+        catch (OperationCanceledException error) when (reportTimeout &&
+            (timeout.IsCancellationRequested || error.InnerException is TimeoutException))
         {
             cancellationToken.ThrowIfCancellationRequested();
             throw new TimeoutException("The ECS clock metadata read timed out.");
