@@ -1,5 +1,6 @@
 using System.Globalization;
 using System.Net;
+using System.Text.Json;
 using System.Web;
 using Knightfall.ScaleSet.Aws.Core.Configuration;
 using Knightfall.ScaleSet.Aws.Core.Lifecycle;
@@ -77,6 +78,12 @@ public sealed partial class MixedControllerIntegrationTests
 
             fixture.Cloud.PublishCapturedStop(acquiredAt);
             await fixture.Cloud.RecoveryRead.WaitAsync(TimeSpan.FromSeconds(20), token);
+            var continuations = fixture.Cloud.Calls.Where(call => call is { Service: "logs", Operation: "FilterLogEvents" })
+                .Select(CaptureWindow).Where(window => window.Token is not null).ToArray();
+            Assert.Contains(continuations, window => window.Token == "6");
+            Assert.Contains(continuations, window => window.Token == "8");
+            Assert.Single(continuations.Select(window => window.End).Distinct());
+            Assert.All(continuations, window => Assert.Equal(acquiredAt.ToUnixTimeSeconds() * 1000, window.Start));
             Assert.Equal(ControllerLeaseMode.RecoveryOnly, (await fixture.Store.ReadLeaseAsync(deployment, token))?.Mode);
             Assert.Equal(priorSession, github.SessionId);
             Assert.False(closeEntered.Task.IsCompleted);
@@ -112,5 +119,13 @@ public sealed partial class MixedControllerIntegrationTests
             await successor.KillAsync(CancellationToken.None);
             output.WriteLine(await successor.DiagnosticsAsync());
         }
+    }
+
+    private static (long Start, long End, string? Token) CaptureWindow(MixedCloudCall call)
+    {
+        using var document = JsonDocument.Parse(call.Request);
+        var request = document.RootElement;
+        return (request.GetProperty("startTime").GetInt64(), request.GetProperty("endTime").GetInt64(),
+            request.TryGetProperty("nextToken", out var token) ? token.GetString() : null);
     }
 }
