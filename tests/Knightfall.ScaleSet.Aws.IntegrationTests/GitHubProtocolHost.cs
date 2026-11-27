@@ -18,15 +18,17 @@ internal sealed class GitHubProtocolHost : IAsyncDisposable
 {
     internal const string PublicApi = "api.github.com";
     internal const string EnterpriseApi = "api.example.ghe.com";
-    internal const string ServiceHost = "actions.example.test";
-    internal const string QueueHost = "queue.example.test";
+    internal const string ServiceHost = "service-fixture.actions.githubusercontent.com";
+    internal const string QueueHost = "queue-fixture.actions.githubusercontent.com";
 
     private readonly WebApplication _app;
     private readonly X509Certificate2 _certificate;
-    private GitHubProtocolHost(WebApplication app, X509Certificate2 certificate)
+    private readonly string[] _hosts;
+    private GitHubProtocolHost(WebApplication app, X509Certificate2 certificate, string[] hosts)
     {
         _app = app;
         _certificate = certificate;
+        _hosts = hosts;
         var listening = app.Services.GetRequiredService<IServer>().Features.Get<IServerAddressesFeature>()!.Addresses.Single();
         var endpoint = new Uri(listening);
         Port = endpoint.Port;
@@ -42,7 +44,8 @@ internal sealed class GitHubProtocolHost : IAsyncDisposable
     internal static async Task<GitHubProtocolHost> StartAsync(IReadOnlyList<GitHubSimulator> simulators, CancellationToken cancellationToken,
         Func<HttpContext, Task>? beforeRequest = null)
     {
-        var certificate = CreateCertificate(simulators.SelectMany(simulator => simulator.Address.Hosts));
+        var hosts = simulators.SelectMany(simulator => simulator.Address.Hosts).Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
+        var certificate = CreateCertificate(hosts);
         var builder = WebApplication.CreateSlimBuilder();
         builder.Logging.ClearProviders();
         builder.WebHost.ConfigureKestrel(server =>
@@ -74,7 +77,7 @@ internal sealed class GitHubProtocolHost : IAsyncDisposable
                 simulator.Map(app);
             }
             await app.StartAsync(cancellationToken).ConfigureAwait(false);
-            return new GitHubProtocolHost(app, certificate);
+            return new GitHubProtocolHost(app, certificate, hosts);
         }
         catch
         {
@@ -84,7 +87,7 @@ internal sealed class GitHubProtocolHost : IAsyncDisposable
         }
     }
 
-    internal HttpClient CreateClient() => CreateClient(Port, Fingerprint);
+    internal HttpClient CreateClient() => CreateClient(Port, Fingerprint, _hosts);
 
     internal static HttpClient CreateClient(int port, string fingerprint, IEnumerable<string>? allowedHosts = null)
     {

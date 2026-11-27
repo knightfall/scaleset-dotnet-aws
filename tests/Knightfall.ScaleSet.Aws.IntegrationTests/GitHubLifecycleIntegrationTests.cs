@@ -39,7 +39,8 @@ public sealed partial class GitHubLifecycleIntegrationTests
         var clock = new IntegrationClock();
         var store = new DynamoDbLifecycleStore(table.Client, table.Name, clock);
         var lease = await StartOwnerAsync(store, configuration, clock, token);
-        var simulator = new GitHubSimulator(Group);
+        var simulator = new GitHubSimulator(Group, scope.Contains(".ghe.com", StringComparison.Ordinal)
+            ? GitHubSimulatorAddress.ForProfile("example") : null);
         await using var host = await GitHubProtocolHost.StartAsync(simulator, token);
         using var http = host.CreateClient();
         var factory = new GitHubScaleSetClientFactory(http, timeProvider: clock);

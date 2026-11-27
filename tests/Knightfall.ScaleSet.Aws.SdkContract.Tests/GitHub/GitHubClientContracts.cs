@@ -57,7 +57,10 @@ public sealed class GitHubClientContracts
         using var discovery = JsonDocument.Parse(requests[^2].Body!);
         Assert.Equal(targetUrl, discovery.RootElement.GetProperty("url").GetString());
         Assert.Equal("register", discovery.RootElement.GetProperty("runner_event").GetString());
-        AssertAdmin(requests[^1], HttpMethod.Get, SetPath);
+        string serviceHost = apiHost == "api.tenant.ghe.com"
+            ? "service-fixture.actions.tenant.ghe.com"
+            : GitHubWire.ServiceHost;
+        AssertAdmin(requests[^1], HttpMethod.Get, SetPath, serviceHost);
     }
 
     [Fact]
@@ -252,6 +255,55 @@ public sealed class GitHubClientContracts
         AssertAdmin(Assert.Single(wire.Requests, request => request.Uri.Host == GitHubWire.ServiceHost), HttpMethod.Get, SetPath);
     }
 
+    [Theory]
+    [InlineData("https://github.com/owner/repository", GitHubWire.ServiceHost, GitHubWire.QueueHost)]
+    [InlineData("https://tenant.ghe.com/owner/repository", "service-fixture.actions.tenant.ghe.com", "queue-fixture.actions.tenant.ghe.com")]
+    public async Task SessionRoutesAdministrationAndQueueTrafficToTheSameTarget(
+        string url, string serviceHost, string queueHost)
+    {
+        GitHubTarget target = GitHubTarget.Parse(url);
+        using var wire = new GitHubWire((call, _) => call.Method == HttpMethod.Get
+            ? GitHubWire.Reply(HttpStatusCode.Accepted, "")
+            : GitHubWire.Reply(HttpStatusCode.OK, GitHubWire.SessionJson(target: target)));
+        using var http = new HttpClient(wire);
+        using var client = new ScaleSetClient(target, ScaleSetCredentials.FromPersonalAccessToken(GitHubWire.Pat),
+            httpClient: http, timeProvider: new ContractClock());
+
+        var token = TestContext.Current.CancellationToken;
+        var session = await client.CreateMessageSessionAsync(GitHubWire.SetId, "owner", token);
+        Assert.Null(await session.GetMessageAsync(0, 1, token));
+
+        AssertAdmin(Assert.Single(wire.Requests, call => call.Uri.AbsolutePath == SessionPath), HttpMethod.Post,
+            SessionPath, serviceHost);
+        var poll = Assert.Single(wire.Requests, call => call.Method == HttpMethod.Get);
+        Assert.Equal(queueHost, poll.Uri.Host);
+        Assert.Equal(GitHubWire.QueuePath, poll.Uri.AbsolutePath);
+        Assert.Equal("Bearer " + GitHubWire.QueueToken, poll.Authorization);
+    }
+
+    /// <summary>Enables the strict negative contract once the installed SDK provides endpoint validation.</summary>
+    public static bool SdkHasDiscoveredEndpointPolicy =>
+        typeof(ScaleSetClientOptions).GetProperty("IsTrustedDiscoveredEndpoint") is not null;
+
+    [Fact(Skip = "Requires the SDK with discovered endpoint validation.", SkipUnless = nameof(SdkHasDiscoveredEndpointPolicy))]
+    public async Task SessionRejectsQueueForAnotherTenantBeforeSendingItsToken()
+    {
+        GitHubTarget target = GitHubTarget.Parse("https://tenant.ghe.com/owner/repository");
+        GitHubTarget other = GitHubTarget.Parse("https://other.ghe.com/owner/repository");
+        using var wire = new GitHubWire((_, _) => GitHubWire.Reply(HttpStatusCode.OK, GitHubWire.SessionJson(target: other)));
+        using var http = new HttpClient(wire);
+        using var client = new ScaleSetClient(target, ScaleSetCredentials.FromPersonalAccessToken(GitHubWire.Pat),
+            httpClient: http, timeProvider: new ContractClock());
+
+        await Assert.ThrowsAsync<ScaleSetApiException>(() =>
+            client.CreateMessageSessionAsync(GitHubWire.SetId, "owner", TestContext.Current.CancellationToken));
+
+        AssertAdmin(Assert.Single(wire.Requests, call => call.Uri.AbsolutePath == SessionPath), HttpMethod.Post,
+            SessionPath, "service-fixture.actions.tenant.ghe.com");
+        Assert.DoesNotContain(wire.Requests, call => call.Uri.Host == "queue-fixture.actions.other.ghe.com"
+            || call.Authorization == "Bearer " + GitHubWire.QueueToken);
+    }
+
     [Fact]
     public async Task QueueFailureKeepsRawResponseButRedactsDiagnosticSurfaces()
     {
@@ -288,10 +340,11 @@ public sealed class GitHubClientContracts
         }
     }
 
-    private static void AssertAdmin(GitHubRequest request, HttpMethod method, string path)
+    private static void AssertAdmin(
+        GitHubRequest request, HttpMethod method, string path, string serviceHost = GitHubWire.ServiceHost)
     {
         Assert.Equal(method, request.Method);
-        Assert.Equal(GitHubWire.ServiceHost, request.Uri.Host);
+        Assert.Equal(serviceHost, request.Uri.Host);
         Assert.Equal(path, request.Uri.AbsolutePath);
         Assert.Equal("Bearer " + GitHubWire.AdminToken, request.Authorization);
     }

@@ -31,12 +31,12 @@ internal sealed record SimulatorRequest(string Method, string Host, string Path,
 internal sealed record GitHubSimulatorAddress(string[] ApiHosts, string ServiceHost, string QueueHost)
 {
     internal static readonly GitHubSimulatorAddress Default = new(
-        [GitHubProtocolHost.PublicApi, GitHubProtocolHost.EnterpriseApi], GitHubProtocolHost.ServiceHost, GitHubProtocolHost.QueueHost);
+        [GitHubProtocolHost.PublicApi], GitHubProtocolHost.ServiceHost, GitHubProtocolHost.QueueHost);
 
     internal IEnumerable<string> Hosts => ApiHosts.Append(ServiceHost).Append(QueueHost);
 
     internal static GitHubSimulatorAddress ForProfile(string profileId) => new(
-        ["api." + profileId + ".ghe.com"], profileId + ".actions.example.test", profileId + ".queue.example.test");
+        [$"api.{profileId}.ghe.com"], $"service-fixture.actions.{profileId}.ghe.com", $"queue-fixture.actions.{profileId}.ghe.com");
 }
 
 internal sealed class GitHubSimulator(string groupName, GitHubSimulatorAddress? address = null)

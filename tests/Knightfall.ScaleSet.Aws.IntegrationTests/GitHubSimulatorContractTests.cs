@@ -5,15 +5,21 @@ namespace Knightfall.ScaleSet.Aws.IntegrationTests;
 
 public sealed class GitHubSimulatorContractTests
 {
-    [Fact]
-    public async Task PinnedClientPollsAnExclusiveQueueOverLoopbackHttp2()
+    [Theory]
+    [InlineData(null, GitHubProtocolHost.PublicApi, GitHubProtocolHost.QueueHost)]
+    [InlineData("example", "api.example.ghe.com", "queue-fixture.actions.example.ghe.com")]
+    public async Task PinnedClientPollsAnExclusiveQueueOverLoopbackHttp2(string? tenant, string apiHost, string queueHost)
     {
         const string Group = "No-Docker";
         var cancellationToken = TestContext.Current.CancellationToken;
-        var simulator = new GitHubSimulator(Group) { TotalAssignedJobs = 3 };
+        var simulator = new GitHubSimulator(Group, tenant is null ? null : GitHubSimulatorAddress.ForProfile(tenant))
+        {
+            TotalAssignedJobs = 3,
+        };
         await using var host = await GitHubProtocolHost.StartAsync(simulator, cancellationToken);
         using var http = host.CreateClient();
-        using var client = new ScaleSetClient(GitHubTarget.Parse("https://github.com/enterprises/engineering"),
+        string webHost = tenant is null ? "github.com" : $"{tenant}.ghe.com";
+        using var client = new ScaleSetClient(GitHubTarget.Parse($"https://{webHost}/enterprises/engineering"),
             ScaleSetCredentials.FromPersonalAccessToken(GitHubSimulator.FirstPat), httpClient: http);
         var group = await client.GetRunnerGroupByNameAsync(Group, cancellationToken);
         Assert.Equal(GitHubSimulator.GroupId, group.Id);
@@ -37,9 +43,9 @@ public sealed class GitHubSimulatorContractTests
         await session.CloseAsync(cancellationToken);
         Assert.Null(simulator.SessionId);
         Assert.All(simulator.Requests, request => Assert.Equal("HTTP/2", request.Protocol));
-        Assert.Contains(simulator.Requests, request => request.Host == GitHubProtocolHost.PublicApi &&
+        Assert.Contains(simulator.Requests, request => request.Host == apiHost &&
             request.Path == "/enterprises/engineering/actions/runners/registration-token");
-        Assert.Contains(simulator.Requests, request => request.Host == GitHubProtocolHost.QueueHost &&
+        Assert.Contains(simulator.Requests, request => request.Host == queueHost &&
             request.Method == "GET" && request.Cursor == "1" && request.Capacity == "0");
     }
 
@@ -49,7 +55,7 @@ public sealed class GitHubSimulatorContractTests
     public async Task HostedEnterpriseUsesItsOwnRateLimitedApi(int expectedStatus)
     {
         var cancellationToken = TestContext.Current.CancellationToken;
-        var simulator = new GitHubSimulator("No-Docker");
+        var simulator = new GitHubSimulator("No-Docker", GitHubSimulatorAddress.ForProfile("example"));
         await using var host = await GitHubProtocolHost.StartAsync(simulator, cancellationToken);
         using var http = host.CreateClient();
         using var client = new ScaleSetClient(GitHubTarget.Parse("https://example.ghe.com/enterprises/engineering"),
