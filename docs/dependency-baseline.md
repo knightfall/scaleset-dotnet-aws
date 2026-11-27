@@ -25,15 +25,20 @@ archives:
 | `Knightfall.ScaleSet.Listener.0.1.0-alpha.1.nupkg` | `01b8d686419a951c7b9b58918f8eaf56e39ee63e57502e594093dd76f8203066` |
 
 The controller consumes the published packages from NuGet.org with exact central versions,
-committed NuGet lock files, and locked CI restore. Do not use the earlier local
-candidate feed or a sibling project reference: candidate builds reused the same
-preview version. T02 verifies consumption in an isolated package cache and
-records the resolved package identities. Follow the upstream
+committed NuGet lock files, and locked CI restore. T02 verifies consumption in
+an isolated package cache and records the resolved package identities. Follow the upstream
 [artifact verification procedure](https://github.com/knightfall/scaleset.NET/blob/v0.1.0-alpha.1/docs/releases/PUBLISHING.md#verify-release-artifacts)
 for provenance, SBOM, and registry signatures. NuGet.org adds a repository
 signature, so its archive bytes need not match the original release archive
 hashes above. A package upgrade requires an explicit baseline change and rerun
 of the relevant SDK and integration contracts.
+
+Use a disposable AWS checkout for unreleased SDK checks. Temporary project
+references are useful for debugging. For compatibility verification, pack the
+SDK with distinct prerelease versions and use a private feed and separate
+package cache. Update the pins and locks in that checkout, verify the resolved
+packages, and record the SDK commit, versions, and checks run. Keep the
+committed baseline and release evidence tied to the published packages.
 
 Use the release's [central dependency versions](https://github.com/knightfall/scaleset.NET/blob/v0.1.0-alpha.1/Directory.Packages.props)
 when selecting compatible direct dependencies. In particular, do not
