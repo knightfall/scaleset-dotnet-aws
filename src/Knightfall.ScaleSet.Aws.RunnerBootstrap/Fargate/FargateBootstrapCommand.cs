@@ -7,27 +7,26 @@ using Amazon.DynamoDBv2;
 using Amazon.Runtime;
 using Amazon.SecurityToken;
 using Knightfall.ScaleSet.Aws.RunnerBootstrap.Linux;
+using Microsoft.Extensions.Logging;
 
 namespace Knightfall.ScaleSet.Aws.RunnerBootstrap.Fargate;
 
-[SupportedOSPlatform("linux")]
 internal static class FargateBootstrapCommand
 {
+    [SupportedOSPlatform("linux")]
     internal static async Task<int> RunAsync(string settingsPath)
     {
-        if (Environment.ProcessId != 1)
-        {
-            Console.Error.WriteLine("Fargate bootstrap must run as PID 1.");
-            return 1;
-        }
-
+        bool isPidOne = Environment.ProcessId == 1;
         using var stopping = new CancellationTokenSource();
-        using var stop = PosixSignalRegistration.Create(PosixSignal.SIGTERM, context =>
+        using var stop = isPidOne ? PosixSignalRegistration.Create(PosixSignal.SIGTERM, context =>
         {
             context.Cancel = true;
             stopping.Cancel();
-        });
-        try
+        }) : null;
+        return await RunWithDiagnosticsAsync(isPidOne, RunBootstrapAsync, Console.Out, Console.Error, TimeProvider.System, stopping.Token)
+            .ConfigureAwait(false);
+
+        async Task<RunnerBootstrapOutcome> RunBootstrapAsync(ILogger? logger, CancellationToken token)
         {
             if (!LinuxFiles.HasFargateRunnerIdentity() || !LinuxFiles.IsTrustedFile(settingsPath, ownerOnly: false))
             {
@@ -65,23 +64,40 @@ internal static class FargateBootstrapCommand
             using var helloTransport = HelloEndpointRegistration.CreateTransport();
             var registration = new HelloEndpointRegistration(helloTransport, settings.HelloEndpoint, settings.Region,
                 taskCredentials, TimeProvider.System);
-            var application = new FargateBootstrapApplication(settings, TimeProvider.System);
+            var application = new FargateBootstrapApplication(settings, TimeProvider.System, logger);
             var runner = new LinuxOneJobRunner(boundary, stopGrace: TimeSpan.FromSeconds(20));
-            var outcome = await application.RunAsync(metadataEndpoint, metadata, sts, ddb, runner, registration.RegisterAsync, stopping.Token)
+            return await application.RunAsync(metadataEndpoint, metadata, sts, ddb, runner, registration.RegisterAsync, token)
                 .ConfigureAwait(false);
-            Console.WriteLine(outcome);
+        }
+    }
+
+    internal static async Task<int> RunWithDiagnosticsAsync(bool isPidOne,
+        Func<ILogger?, CancellationToken, Task<RunnerBootstrapOutcome>> run,
+        TextWriter output, TextWriter errors, TimeProvider clock, CancellationToken stopping)
+    {
+        await using var logger = BootstrapLogQueue.Start(new BootstrapConsoleLogger(output, errors), clock);
+        if (!isPidOne)
+        {
+            BootstrapLog.Write(logger, BootstrapLog.FargateRequiresPidOne);
+            return 1;
+        }
+
+        try
+        {
+            var outcome = await run(logger, stopping).ConfigureAwait(false);
+            BootstrapLog.Write(logger, target => BootstrapLog.Outcome(target, outcome));
             return outcome == RunnerBootstrapOutcome.Completed ? 0 : 1;
         }
         catch (OperationCanceledException) when (stopping.IsCancellationRequested)
         {
-            Console.Error.WriteLine("Fargate bootstrap stopped.");
+            BootstrapLog.Write(logger, BootstrapLog.FargateStopped);
             return 1;
         }
         catch (Exception error) when (error is InvalidDataException or IOException or HttpRequestException or ArgumentException or JsonException or Win32Exception or
                                       AmazonClientException or AmazonServiceException or InvalidOperationException or UnauthorizedAccessException or
                                       OperationCanceledException)
         {
-            Console.Error.WriteLine("Fargate bootstrap failed.");
+            BootstrapLog.Write(logger, BootstrapLog.FargateFailed);
             return 1;
         }
     }

@@ -7,11 +7,12 @@ using Knightfall.ScaleSet.Aws.Core.Lifecycle;
 using Knightfall.ScaleSet.Aws.DynamoDb;
 using Knightfall.ScaleSet.Aws.Handoff;
 using Knightfall.ScaleSet.Aws.RunnerBootstrap.Linux;
+using Microsoft.Extensions.Logging;
 
 namespace Knightfall.ScaleSet.Aws.RunnerBootstrap.Ec2;
 
 [SupportedOSPlatform("linux")]
-internal sealed class Ec2BootstrapApplication(Ec2BootstrapSettings settings, TimeProvider clock)
+internal sealed class Ec2BootstrapApplication(Ec2BootstrapSettings settings, TimeProvider clock, ILogger? logger = null)
 {
     internal async Task<RunnerBootstrapOutcome> RunAsync(CancellationToken cancellationToken)
     {
@@ -32,18 +33,20 @@ internal sealed class Ec2BootstrapApplication(Ec2BootstrapSettings settings, Tim
         var spent = new Ec2SpentMarker(settings.SpentDirectory, identity.ResourceArn);
         var reporter = qualification is null ? null : new Ec2BootstrapStatusReporter(identity, qualification.EvidenceSha256, clock,
             token => verifier.VerifyAsync(settings.Authority, token, qualification.ImageId), PublishStatusAsync);
+        await using var logQueue = BootstrapLogQueue.Start(logger, clock);
+        var diagnosticsLogger = logQueue ?? logger;
         var bootstrap = new RunnerBootstrap(offers, settings.Target, identity.ResourceArn, identity.AwsUserId, spent.TryReserve,
             new LinuxOneJobRunner(boundary), clock, TimeSpan.FromMinutes(5), TimeSpan.FromSeconds(2),
-            registration.RegisterAsync, ReportAsync, telemetryProvider: RunnerProvisionerType.Ec2);
+            registration.RegisterAsync, ReportAsync, validateProviderBinding: null, RunnerProvisionerType.Ec2, diagnosticsLogger);
         return await bootstrap.RunAsync(cancellationToken).ConfigureAwait(false);
 
         async Task ReportAsync(BootstrapRunnerObservation observation, CancellationToken token)
         {
-            Console.WriteLine(observation.Exited ? "One-job runner exited." : "One-job runner connected.");
+            BootstrapLog.Write(diagnosticsLogger, observation.Exited ? BootstrapLog.RunnerExited : BootstrapLog.RunnerConnected);
             if (reporter is not null &&
                 await reporter.ReportAsync(observation, token).ConfigureAwait(false) != LifecycleWriteOutcome.Committed)
             {
-                Console.Error.WriteLine("Bootstrap status was not confirmed.");
+                BootstrapLog.Write(diagnosticsLogger, BootstrapLog.StatusUnconfirmed);
             }
         }
 
