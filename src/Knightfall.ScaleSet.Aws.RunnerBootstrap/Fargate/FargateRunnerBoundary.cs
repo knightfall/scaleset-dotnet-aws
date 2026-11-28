@@ -13,11 +13,13 @@ internal sealed class FargateRunnerBoundary : ILinuxOneJobBoundary, IDisposable
     private static readonly string[] ManagedEntries = ["Runner.Listener.dll", "Runner.Worker.dll", "Runner.PluginHost.dll"];
     private readonly string _root;
     private readonly string _dotnet;
+    private readonly FargateRamCleanup _cleanup;
 
-    private FargateRunnerBoundary(string root, string dotnet)
+    private FargateRunnerBoundary(string root, string dotnet, FargateRamCleanup cleanup)
     {
         _root = root;
         _dotnet = dotnet;
+        _cleanup = cleanup;
     }
 
     internal static FargateRunnerBoundary Create(FargateBootstrapSettings settings)
@@ -45,10 +47,9 @@ internal sealed class FargateRunnerBoundary : ILinuxOneJobBoundary, IDisposable
         string instance = "scaleset-" + Guid.NewGuid().ToString("N");
         string root = Path.Combine(MemoryMount, instance);
         string work = Path.Combine(settings.WorkScratch, instance);
-        var boundary = new FargateRunnerBoundary(root, settings.RunnerDotnet);
+        var boundary = new FargateRunnerBoundary(root, settings.RunnerDotnet, FargateRamCleanup.Open(MemoryMount, instance, create: true));
         try
         {
-            Directory.CreateDirectory(root, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
             Directory.CreateDirectory(work, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
             string bin = Directory.CreateDirectory(Path.Combine(root, "bin")).FullName;
             Directory.CreateSymbolicLink(Path.Combine(root, "externals"), runnerExternals);
@@ -127,9 +128,9 @@ internal sealed class FargateRunnerBoundary : ILinuxOneJobBoundary, IDisposable
         return start;
     }
 
-    public void RemoveConfigFiles() => FargateRamCleanup.Remove(MemoryMount, Path.GetFileName(_root));
+    public void RemoveConfigFiles() => _cleanup.Remove();
 
-    public void Dispose() => RemoveConfigFiles();
+    public void Dispose() => _cleanup.Dispose();
 }
 
 internal static class FargateMountLayout
