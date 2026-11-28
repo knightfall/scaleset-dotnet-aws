@@ -137,7 +137,12 @@ export class ControllerInfrastructure extends Stack {
       new iam.PolicyStatement({
         actions: ["s3:GetObjectVersion"],
         resources: [artifact.objectArn],
-        conditions: { StringEquals: { "s3:VersionId": artifact.versionId } },
+        conditions: {
+          StringEquals: {
+            "s3:VersionId": artifact.versionId,
+            "s3:ResourceAccount": this.account,
+          },
+        },
       }),
     );
     if (fargatePreflight?.quotaSource) {

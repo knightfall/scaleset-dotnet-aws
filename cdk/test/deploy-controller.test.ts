@@ -154,17 +154,17 @@ function fixture({
       ) as {
         Properties: { ContainerDefinitions: [{ Environment?: unknown }] };
       };
-      assert.deepEqual(
-        task.Properties.ContainerDefinitions[0].Environment,
-        expectedFargatePreflight === undefined
-          ? undefined
+      assert.deepEqual(task.Properties.ContainerDefinitions[0].Environment, [
+        { Name: "SCALESET_RUNTIME_BUCKET_OWNER", Value: account },
+        ...(expectedFargatePreflight === undefined
+          ? []
           : [
               {
                 Name: "SCALESET_FARGATE_PREFLIGHT",
                 Value: expectedFargatePreflight,
               },
-            ],
-      );
+            ]),
+      ]);
       const name = option(args, "--change-set-name");
       assert.notEqual(name, prepared?.name);
       changeSetNames.push(name);

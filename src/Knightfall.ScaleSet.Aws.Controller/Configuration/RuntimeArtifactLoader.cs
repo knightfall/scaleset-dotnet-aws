@@ -19,7 +19,14 @@ public static class RuntimeArtifactLoader
         var bytes = artifact.S3 is { } s3
             ? await ReadS3Async(s3, region: null, createS3Client, cancellationToken)
             : await File.ReadAllBytesAsync(artifact.LocalPath!, cancellationToken);
-        return RuntimeConfigurationLoader.Load(bytes, artifact.ExpectedSha256);
+        var configuration = RuntimeConfigurationLoader.Load(bytes, artifact.ExpectedSha256);
+        if (artifact.S3?.ExpectedBucketOwner is { } owner &&
+            !string.Equals(owner, configuration.Aws.Account, StringComparison.Ordinal))
+        {
+            throw new RuntimeConfigurationException("owner", "/spec/aws/account",
+                "The runtime artifact bucket owner must match the configured deployment account.");
+        }
+        return configuration;
     }
 
     internal static async Task<byte[]> ReadS3Async(
