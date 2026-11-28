@@ -1,16 +1,19 @@
 using System.Net.Sockets;
 using Amazon.Runtime;
 using Amazon.SQS;
+using Knightfall.ScaleSet.Aws.Controller.Telemetry;
 using Knightfall.ScaleSet.Aws.Core.Configuration;
 using Knightfall.ScaleSet.Aws.Core.Lifecycle;
 using Knightfall.ScaleSet.Aws.DynamoDb;
 using Knightfall.ScaleSet.Aws.Providers.Ec2;
 using Knightfall.ScaleSet.Aws.Providers.Fargate;
+using Microsoft.Extensions.Logging;
 
 namespace Knightfall.ScaleSet.Aws.Controller.Runtime;
 
 internal sealed class ControllerQueuePump(RuntimeConfiguration configuration, IAmazonSQS sqs, DynamoDbLifecycleStore store,
-    IReadOnlyDictionary<string, Ec2EffectProvider> ec2Effects, FargateProfileInspector? fargateInspector, TimeProvider clock)
+    IReadOnlyDictionary<string, Ec2EffectProvider> ec2Effects, FargateProfileInspector? fargateInspector, TimeProvider clock,
+    ControllerRuntimeLog? log = null)
 {
     private static readonly TimeSpan RetryDelay = TimeSpan.FromSeconds(1);
     private readonly string _deployment = RunnerOwnershipTags.DeploymentIdentity(configuration);
@@ -18,7 +21,7 @@ internal sealed class ControllerQueuePump(RuntimeConfiguration configuration, IA
     internal Task RunEc2Async(string queueUrl, ControllerLeaseOwnership ownership, CancellationToken runToken)
     {
         var consumer = new Ec2StateChangeConsumer(configuration, sqs, queueUrl, clock);
-        return RunOwnedAsync(ownership, ct => consumer.ReceiveOnceAsync(
+        return RunOwnedAsync(ownership, "ec2-queue", ct => consumer.ReceiveOnceAsync(
             (hint, token) => RefreshEc2Async(ownership, hint, token), token => HasCurrentAuthorityAsync(ownership, token), ct), runToken);
     }
 
@@ -26,13 +29,13 @@ internal sealed class ControllerQueuePump(RuntimeConfiguration configuration, IA
     {
         using var consumer = new FargateTaskEventConsumer(sqs, fargateInspector ??
             throw new InvalidOperationException("The Fargate queue requires an enabled Fargate backend."), configuration, queueUrl, clock);
-        await RunOwnedAsync(ownership, ct => consumer.PollAsync(
+        await RunOwnedAsync(ownership, "fargate-queue", ct => consumer.PollAsync(
             (binding, observation, token) => ApplyFargateAsync(ownership, binding, observation, token),
             token => HasCurrentAuthorityAsync(ownership, token), ct), runToken).ConfigureAwait(false);
     }
 
     private async Task RunOwnedAsync(
-        ControllerLeaseOwnership ownership, Func<CancellationToken, Task> receive, CancellationToken runToken)
+        ControllerLeaseOwnership ownership, string operation, Func<CancellationToken, Task> receive, CancellationToken runToken)
     {
         using var owned = CancellationTokenSource.CreateLinkedTokenSource(runToken, ownership.OwnershipLost);
         var token = owned.Token;
@@ -52,6 +55,7 @@ internal sealed class ControllerQueuePump(RuntimeConfiguration configuration, IA
                     HttpRequestException or SocketException or AmazonServiceException or AmazonClientException or TimeoutException or OperationCanceledException)
                 {
                     // A failed observation or queue request leaves the message available for redelivery.
+                    log?.Write(LogLevel.Warning, operation, "unavailable", "unavailable", throttle: true);
                 }
                 await Task.Delay(RetryDelay, clock, token).ConfigureAwait(false);
             }
