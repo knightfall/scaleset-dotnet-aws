@@ -1,9 +1,8 @@
-import { closeSync, constants, fstatSync, openSync } from "node:fs";
 import { isIPv4 } from "node:net";
 import { awsPartition } from "../config/semantics.ts";
 import type { RunnerControllerRuntime } from "../config/types.ts";
 import { parseYaml } from "../config/yaml.ts";
-import { readDeploymentDocument } from "./deployment-document.ts";
+import { readRegularDeploymentDocument } from "./deployment-document.ts";
 
 export interface ControllerTelemetrySettings {
   readonly sdkDisabled?: boolean;
@@ -295,13 +294,7 @@ export function readControllerTelemetry(
   if (path === undefined) return undefined;
   let bytes: Buffer | undefined;
   try {
-    const fd = openSync(path, constants.O_RDONLY | constants.O_NONBLOCK);
-    try {
-      if (!fstatSync(fd).isFile()) return invalid("document");
-      bytes = readDeploymentDocument(fd);
-    } finally {
-      closeSync(fd);
-    }
+    bytes = readRegularDeploymentDocument(path);
   } catch {
     return invalid("document");
   }

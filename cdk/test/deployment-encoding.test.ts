@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import {
   chmodSync,
   mkdtempSync,
@@ -23,6 +23,7 @@ import {
   readAttempt,
   readDecision,
 } from "../lib/infrastructure/deployment-recovery.ts";
+import { readImportedEncryption } from "../lib/infrastructure/imported-encryption.ts";
 
 const config = fileURLToPath(
   new URL("../../testdata/config/mixed-ec2-fargate.yaml", import.meta.url),
@@ -190,6 +191,7 @@ test("local deployment documents accept 64 KiB and reject larger inputs", (conte
   const name = "scaleset-00000000-0000-0000-0000-000000000000";
   const decision = `${journal}.${name}.decision`;
   const telemetry = join(directory, "telemetry.json");
+  const encryption = join(directory, "encryption.json");
   const limit = 64 * 1024;
 
   writeFileSync(decision, '"discard"'.padEnd(limit), { mode: 0o600 });
@@ -204,6 +206,13 @@ test("local deployment documents accept 64 KiB and reject larger inputs", (conte
   writeFileSync(telemetry, "{}".padEnd(limit + 1));
   assert.throws(() => readControllerTelemetry(telemetry, aws), {
     message: "Controller telemetry input exceeds 64 KiB.",
+  });
+
+  writeFileSync(encryption, "{}".padEnd(limit));
+  assert.deepEqual(readImportedEncryption(encryption), {});
+  writeFileSync(encryption, "{}".padEnd(limit + 1));
+  assert.throws(() => readImportedEncryption(encryption), {
+    message: "Invalid imported encryption JSON document.",
   });
 });
 
@@ -232,3 +241,57 @@ test("deployment journal rejects duplicate JSON names even when escaped", (conte
     });
   }
 });
+
+test("imported encryption continues to accept a UTF-8 BOM and reject invalid JSON input", (context) => {
+  const directory = mkdtempSync(
+    join(tmpdir(), "scaleset-encryption-encoding-"),
+  );
+  context.after(() => rmSync(directory, { recursive: true, force: true }));
+  const document = join(directory, "encryption.json");
+  writeFileSync(document, "\ufeff{}");
+  assert.deepEqual(readImportedEncryption(document), {});
+
+  for (const source of [
+    injectBytes('{"key":"FIXTURE_BYTES"}', malformedUtf8[0]),
+    '{"key":1,"key":2}',
+  ]) {
+    writeFileSync(document, source);
+    assert.throws(() => readImportedEncryption(document), {
+      message: "Invalid imported encryption JSON document.",
+    });
+  }
+});
+
+test(
+  "deploy rejects an imported encryption FIFO without waiting for a writer",
+  {
+    skip: process.platform === "win32",
+  },
+  (context) => {
+    const directory = mkdtempSync(join(tmpdir(), "scaleset-encryption-fifo-"));
+    context.after(() => rmSync(directory, { recursive: true, force: true }));
+    const fifo = join(directory, "encryption.fifo");
+    execFileSync("mkfifo", [fifo]);
+    const result = spawnSync(
+      process.execPath,
+      [
+        fileURLToPath(new URL("../bin/deploy-controller.ts", import.meta.url)),
+        "--config",
+        config,
+        "--generation",
+        "1",
+        "--encryption",
+        fifo,
+      ],
+      { encoding: "utf8", env: { PATH: "" }, timeout: 10_000 },
+    );
+
+    assert.ifError(result.error);
+    assert.equal(result.status, 1);
+    assert.equal(result.stdout, "");
+    assert.equal(
+      result.stderr.trim(),
+      "Invalid imported encryption JSON document.",
+    );
+  },
+);

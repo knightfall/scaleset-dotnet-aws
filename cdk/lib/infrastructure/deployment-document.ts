@@ -1,4 +1,4 @@
-import { readSync } from "node:fs";
+import { closeSync, constants, fstatSync, openSync, readSync } from "node:fs";
 
 const maximumDocumentBytes = 64 * 1024;
 
@@ -12,4 +12,18 @@ export function readDeploymentDocument(fd: number): Buffer | undefined {
     length += count;
   }
   return undefined;
+}
+
+export function readRegularDeploymentDocument(
+  path: string,
+): Buffer | undefined {
+  const fd = openSync(path, constants.O_RDONLY | constants.O_NONBLOCK);
+  try {
+    if (!fstatSync(fd).isFile()) {
+      throw new Error("Deployment input must be a regular file.");
+    }
+    return readDeploymentDocument(fd);
+  } finally {
+    closeSync(fd);
+  }
 }

@@ -1,4 +1,3 @@
-import { readFileSync } from "node:fs";
 import { Stack } from "aws-cdk-lib";
 import { PolicyStatement } from "aws-cdk-lib/aws-iam";
 import type { Construct } from "constructs";
@@ -8,6 +7,7 @@ import type {
   RunnerControllerRuntime,
 } from "../config/types.ts";
 import { parseYaml } from "../config/yaml.ts";
+import { readRegularDeploymentDocument } from "./deployment-document.ts";
 
 const bindings = [
   "bootstrapAssetKeyArn",
@@ -87,9 +87,11 @@ export function resolveImportedEncryption(
 export function readImportedEncryption(path: string | undefined): unknown {
   if (path === undefined) return undefined;
   try {
-    const text = new TextDecoder("utf-8", { fatal: true }).decode(
-      readFileSync(path),
-    );
+    const bytes = readRegularDeploymentDocument(path);
+    if (bytes === undefined) {
+      throw new Error("Imported encryption input exceeds 64 KiB.");
+    }
+    const text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
     parseYaml(text); // Reject duplicate JSON members.
     return JSON.parse(text) as unknown;
   } catch {
