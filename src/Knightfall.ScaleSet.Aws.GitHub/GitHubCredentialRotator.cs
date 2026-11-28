@@ -1,4 +1,5 @@
 using Knightfall.ScaleSet.Aws.Core.Configuration;
+using Knightfall.ScaleSet.Aws.Core.Telemetry;
 using Microsoft.Extensions.Logging;
 using ScaleSet.Client;
 
@@ -110,8 +111,34 @@ public sealed partial class GitHubCredentialRotator
     {
         if (_logger is not null)
         {
-            LogCandidateRejected(_logger, failure.Error, failure.StatusCode, failure.RateLimit?.Kind,
-                failure.RateLimit?.RetryAfter, failure.RateLimit?.Reset, failure.RateLimit?.Retries);
+            try
+            {
+                var profile = TelemetryProfileScope.Current;
+                string reason = failure switch
+                {
+                    { RateLimit: not null } => "rate_limit",
+                    { Error: GitHubOperationError.CredentialUnavailable } => "credential_unavailable",
+                    { Error: GitHubOperationError.BindingMismatch } => "binding_mismatch",
+                    { Error: GitHubOperationError.DeadlineElapsed } => "timeout",
+                    { Error: GitHubOperationError.AuthorizationConsumed } => "authorization_consumed",
+                    { StatusCode: 401 or 403 } => "unauthorized",
+                    _ => "request_failed",
+                };
+                using var scope = _logger.BeginScope(new KeyValuePair<string, object?>[]
+                {
+                    new("operation", "credential-rotate"),
+                    new("outcome", "rejected"),
+                    new("reason", reason),
+                    new("profile", profile?.Id),
+                    new("provider", profile?.Provider),
+                });
+                LogCandidateRejected(_logger, failure.Error, failure.StatusCode, failure.RateLimit?.Kind,
+                    failure.RateLimit?.RetryAfter, failure.RateLimit?.Reset, failure.RateLimit?.Retries);
+            }
+            catch (Exception error) when (error is not OutOfMemoryException)
+            {
+                // A logging provider cannot change the rejection or the connection owned by the caller.
+            }
         }
         return new GitHubCredentialRotationResult(GitHubCredentialRotationStatus.CandidateRejected, Failure: failure);
     }

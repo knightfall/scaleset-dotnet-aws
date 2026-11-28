@@ -1,5 +1,6 @@
 using System.Globalization;
 using Knightfall.ScaleSet.Aws.Controller.Lifecycle;
+using Knightfall.ScaleSet.Aws.GitHub;
 using Serilog;
 using Serilog.Configuration;
 using Serilog.Core;
@@ -71,7 +72,11 @@ internal sealed class SafeTelemetryLogSink(TelemetryPrivacy privacy, TelemetryEx
         var properties = new List<LogEventProperty>(6) { Property("SourceContext", SafeCategory(category)) };
         string? operation = TelemetryPrivacy.Scalar(log, "operation");
         string? outcome = TelemetryPrivacy.Scalar(log, "outcome");
-        bool known = log.MessageTemplate.Text == TelemetryNames.EventTemplate && operation is not null && outcome is not null &&
+        // The rotator's direct ILogger consumers retain the existing template. The controller projects it
+        // onto the same bounded schema as every other exported operation event.
+        bool credentialRejection = category == typeof(GitHubCredentialRotator).FullName && operation == "credential-rotate" &&
+            outcome == "rejected" && log.MessageTemplate.Text == TelemetryNames.CredentialRejectionTemplate;
+        bool known = (log.MessageTemplate.Text == TelemetryNames.EventTemplate || credentialRejection) && operation is not null && outcome is not null &&
             TelemetryNames.Operations.Contains(operation) && TelemetryNames.Outcomes.Contains(outcome);
         if (known)
         {
