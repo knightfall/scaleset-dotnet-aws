@@ -21,7 +21,7 @@ export function generationValue(value: string): bigint {
   return generation;
 }
 
-export function deploymentArguments(argv: string[], allowResume = false) {
+export function deploymentArguments(argv: string[], allowRecovery = false) {
   const { values } = parseArgs({
     args: argv,
     options: {
@@ -29,7 +29,12 @@ export function deploymentArguments(argv: string[], allowResume = false) {
       generation: { type: "string" },
       telemetry: { type: "string" },
       encryption: { type: "string" },
-      ...(allowResume ? { resume: { type: "string" } as const } : {}),
+      ...(allowRecovery
+        ? ({
+            resume: { type: "string" },
+            "inspect-review": { type: "string" },
+          } as const)
+        : {}),
     },
   });
   if (!values.config || !values.generation) {
@@ -38,12 +43,21 @@ export function deploymentArguments(argv: string[], allowResume = false) {
     );
   }
   generationValue(values.generation);
+  const resume = typeof values.resume === "string" ? values.resume : undefined;
+  const inspectReview =
+    typeof values["inspect-review"] === "string"
+      ? values["inspect-review"]
+      : undefined;
+  if (resume !== undefined && inspectReview !== undefined) {
+    throw new Error("Choose either --resume or --inspect-review.");
+  }
   return {
     config: values.config,
     generation: values.generation,
     telemetry: values.telemetry,
     encryption: values.encryption,
-    resume: typeof values.resume === "string" ? values.resume : undefined,
+    resume,
+    inspectReview,
   };
 }
 

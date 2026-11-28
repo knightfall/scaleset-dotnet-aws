@@ -8,7 +8,7 @@ import { fargatePreflightEnvironmentName } from "../lib/infrastructure/fargate-p
 import { readImportedEncryption } from "../lib/infrastructure/imported-encryption.ts";
 
 try {
-  const { config, generation, telemetry, encryption, resume } =
+  const { config, generation, telemetry, encryption, resume, inspectReview } =
     deploymentArguments(process.argv.slice(2), true);
   const compiled = compileConfig(readFileSync(config));
   const env = Object.fromEntries(
@@ -21,11 +21,12 @@ try {
   );
   env.AWS_IGNORE_CONFIGURED_ENDPOINT_URLS = "true";
   env.AWS_CLI_AUTO_PROMPT = "off";
-  deployController(
+  const reviewStack = deployController(
     {
       compiled,
       generation,
       resume,
+      inspectReview,
       fargatePreflight: process.env[fargatePreflightEnvironmentName],
       telemetry: readControllerTelemetry(telemetry, compiled.runtime.spec.aws),
       encryption: readImportedEncryption(encryption),
@@ -44,6 +45,7 @@ try {
       };
     },
   );
+  if (reviewStack !== undefined) process.stdout.write(`${reviewStack}\n`);
 } catch (error) {
   process.stderr.write(
     `${error instanceof Error ? error.message : String(error)}\n`,
