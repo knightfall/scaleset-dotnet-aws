@@ -199,7 +199,8 @@ internal sealed class FargateInspectionFixture : IDisposable
         "requiresCompatibilities":["FARGATE"],"runtimePlatform":{"cpuArchitecture":"X86_64","operatingSystemFamily":"LINUX"},
         "cpu":"1024","memory":"2048","taskRoleArn":"arn:aws:iam::{{Account}}:role/{{TaskRoleName}}",
         "executionRoleArn":"arn:aws:iam::{{Account}}:role/{{ExecutionRoleName}}","containerDefinitions":[{
-        "name":"runner","essential":true,"privileged":false,"readonlyRootFilesystem":true,"image":"{{Approval.Image}}","user":"1000",
+        "name":"runner","essential":true,"privileged":false,"readonlyRootFilesystem":true,"image":"{{Approval.Image}}","user":"1000:1000",
+        "linuxParameters":{"capabilities":{"drop":["ALL"]} },
         "entryPoint":["/app/runner-bootstrap"],"command":["run"]}]}
         """)!.AsObject();
 

@@ -29,7 +29,7 @@ internal static class FargateBootstrapCommand
         });
         try
         {
-            if (LinuxFiles.IsRoot() || !LinuxFiles.IsTrustedFile(settingsPath, ownerOnly: false))
+            if (!LinuxFiles.HasFargateRunnerIdentity() || !LinuxFiles.IsTrustedFile(settingsPath, ownerOnly: false))
             {
                 throw new IOException("The Fargate bootstrap settings file or user is invalid.");
             }

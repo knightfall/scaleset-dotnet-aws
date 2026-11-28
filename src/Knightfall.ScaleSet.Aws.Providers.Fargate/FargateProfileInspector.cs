@@ -250,15 +250,19 @@ public sealed partial class FargateProfileInspector
         }
         if (container.Environment is { Count: > 0 } || container.EnvironmentFiles is { Count: > 0 } ||
             container.Secrets is { Count: > 0 } || container.LinuxParameters?.Capabilities?.Add is { Count: > 0 } ||
-            container.LinuxParameters?.Devices is { Count: > 0 } || container.DockerSecurityOptions is { Count: > 0 })
+            container.LinuxParameters?.Capabilities?.Drop?.Contains("ALL", StringComparer.Ordinal) != true ||
+            container.LinuxParameters.Devices is { Count: > 0 } || container.DockerSecurityOptions is { Count: > 0 })
         {
             return false;
         }
-        if (container.User is { } user && user.Split(':', 2)[0] is "0" or "root")
+        if (container.User?.Split(':') is not [var uid, var gid] || !ValidId(uid) || !ValidId(gid))
         {
             return false;
         }
         return ValidScratchMounts(definition, container, approval) && ValidLogging(container.LogConfiguration);
+
+        static bool ValidId(string value) => int.TryParse(value, NumberStyles.None, CultureInfo.InvariantCulture, out int id) && id >= 1000 &&
+            value == id.ToString(CultureInfo.InvariantCulture);
     }
 
     private static bool ValidScratchMounts(TaskDefinition definition, ContainerDefinition container, FargateContainerApproval approval)

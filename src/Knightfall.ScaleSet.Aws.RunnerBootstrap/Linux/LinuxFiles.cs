@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.Runtime.InteropServices;
 using System.Runtime.Versioning;
 
@@ -12,6 +13,35 @@ internal static partial class LinuxFiles
     private const ushort GroupOtherWrite = 0x0012;
 
     internal static bool IsRoot() => GetEffectiveUserId() == 0;
+
+    internal static bool HasFargateRunnerIdentity() =>
+        HasFargateRunnerIdentity(File.ReadAllLines("/proc/thread-self/status"));
+
+    internal static bool HasFargateRunnerIdentity(string[] status)
+    {
+        // Uid and Gid include the real, effective, saved and filesystem IDs.
+        return ValidIds("Uid:", primary: true) && ValidIds("Gid:", primary: true) && ValidIds("Groups:", primary: false) &&
+            EmptyCapabilities("CapInh:") && EmptyCapabilities("CapPrm:") && EmptyCapabilities("CapEff:") &&
+            EmptyCapabilities("CapBnd:") && EmptyCapabilities("CapAmb:");
+
+        string? FieldValue(string field) =>
+            Array.Find(status, entry => entry.StartsWith(field, StringComparison.Ordinal))?[field.Length..].Trim();
+
+        bool ValidIds(string field, bool primary)
+        {
+            string? value = FieldValue(field);
+            if (value is null) return false;
+            string[] ids = value.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries);
+            return (!primary || ids.Length == 4) && ids.All(text =>
+                int.TryParse(text, NumberStyles.None, CultureInfo.InvariantCulture, out int id) && id >= 1000);
+        }
+
+        bool EmptyCapabilities(string field)
+        {
+            string? value = FieldValue(field);
+            return value is { Length: > 0 } && !value.AsSpan().ContainsAnyExcept('0');
+        }
+    }
 
     internal static ulong? GetMountId(string path)
     {
