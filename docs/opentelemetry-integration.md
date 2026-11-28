@@ -22,7 +22,7 @@ V1 exports controller signals and instruments the reusable bootstrap library. Bo
 
 Use the central versions and locks already selected in `Directory.Packages.props`: OpenTelemetry hosting/exporter/HTTP/runtime `1.21.0`, Serilog hosting `11.0.0`, OTLP sink `4.2.0`, console sink `6.1.1`. Verify implementation APIs against these packages; a documentation example is not permission to upgrade dependencies or import `Knightfall.ScaleSet.Hosting`.
 
-The released `Knightfall.ScaleSet.*` `0.1.0-alpha.1` contracts are:
+The [released SDK baseline](dependency-baseline.md) provides these telemetry contracts.
 
 | Subscription | Released behavior | AWS integration |
 | --- | --- | --- |
@@ -32,7 +32,7 @@ The released `Knightfall.ScaleSet.*` `0.1.0-alpha.1` contracts are:
 | Listener metrics | No `ScaleSet.Listener` meter in this release | Emit AWS-owned listener measurements from application adapters; do not invent an upstream meter or require an SDK change. |
 | `Knightfall.ScaleSet.Aws.*` | New application instrumentation | Maintain a tested, explicit source/meter inventory named by owning assembly; keep instrumentation lifetimes independent of individual profiles. |
 
-Verify these contracts against the release [Client diagnostics](https://github.com/knightfall/scaleset.NET/blob/a0bc2060715767bff0f1a22a9f328689ed363493/src/ScaleSet.Client/Transport/ScaleSetClientDiagnostics.cs), [Listener pump](https://github.com/knightfall/scaleset.NET/blob/a0bc2060715767bff0f1a22a9f328689ed363493/src/ScaleSet.Listener/ScaleSetListenerPump.cs), and [Listener operations](https://github.com/knightfall/scaleset.NET/blob/a0bc2060715767bff0f1a22a9f328689ed363493/src/ScaleSet.Listener/ListenerOperations.cs). Pin captured-payload assertions to the consumed package version.
+Verify these contracts against the release [Client diagnostics](https://github.com/knightfall/scaleset.NET/blob/v0.1.0-alpha.2/src/ScaleSet.Client/Transport/ScaleSetClientDiagnostics.cs), [Listener pump](https://github.com/knightfall/scaleset.NET/blob/v0.1.0-alpha.2/src/ScaleSet.Listener/ScaleSetListenerPump.cs), and [Listener operations](https://github.com/knightfall/scaleset.NET/blob/v0.1.0-alpha.2/src/ScaleSet.Listener/ListenerOperations.cs). Pin captured-payload assertions to the consumed package version.
 
 ## Resources, profiles, and correlation
 

@@ -281,11 +281,7 @@ public sealed class GitHubClientContracts
         Assert.Equal("Bearer " + GitHubWire.QueueToken, poll.Authorization);
     }
 
-    /// <summary>Enables the strict negative contract once the installed SDK provides endpoint validation.</summary>
-    public static bool SdkHasDiscoveredEndpointPolicy =>
-        typeof(ScaleSetClientOptions).GetProperty("IsTrustedDiscoveredEndpoint") is not null;
-
-    [Fact(Skip = "Requires the SDK with discovered endpoint validation.", SkipUnless = nameof(SdkHasDiscoveredEndpointPolicy))]
+    [Fact]
     public async Task SessionRejectsQueueForAnotherTenantBeforeSendingItsToken()
     {
         GitHubTarget target = GitHubTarget.Parse("https://tenant.ghe.com/owner/repository");

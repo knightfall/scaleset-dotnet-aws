@@ -1,7 +1,7 @@
 # Released scaleset.NET dependency baseline
 
 The AWS controller consumes the released upstream SDK baseline below. The
-package identity was verified on 24 November 2026. See the
+package identity was verified on 28 November 2026. See the
 [target qualification record](emulator-boundaries.md) for deployment evidence.
 
 ## Release identity
@@ -10,24 +10,24 @@ package identity was verified on 24 November 2026. See the
 | --- | --- |
 | Target framework | `.NET 10` (`net10.0`) |
 | NuGet packages | `Knightfall.ScaleSet.Client` and `Knightfall.ScaleSet.Listener` |
-| Package version | Exact `0.1.0-alpha.1` for both packages |
-| Release tag | [`v0.1.0-alpha.1`](https://github.com/knightfall/scaleset.NET/releases/tag/v0.1.0-alpha.1) |
-| Release source commit | [`a0bc2060715767bff0f1a22a9f328689ed363493`](https://github.com/knightfall/scaleset.NET/commit/a0bc2060715767bff0f1a22a9f328689ed363493) |
-| Release manifest | [`release.json`](https://github.com/knightfall/scaleset.NET/releases/download/v0.1.0-alpha.1/release.json) |
-| Manifest SHA-256 | `ccf97b15a0c4f85490b28e12a4e770303f5e74a3e4c63f101ea0f8397eb981eb` |
+| Package version | Exact `0.1.0-alpha.2` for both packages |
+| Release tag | [`v0.1.0-alpha.2`](https://github.com/knightfall/scaleset.NET/releases/tag/v0.1.0-alpha.2) |
+| Release source commit | [`8618c23ac706ca781c561307fd2910fc63b8c95f`](https://github.com/knightfall/scaleset.NET/commit/8618c23ac706ca781c561307fd2910fc63b8c95f) |
+| Release manifest | [`release.json`](https://github.com/knightfall/scaleset.NET/releases/download/v0.1.0-alpha.2/release.json) |
+| Manifest SHA-256 | `8a8de79d4b3341cb0fe75a73c35d4473c5d3f3627ec73238b569000cdac821d8` |
 
 The manifest records these SHA-256 digests for the original GitHub release
 archives:
 
 | Archive | SHA-256 |
 | --- | --- |
-| `Knightfall.ScaleSet.Client.0.1.0-alpha.1.nupkg` | `943d1acf4a2076d7b884e406ac3d576f9982027e1d34f3624692c1e1388b83c0` |
-| `Knightfall.ScaleSet.Listener.0.1.0-alpha.1.nupkg` | `01b8d686419a951c7b9b58918f8eaf56e39ee63e57502e594093dd76f8203066` |
+| `Knightfall.ScaleSet.Client.0.1.0-alpha.2.nupkg` | `0c915279c056c5872af9187fae9adfd1048f33a8af5cbc44973dac05367dc1bc` |
+| `Knightfall.ScaleSet.Listener.0.1.0-alpha.2.nupkg` | `ca8b4f14c3d366f1b2a1de71102b6ea15fd644323ce993b11b089bf6aedb96e5` |
 
 The controller consumes the published packages from NuGet.org with exact central versions,
 committed NuGet lock files, and locked CI restore. T02 verifies consumption in
 an isolated package cache and records the resolved package identities. Follow the upstream
-[artifact verification procedure](https://github.com/knightfall/scaleset.NET/blob/v0.1.0-alpha.1/docs/releases/PUBLISHING.md#verify-release-artifacts)
+[artifact verification procedure](https://github.com/knightfall/scaleset.NET/blob/v0.1.0-alpha.2/docs/releases/PUBLISHING.md#verify-release-artifacts)
 for provenance, SBOM, and registry signatures. NuGet.org adds a repository
 signature, so its archive bytes need not match the original release archive
 hashes above. A package upgrade requires an explicit baseline change and rerun
@@ -40,11 +40,11 @@ package cache. Update the pins and locks in that checkout, verify the resolved
 packages, and record the SDK commit, versions, and checks run. Keep the
 committed baseline and release evidence tied to the published packages.
 
-Use the release's [central dependency versions](https://github.com/knightfall/scaleset.NET/blob/v0.1.0-alpha.1/Directory.Packages.props)
-when selecting compatible direct dependencies. In particular, do not
-force all `Microsoft.Extensions.*` packages to `10.0.12`: the released SDK uses
-`Microsoft.Extensions.Logging.Abstractions` `11.0.0`. Keep the AWS controller
-independent of `Knightfall.ScaleSet.Hosting` and `Knightfall.ScaleSet.Providers.Docker`.
+The SDK packages declare `Microsoft.Extensions.Logging.Abstractions` `10.0.15`
+as their minimum. The standalone Listener consumer resolves that version. The
+AWS controller retains its direct `11.0.0` pin. The controller consumes Client
+and Listener independently of `Knightfall.ScaleSet.Hosting` and
+`Knightfall.ScaleSet.Providers.Docker`. [SDK central dependency versions](https://github.com/knightfall/scaleset.NET/blob/v0.1.0-alpha.2/Directory.Packages.props)
 
 ## Listener integration contract
 
@@ -64,8 +64,12 @@ real delivery uses four logical checkpoint writes. `Received` resumes handling;
 `Processed` resumes acknowledgement; uncertain `Acknowledging` returns
 `RecoveryRequired`. DynamoDB storage and the business-effect ledger still own
 distributed fencing and deduplication. See the
-[released Listener contract](https://github.com/knightfall/scaleset.NET/blob/v0.1.0-alpha.1/docs/product/LISTENER-EXTENSIBILITY.md)
-and [package consumer example](https://github.com/knightfall/scaleset.NET/tree/v0.1.0-alpha.1/examples/checkpointed-listener).
+[released Listener contract](https://github.com/knightfall/scaleset.NET/blob/v0.1.0-alpha.2/docs/product/LISTENER-EXTENSIBILITY.md)
+and [package consumer example](https://github.com/knightfall/scaleset.NET/tree/v0.1.0-alpha.2/examples/checkpointed-listener).
+
+The lifecycle suite loads a [checkpoint captured with alpha.1](../tests/Knightfall.ScaleSet.Aws.Lifecycle.Tests/Fixtures/alpha1-listener-checkpoint.json).
+The checkpoint store validates the existing acknowledgement hash. The pump
+requires recovery without repeating the DELETE or advancing the cursor.
 
 ## Session recovery and qualification boundary
 
@@ -97,7 +101,7 @@ remain outside this baseline and must be rejected during configuration validatio
 ### Published package identity
 
 An isolated restore from NuGet.org resolved Client and Listener
-`0.1.0-alpha.1`. Both registry archives passed `dotnet nuget verify --all`
+`0.1.0-alpha.2`. Both registry archives passed `dotnet nuget verify --all`
 with the NuGet.org repository signature. Each archive had the same 10 release
 entries as its GitHub counterpart and one additional signature entry. The
 SHA-512 digests of the original archives matched the NuGet content hashes in
@@ -117,6 +121,9 @@ package interfaces.
   shapes. Enterprise credentials must use the PAT path. The service determines
   the token's granted scopes. The controller rejects custom GHES hosts and
   `caBundlePath` during configuration validation.
+- The SDK validates discovered Actions service and queue origins. For a GHE.com
+  target, the contract tests verify routing to the configured tenant and reject
+  another tenant's queue before sending its token.
 - The create and update requests serialize default label types as `System`.
   Lookup responses can explicitly return a missing scale set or runner.
 - Use the sanitized exception diagnostics when recording GitHub errors.

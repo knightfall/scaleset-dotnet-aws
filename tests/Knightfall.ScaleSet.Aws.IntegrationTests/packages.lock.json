@@ -361,8 +361,8 @@
           "Knightfall.ScaleSet.Aws.Core": "[1.0.0, )",
           "Knightfall.ScaleSet.Aws.DynamoDb": "[1.0.0, )",
           "Knightfall.ScaleSet.Aws.Handoff": "[1.0.0, )",
-          "Knightfall.ScaleSet.Client": "[0.1.0-alpha.1, 0.1.0-alpha.1]",
-          "Knightfall.ScaleSet.Listener": "[0.1.0-alpha.1, 0.1.0-alpha.1]",
+          "Knightfall.ScaleSet.Client": "[0.1.0-alpha.2, 0.1.0-alpha.2]",
+          "Knightfall.ScaleSet.Listener": "[0.1.0-alpha.2, 0.1.0-alpha.2]",
           "Microsoft.Extensions.Logging.Abstractions": "[11.0.0, 11.0.0]"
         }
       },
@@ -503,21 +503,17 @@
       },
       "Knightfall.ScaleSet.Client": {
         "type": "CentralTransitive",
-        "requested": "[0.1.0-alpha.1, 0.1.0-alpha.1]",
-        "resolved": "0.1.0-alpha.1",
-        "contentHash": "Uxbespe0X2hwS8A3QRCYQcjOMx8rSUI7DIdnaJEp0h1POFG90bmp1i+uhzEouW2qCWn7P3PypHXDnNr+j5OKvA==",
-        "dependencies": {
-          "Microsoft.Extensions.Logging.Abstractions": "11.0.0"
-        }
+        "requested": "[0.1.0-alpha.2, 0.1.0-alpha.2]",
+        "resolved": "0.1.0-alpha.2",
+        "contentHash": "T84fbEG2crAD1UAdme4usDXgmSqRVRfSeaN5/sVRmgZuwl1BzN1cupwfHLYfp6ZbSxNjWYo53DGwvWLZ+qb/Yg=="
       },
       "Knightfall.ScaleSet.Listener": {
         "type": "CentralTransitive",
-        "requested": "[0.1.0-alpha.1, 0.1.0-alpha.1]",
-        "resolved": "0.1.0-alpha.1",
-        "contentHash": "fBRrk2Oo4O5kqn4Oh8nSL2iMNbq49sSroVeXXdcSByte3mb+etCBmsCSun8mucjBRa6prrZljONbsNAEe4/I/g==",
+        "requested": "[0.1.0-alpha.2, 0.1.0-alpha.2]",
+        "resolved": "0.1.0-alpha.2",
+        "contentHash": "BtAHOaebb9x/So0NJZn9DJkd07aDFeuHCJgy3np5EaGAj1EcRiOz8YEL1ll1H+yu66hi//nP0JhLwl1NQjsm0A==",
         "dependencies": {
-          "Knightfall.ScaleSet.Client": "0.1.0-alpha.1",
-          "Microsoft.Extensions.Logging.Abstractions": "11.0.0"
+          "Knightfall.ScaleSet.Client": "0.1.0-alpha.2"
         }
       },
       "Microsoft.Extensions.Hosting": {

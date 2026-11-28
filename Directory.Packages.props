@@ -10,8 +10,8 @@
     <PackageVersion Include="JsonSchema.Net" Version="[9.7.0]" />
   </ItemGroup>
   <ItemGroup>
-    <PackageVersion Include="Knightfall.ScaleSet.Client" Version="[0.1.0-alpha.1]" />
-    <PackageVersion Include="Knightfall.ScaleSet.Listener" Version="[0.1.0-alpha.1]" />
+    <PackageVersion Include="Knightfall.ScaleSet.Client" Version="[0.1.0-alpha.2]" />
+    <PackageVersion Include="Knightfall.ScaleSet.Listener" Version="[0.1.0-alpha.2]" />
   </ItemGroup>
   <ItemGroup>
     <PackageVersion Include="AWSSDK.Core" Version="[4.1.1.2]" />

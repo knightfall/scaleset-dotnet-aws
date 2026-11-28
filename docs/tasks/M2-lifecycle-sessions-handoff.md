@@ -99,7 +99,7 @@ Deliver durable admission accounting, replay-safe delivery/acknowledgement handl
 
 - Journal `SESSION` open/close intents before calling `CreateMessageSessionAsync`, `CloseAsync`, or `DeleteMessageSessionAsync`. Scope checkpoints and deliveries to the exact `(GitHub host/target scope, scaleSetId, sessionId)` key.
 - Integrate `ScaleSetListenerPump.StepAsync` through a narrow T09 adapter.
-  Consume the published Client and Listener `0.1.0-alpha.1` packages under the
+  Consume the published Client and Listener packages under the
   [released dependency baseline](../dependency-baseline.md). Implement
   `IScaleSetListenerCheckpointStore`, `IScaleSetListenerDeliveryHandler`, and
   `IScaleSetListenerExecutionPolicy` in the GitHub adapter; translate persistence
