@@ -22,6 +22,7 @@ public enum Ec2PreflightStatus
     InstanceTypeIncompatible = 13,
     StatusQualificationMismatch = 14,
     EbsKeyUnqualified = 15,
+    VolumeEncryptionUnverified = 16,
 }
 
 public sealed record Ec2PreflightSubnet(string SubnetId, string AvailabilityZone, int? AvailableIpAddresses);

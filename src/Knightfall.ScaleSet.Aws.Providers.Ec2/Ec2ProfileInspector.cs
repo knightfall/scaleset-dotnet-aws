@@ -117,7 +117,7 @@ public sealed partial class Ec2ProfileInspector : IDisposable
                 return Failed(Ec2PreflightStatus.TemplateIdentityMismatch);
             }
             observedVersion = version.VersionNumber;
-            if (data.MetadataOptions is not { HttpEndpoint.Value: "enabled", HttpTokens.Value: "required" })
+            if (data.MetadataOptions is not { HttpEndpoint.Value: "enabled", HttpTokens.Value: "required", HttpPutResponseHopLimit: 1 })
             {
                 return Failed(Ec2PreflightStatus.ImdsV2Required, observedVersion);
             }
@@ -146,6 +146,10 @@ public sealed partial class Ec2ProfileInspector : IDisposable
             if (!HasEncryptedRoot(data, image.RootDeviceName))
             {
                 return Failed(Ec2PreflightStatus.RootEncryptionUnverified, observedVersion);
+            }
+            if (!HasEncryptedVolumes(data, image))
+            {
+                return Failed(Ec2PreflightStatus.VolumeEncryptionUnverified, observedVersion);
             }
             // An explicit KMS key other than the regional AWS-managed alias requires a separately qualified launch path.
             string awsManagedKey = $"arn:{target.Partition}:kms:{target.Aws.Region}:{target.Aws.Account}:alias/aws/ebs";
@@ -371,8 +375,63 @@ public sealed partial class Ec2ProfileInspector : IDisposable
 
     private static bool HasEncryptedRoot(ResponseLaunchTemplateData data, string rootDevice)
     {
-        var mappings = data.BlockDeviceMappings?.Where(mapping => mapping.DeviceName == rootDevice).Take(2).ToArray();
+        var mappings = data.BlockDeviceMappings?.Where(mapping => mapping?.DeviceName == rootDevice).Take(2).ToArray();
         return mappings is [{ NoDevice: null, Ebs.Encrypted: true }];
+    }
+
+    private static bool HasEncryptedVolumes(ResponseLaunchTemplateData data, Image image)
+    {
+        var templateDevices = new Dictionary<string, bool>(StringComparer.Ordinal);
+        foreach (var mapping in data.BlockDeviceMappings ?? [])
+        {
+            if (string.IsNullOrWhiteSpace(mapping?.DeviceName))
+            {
+                return false;
+            }
+            bool coversImageEbs;
+            switch (mapping.NoDevice, mapping.VirtualName, mapping.Ebs)
+            {
+                case (null, null, { Encrypted: true }):
+                case ("", null, null): // EC2 represents a suppressed device with an empty NoDevice.
+                    coversImageEbs = true;
+                    break;
+                case (null, { Length: > 0 }, null):
+                    coversImageEbs = false;
+                    break;
+                default:
+                    return false;
+            }
+            if (!templateDevices.TryAdd(mapping.DeviceName, coversImageEbs))
+            {
+                return false;
+            }
+        }
+
+        var imageDevices = new HashSet<string>(StringComparer.Ordinal);
+        bool sawRootEbs = false;
+        foreach (var mapping in image.BlockDeviceMappings ?? [])
+        {
+            if (string.IsNullOrWhiteSpace(mapping?.DeviceName) || !imageDevices.Add(mapping.DeviceName))
+            {
+                return false;
+            }
+            switch (mapping.NoDevice, mapping.VirtualName, mapping.Ebs)
+            {
+                case (null, null, { } ebs):
+                    if (ebs.Encrypted != true && !templateDevices.GetValueOrDefault(mapping.DeviceName))
+                    {
+                        return false;
+                    }
+                    sawRootEbs |= mapping.DeviceName == image.RootDeviceName;
+                    break;
+                case (null, { Length: > 0 }, null):
+                case ("", null, null):
+                    break;
+                default:
+                    return false;
+            }
+        }
+        return sawRootEbs;
     }
 
     private static bool MatchesInstanceProfileReference(ResponseLaunchTemplateData data, string expectedArn) =>
