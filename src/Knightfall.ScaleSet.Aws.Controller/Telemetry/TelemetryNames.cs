@@ -9,6 +9,8 @@ internal static class TelemetryNames
     internal const string Listener = "ScaleSet.Listener";
     internal const string Http = "System.Net.Http";
     internal const string EventTemplate = "Telemetry operation {operation} finished with {outcome}";
+    internal const string CredentialRejectionTemplate =
+        "GitHub credential candidate rejected ({Error}, HTTP {StatusCode}, rate limit {RateLimitKind}, retry after {RetryAfter}, reset {Reset}, retries {Retries})";
 
     internal static readonly FrozenSet<string> Components = new[]
     {
@@ -36,7 +38,7 @@ internal static class TelemetryNames
         "checkpoint-initialized", "checkpoint-settled", "admission-reserve", "admission-settle", "session-open", "session-close",
         "session-quarantine", "supervise", "effect-plan", "effect-uncertain", "effect-settle", "fargate-replay",
         "offer.publish", "offer.revoke", "offer.consume", "publish", "revoke", "consume", "advance", "seal", "open",
-        "bootstrap-consume", "runner-listen",
+        "bootstrap-consume", "runner-listen", "credential-rotate",
     }.ToFrozenSet(StringComparer.Ordinal);
 
     internal static readonly FrozenSet<string> Outcomes = new[]
@@ -68,6 +70,7 @@ internal static class TelemetryNames
         "provider_identity_verified", "interrupted", "already_spent", "hello_unconfirmed", "hello_rejected",
         "no_offer_before_deadline", "receipt_expired", "receipt_unknown", "binding_mismatch", "authentication_failed",
         "offer_authenticated", "listener_connected", "runner_exit_without_readiness",
+        "credential_unavailable", "request_failed", "authorization_consumed",
     }.ToFrozenSet(StringComparer.Ordinal);
 
     internal static bool IsApplicationSpan(string name)
