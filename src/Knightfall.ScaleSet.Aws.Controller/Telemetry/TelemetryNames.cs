@@ -38,7 +38,7 @@ internal static class TelemetryNames
         "checkpoint-initialized", "checkpoint-settled", "admission-reserve", "admission-settle", "session-open", "session-close",
         "session-quarantine", "supervise", "effect-plan", "effect-uncertain", "effect-settle", "fargate-replay",
         "offer.publish", "offer.revoke", "offer.consume", "publish", "revoke", "consume", "advance", "seal", "open",
-        "bootstrap-consume", "runner-listen", "credential-rotate",
+        "bootstrap-consume", "runner-listen", "credential-rotate", "connect", "catalog-rollout", "run", "ec2-queue", "fargate-queue",
     }.ToFrozenSet(StringComparer.Ordinal);
 
     internal static readonly FrozenSet<string> Outcomes = new[]
@@ -46,7 +46,7 @@ internal static class TelemetryNames
         "success", "failed", "unknown", "deferred", "cancelled", "cancelled-shutdown", "conflict", "rejected", "held",
         "ineligible", "duplicate", "timeout", "settled", "committed", "read-only", "unavailable", "other", "error",
         "initialized", "empty", "acknowledged", "received", "returned", "read", "fenced", "completed", "no_capacity",
-        "reserved", "expired", "consumed", "not_available", "already_consumed",
+        "reserved", "expired", "consumed", "not_available", "already_consumed", "observed",
     }.ToFrozenSet(StringComparer.Ordinal);
 
     internal static readonly FrozenSet<string> Reasons = new[]
@@ -71,6 +71,8 @@ internal static class TelemetryNames
         "no_offer_before_deadline", "receipt_expired", "receipt_unknown", "binding_mismatch", "authentication_failed",
         "offer_authenticated", "listener_connected", "runner_exit_without_readiness",
         "credential_unavailable", "request_failed", "authorization_consumed",
+        "stale_generation", "binding_conflict", "retirement_required", "pending_conflict",
+        "shutdown_unconfirmed", "shutdown_deadline", "runtime_failure", "github_unavailable",
     }.ToFrozenSet(StringComparer.Ordinal);
 
     internal static bool IsApplicationSpan(string name)
@@ -83,7 +85,7 @@ internal static class TelemetryNames
         string suffix = name[prefix.Length..];
         int delimiter = suffix.IndexOf('.');
         return delimiter > 0 && suffix[..delimiter] is "plan" or "reconcile" or "ec2" or "fargate" or "listener" or
-            "github" or "dynamodb" or "handoff" or "startup" or "provider" or "telemetry" &&
+            "github" or "dynamodb" or "handoff" or "startup" or "provider" or "telemetry" or "controller" &&
             Operations.Contains(suffix[(delimiter + 1)..]);
     }
 

@@ -4,6 +4,7 @@ using Amazon.Runtime;
 using Knightfall.ScaleSet.Aws.Controller.Configuration;
 using Knightfall.ScaleSet.Aws.Controller.Health;
 using Knightfall.ScaleSet.Aws.Controller.Lifecycle;
+using Knightfall.ScaleSet.Aws.Controller.Telemetry;
 using Knightfall.ScaleSet.Aws.Core.Catalog;
 using Knightfall.ScaleSet.Aws.Core.Configuration;
 using Knightfall.ScaleSet.Aws.Core.Lifecycle;
@@ -30,6 +31,7 @@ internal static class ActiveControllerRuntime
     internal static async Task RunAsync(ControllerRunContext context, HttpClient? githubHttpClient = null)
     {
         var clock = TimeProvider.System;
+        var log = new ControllerRuntimeLog(context.Telemetry.Logging.CreateLogger(typeof(ActiveControllerRuntime).FullName!), clock);
         var configuration = context.Configuration;
         var configured = configuration.Profiles.Where(profile => profile.State != RunnerProfileState.Disabled).ToArray();
         var emptyHealth = configured.Select(profile => new ControllerProfileHealth(profile.Id, Ready: false)).ToImmutableArray();
@@ -39,7 +41,7 @@ internal static class ActiveControllerRuntime
             Environment.GetEnvironmentVariable("ECS_CONTAINER_METADATA_URI_V4"), allowLoopback: context.AwsLoopbackEndpoint is not null);
         // Verify the local task and clock before constructing any active service clients.
         var observation = await WaitForTaskAsync(metadata, clock, context.Stopping).ConfigureAwait(false);
-        using var clients = await ConnectAsync(configuration.Aws, context.AwsLoopbackEndpoint, clock, context.Stopping).ConfigureAwait(false);
+        using var clients = await ConnectAsync(configuration.Aws, context.AwsLoopbackEndpoint, clock, log, context.Stopping).ConfigureAwait(false);
         var store = new DynamoDbLifecycleStore(clients.DynamoDb(), configuration.TrackingTable.Name, clock);
         var ecs = clients.Ecs();
         IControllerTaskFenceObserver tasks = new EcsControllerTaskFenceObserver(ecs, metadata.ClusterArn);
@@ -73,12 +75,12 @@ internal static class ActiveControllerRuntime
                 var provider = clients.Ec2Effects(configuration, key, clock);
                 ec2Effects.Add(profile.Id, provider);
                 backends.Add(key, new Ec2RunnerBackend(configuration, profile, key, ec2Inspector!, provider,
-                    store, journal, dispatcher, clock, EffectTiming));
+                    store, journal, dispatcher, clock, EffectTiming, log));
             }
             else
             {
                 backends.Add(key, new FargateRunnerBackend(configuration, profile, key, fargateInspector!, fargateEvidence!,
-                    fargateQuota!, fargateKeys, fargateInventory, store, journal, dispatcher, clock, EffectTiming));
+                    fargateQuota!, fargateKeys, fargateInventory, store, journal, dispatcher, clock, EffectTiming, log));
             }
         }
 
@@ -92,7 +94,7 @@ internal static class ActiveControllerRuntime
             secrets, gitHub, registration, handoff);
         var shutdown = new ControllerShutdownCoordinator(store, dispatcher);
         using var metrics = new ProfileTelemetry(configuration, clock);
-        using var owner = await AcquireAsync(adapter, metadata, observation, recoveryWork, clock, context.Stopping).ConfigureAwait(false);
+        using var owner = await AcquireAsync(adapter, metadata, observation, recoveryWork, clock, log, context.Stopping).ConfigureAwait(false);
         var rotation = new GitHubCredentialRotator(secrets, gitHub, context.Telemetry.Logging.CreateLogger<GitHubCredentialRotator>());
         var cooldown = new GitHubCredentialCooldown(clock, CooldownDuration);
         var supervisor = new GitHubListenerSupervisor(store, clock,
@@ -112,9 +114,9 @@ internal static class ActiveControllerRuntime
                 context.Telemetry.Logging.CreateLogger<ControllerProfileReconciler>());
         }).ToArray();
         var queuePump = context.EventQueues is { Ec2: not null } or { Ecs: not null }
-            ? new ControllerQueuePump(configuration, clients.Queue(), store, ec2Effects, fargateInspector, clock) : null;
+            ? new ControllerQueuePump(configuration, clients.Queue(), store, ec2Effects, fargateInspector, clock, log) : null;
         await RunOwnedAsync(context, metadata, observation.TaskArn, owner, store, dispatcher, shutdown, profiles, queuePump,
-            metrics, clock).ConfigureAwait(false);
+            metrics, clock, log).ConfigureAwait(false);
     }
 
     private static async Task<ControllerTaskAuthority> WaitForTaskAsync(EcsControllerMetadata metadata, TimeProvider clock, CancellationToken token)
@@ -129,7 +131,8 @@ internal static class ActiveControllerRuntime
         }
     }
 
-    private static async Task<ControllerCloudClients> ConnectAsync(AwsEnvironment environment, Uri? endpoint, TimeProvider clock, CancellationToken token)
+    private static async Task<ControllerCloudClients> ConnectAsync(AwsEnvironment environment, Uri? endpoint, TimeProvider clock,
+        ControllerRuntimeLog log, CancellationToken token)
     {
         while (true)
         {
@@ -142,21 +145,25 @@ internal static class ActiveControllerRuntime
             catch (Exception error) when (IsServiceOutage(error))
             {
                 token.ThrowIfCancellationRequested();
+                log.Write(LogLevel.Warning, "connect", "unavailable", "aws_unavailable", throttle: true);
                 await Task.Delay(RetryInterval, clock, token).ConfigureAwait(false);
             }
         }
     }
 
     private static async Task<ControllerLeaseOwnership> AcquireAsync(ControllerAuthorityAdapter adapter, EcsControllerMetadata metadata,
-        ControllerTaskAuthority initial, ControllerEffectRecovery recovery, TimeProvider clock, CancellationToken token)
+        ControllerTaskAuthority initial, ControllerEffectRecovery recovery, TimeProvider clock, ControllerRuntimeLog log, CancellationToken token)
     {
         var observation = initial;
         while (true)
         {
             if (await adapter.TryActivateAsync(observation, recovery.AdvanceAsync, token).ConfigureAwait(false) is { } owner)
             {
+                log.Write(LogLevel.Information, "lease-acquire", "success", "ownership");
                 return owner;
             }
+            token.ThrowIfCancellationRequested();
+            log.Write(LogLevel.Information, "lease-acquire", "deferred", "ownership_unavailable", throttle: true);
             await Task.Delay(RetryInterval, clock, token).ConfigureAwait(false);
             observation = await WaitForTaskAsync(metadata, clock, token).ConfigureAwait(false);
         }
@@ -164,10 +171,12 @@ internal static class ActiveControllerRuntime
 
     private static async Task RunOwnedAsync(ControllerRunContext context, EcsControllerMetadata metadata, string taskArn,
         ControllerLeaseOwnership owner, DynamoDbLifecycleStore store, DynamoDbEffectDispatcher dispatcher,
-        ControllerShutdownCoordinator shutdown, ControllerProfileReconciler[] profiles, ControllerQueuePump? queuePump, ProfileTelemetry metrics, TimeProvider clock)
+        ControllerShutdownCoordinator shutdown, ControllerProfileReconciler[] profiles, ControllerQueuePump? queuePump, ProfileTelemetry metrics,
+        TimeProvider clock, ControllerRuntimeLog log)
     {
         if (owner.ReadAuthority() is not { } initial)
         {
+            log.Write(LogLevel.Warning, "lease-loss", "failed", "ownership_unavailable");
             throw new InvalidOperationException("The controller lost authority before starting its workers.");
         }
         using var heartbeatsStop = new CancellationTokenSource();
@@ -183,7 +192,7 @@ internal static class ActiveControllerRuntime
             health.Pulse();
             return proof;
         }, heartbeatsStop.Token);
-        var workers = RunProfilesAsync(context, owner, store, dispatcher, profiles, queuePump, metrics, health, clock, workStop.Token);
+        var workers = RunProfilesAsync(context, owner, store, dispatcher, profiles, queuePump, metrics, health, clock, log, workStop.Token);
         using var stopSignal = CancellationTokenSource.CreateLinkedTokenSource(context.Stopping, owner.OwnershipLost);
         var quitting = Task.Delay(Timeout.InfiniteTimeSpan, stopSignal.Token);
         bool supervisionFailed;
@@ -205,6 +214,14 @@ internal static class ActiveControllerRuntime
             supervisionFailed = true;
         }
 
+        if (supervisionFailed && owner.OwnershipLost.IsCancellationRequested)
+        {
+            log.Write(LogLevel.Warning, "lease-loss", "failed", "ownership_unavailable");
+        }
+        else if (supervisionFailed)
+        {
+            log.Write(LogLevel.Error, "supervise", "failed", "runtime_failure");
+        }
         context.RequestStop();
         health.Stop();
         using var localDeadline = new CancellationTokenSource(CleanupBudget, clock);
@@ -232,16 +249,20 @@ internal static class ActiveControllerRuntime
         }
         if (supervisionFailed || stopped != ControllerShutdownStatus.Released)
         {
+            if (stopped != ControllerShutdownStatus.Released)
+            {
+                log.Write(LogLevel.Warning, "supervise", "unknown", "shutdown_unconfirmed");
+            }
             throw new InvalidOperationException("Controller supervision ended or shutdown could not be confirmed.");
         }
     }
 
     private static async Task RunProfilesAsync(ControllerRunContext context, ControllerLeaseOwnership owner, DynamoDbLifecycleStore store,
         DynamoDbEffectDispatcher dispatcher, ControllerProfileReconciler[] profiles, ControllerQueuePump? queuePump, ProfileTelemetry metrics, ActiveHealth health, TimeProvider clock,
-        CancellationToken cancellationToken)
+        ControllerRuntimeLog log, CancellationToken cancellationToken)
     {
         var keys = profiles.Select(profile => profile.Key).ToArray();
-        if (!await PrepareConfigurationAsync(context, owner, store, dispatcher, keys, clock, cancellationToken).ConfigureAwait(false))
+        if (!await PrepareConfigurationAsync(context, owner, store, dispatcher, keys, clock, log, cancellationToken).ConfigureAwait(false))
         {
             return;
         }
@@ -259,14 +280,25 @@ internal static class ActiveControllerRuntime
                 {
                     using var timeout = new CancellationTokenSource(ProfilePassBudget, clock);
                     using var pass = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, timeout.Token);
+                    using var activity = ControllerRuntimeLog.StartAttempt("reconcile");
+                    profile.TelemetryIdentity?.SetTags(activity);
                     bool ready;
                     try
                     {
                         ready = await profile.ReconcileAsync(pass.Token).ConfigureAwait(false);
+                        activity?.SetTag("outcome", ready ? "success" : "deferred");
                     }
                     catch (Exception error) when (IsServiceOutage(error) || error is GitHubOperationException or GitHubSecretLoadException)
                     {
                         cancellationToken.ThrowIfCancellationRequested();
+                        string reason = error switch
+                        {
+                            GitHubOperationException or GitHubSecretLoadException => "github_unavailable",
+                            OperationCanceledException or TimeoutException => "timeout",
+                            _ => "unavailable",
+                        };
+                        activity?.SetTag("outcome", "unavailable").SetTag("reason", reason);
+                        log.Write(LogLevel.Warning, "reconcile", "unavailable", reason, profile.TelemetryIdentity, throttle: true);
                         ready = false;
                     }
                     health.Observe(profile.Key.ProfileId, ready);
@@ -283,7 +315,7 @@ internal static class ActiveControllerRuntime
 
     private static async Task<bool> PrepareConfigurationAsync(ControllerRunContext context, ControllerLeaseOwnership owner,
         DynamoDbLifecycleStore store, DynamoDbEffectDispatcher dispatcher, LifecycleProfile[] keys, TimeProvider clock,
-        CancellationToken cancellationToken)
+        ControllerRuntimeLog log, CancellationToken cancellationToken)
     {
         while (owner.ReadAuthority() is { } current && !cancellationToken.IsCancellationRequested)
         {
@@ -306,12 +338,21 @@ internal static class ActiveControllerRuntime
                     case CatalogRolloutStatus.BindingConflict:
                     case CatalogRolloutStatus.RetirementRequired:
                     case CatalogRolloutStatus.PendingConflict:
+                        string reason = applied.Status switch
+                        {
+                            CatalogRolloutStatus.StaleGeneration => "stale_generation",
+                            CatalogRolloutStatus.BindingConflict => "binding_conflict",
+                            CatalogRolloutStatus.RetirementRequired => "retirement_required",
+                            _ => "pending_conflict",
+                        };
+                        log.Write(LogLevel.Error, "catalog-rollout", "rejected", reason);
                         throw new InvalidOperationException("The deployment catalog rejected the requested configuration generation.");
                 }
             }
             catch (Exception error) when (IsServiceOutage(error))
             {
                 cancellationToken.ThrowIfCancellationRequested();
+                log.Write(LogLevel.Warning, "catalog-rollout", "unavailable", "aws_unavailable", throttle: true);
             }
             await Task.Delay(RetryInterval, clock, cancellationToken).ConfigureAwait(false);
         }

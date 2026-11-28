@@ -1,19 +1,23 @@
 using System.Collections.Immutable;
+using Knightfall.ScaleSet.Aws.Controller.Telemetry;
 using Knightfall.ScaleSet.Aws.Core.Catalog;
 using Knightfall.ScaleSet.Aws.Core.Configuration;
 using Knightfall.ScaleSet.Aws.Core.Lifecycle;
+using Knightfall.ScaleSet.Aws.Core.Telemetry;
 using Knightfall.ScaleSet.Aws.DynamoDb;
 using Knightfall.ScaleSet.Aws.Providers.Ec2;
+using Microsoft.Extensions.Logging;
 
 namespace Knightfall.ScaleSet.Aws.Controller.Runtime;
 
 internal sealed class Ec2RunnerBackend(
     RuntimeConfiguration configuration, RunnerProfile profile, LifecycleProfile key, Ec2ProfileInspector inspector,
     Ec2EffectProvider provider, DynamoDbLifecycleStore store, DynamoDbEffectJournal journal, DynamoDbEffectDispatcher dispatcher,
-    TimeProvider clock, EffectDispatcherTiming timing) : IRunnerBackend
+    TimeProvider clock, EffectDispatcherTiming timing, ControllerRuntimeLog? log = null) : IRunnerBackend
 {
     private readonly Ec2ProvisionerConfiguration _provisioner = profile.Provisioner as Ec2ProvisionerConfiguration
         ?? throw new ArgumentException("The EC2 backend requires an EC2 profile.", nameof(profile));
+    private readonly TelemetryProfile? _telemetryProfile = TelemetryProfile.From(profile);
 
     private ActiveEffectCursor? _pendingCursor;
     private bool _sawPending;
@@ -63,6 +67,10 @@ internal sealed class Ec2RunnerBackend(
         int? drift = preflight?.Template is { } resolved && nonterminal.All(static item => item.Binding is not null)
             ? nonterminal.Count(item => item.Binding?.Provider is Ec2ExecutorIdentity identity && identity.LaunchTemplateVersion != resolved.VersionNumber)
             : null;
+        if (drift is > 0)
+        {
+            log?.Write(LogLevel.Warning, "template-drift", "observed", "template_version_changed", _telemetryProfile, throttle: true);
+        }
         return new RunnerBackendInventory(inventory.ObservedAt, true, headroom, drift, resources);
     }
 
@@ -92,7 +100,7 @@ internal sealed class Ec2RunnerBackend(
         {
             if (await IsCurrentCatalogAsync(catalog, token).ConfigureAwait(false))
             {
-                _ = await DispatchPreparedAsync(authority, prepared.AllocationId, ownershipLost, token).ConfigureAwait(false);
+                await DispatchPreparedAsync(authority, prepared.AllocationId, ownershipLost, token).ConfigureAwait(false);
             }
             return;
         }
@@ -129,7 +137,11 @@ internal sealed class Ec2RunnerBackend(
             provider, ownershipLost, token).ConfigureAwait(false);
         if (result.Status == Ec2LaunchAdvanceStatus.Planned)
         {
-            _ = await DispatchPreparedAsync(authority, allocation, ownershipLost, token).ConfigureAwait(false);
+            await DispatchPreparedAsync(authority, allocation, ownershipLost, token).ConfigureAwait(false);
+        }
+        else
+        {
+            ReportLaunchDecision(result);
         }
     }
 
@@ -186,13 +198,34 @@ internal sealed class Ec2RunnerBackend(
             return;
         }
 
-        _ = await dispatcher.DispatchPlannedAsync(authority.Lease, authority.Clock, key, intentId, provider, ownershipLost, token).ConfigureAwait(false);
+        var dispatch = await dispatcher.DispatchPlannedAsync(authority.Lease, authority.Clock, key, intentId, provider, ownershipLost, token)
+            .ConfigureAwait(false);
+        if (dispatch == EffectDispatchStatus.AwaitingEvidence)
+        {
+            log?.Write(LogLevel.Warning, "terminate", "unknown", "recovery_required", _telemetryProfile, throttle: true);
+        }
     }
 
-    private Task<Ec2LaunchAdvanceResult> DispatchPreparedAsync(
-        ActiveControllerAuthority authority, Guid allocation, CancellationToken ownershipLost, CancellationToken cancellationToken) =>
-        dispatcher.AdvanceEc2LaunchAsync(authority.Lease, authority.Clock, key, allocation,
-            static (_, _, _) => Task.FromResult<Ec2LaunchEffectRequest?>(null), provider, ownershipLost, cancellationToken);
+    private async Task DispatchPreparedAsync(ActiveControllerAuthority authority, Guid allocation, CancellationToken ownershipLost,
+        CancellationToken cancellationToken)
+    {
+        var result = await dispatcher.AdvanceEc2LaunchAsync(authority.Lease, authority.Clock, key, allocation,
+            static (_, _, _) => Task.FromResult<Ec2LaunchEffectRequest?>(null), provider, ownershipLost, cancellationToken)
+            .ConfigureAwait(false);
+        ReportLaunchDecision(result);
+    }
+
+    private void ReportLaunchDecision(Ec2LaunchAdvanceResult result)
+    {
+        if (result.Status == Ec2LaunchAdvanceStatus.CanceledObsolete)
+        {
+            log?.Write(LogLevel.Information, "launch", "cancelled", "stale", _telemetryProfile, throttle: true);
+        }
+        else if (result is { Status: Ec2LaunchAdvanceStatus.AwaitingEvidence } or { DispatchStatus: EffectDispatchStatus.AwaitingEvidence })
+        {
+            log?.Write(LogLevel.Warning, "launch", "unknown", "recovery_required", _telemetryProfile, throttle: true);
+        }
+    }
 
     private async Task<Ec2LaunchEffectRequest?> SelectPlacementAsync(CatalogProfile catalog, Guid allocation,
         int expectedOrdinal, int ordinal, long sequence, IReadOnlySet<string> excluded, IReadOnlyDictionary<string, int> recent,
