@@ -250,12 +250,11 @@ Runner subnets need an approved outbound Internet route for HTTPS to the role's 
 Before applying an active generation, compare the sum of its broker reservations
 and existing reserved concurrency with the account's Lambda concurrency quota
 in that Region. Lambda keeps at least 100 units unreserved. A rejected reservation
-blocks the stack update. Reservations cap simultaneous invocations and AWS also
-enforces synchronous request-rate quotas. Use Lambda `ConcurrentExecutions`,
-`Throttles`, `Invocations`, and `Duration` to qualify the expected startup
-burst and check its downstream DynamoDB load. Local fixtures exercise throttling,
-lost responses, and conditional writes. Target throughput, cold starts, and
-account-specific quotas require live qualification. [Lambda reserved concurrency](https://docs.aws.amazon.com/lambda/latest/dg/configuration-concurrency.html) · [Lambda invocation limits](https://docs.aws.amazon.com/lambda/latest/dg/lambda-concurrency.html)
+blocks the stack update. A broker's reservation limits simultaneous invocations. Its Function URL also has a request ceiling of ten times that reservation per second (160 at the 16-slot cap). Either limit can return HTTP 429. Other functions cannot borrow a broker's reserved slots. Different brokers can still contend for throughput on the same DynamoDB table. [Lambda reserved concurrency](https://docs.aws.amazon.com/lambda/latest/dg/configuration-concurrency.html) · [Function URL throttling](https://docs.aws.amazon.com/lambda/latest/dg/urls-configuration.html#urls-throttling)
+
+For the affected role's broker, compare maximum `ConcurrentExecutions` against its reservation, `Throttles` (sum), `Invocations` (sum), and `Duration`. Use `UrlRequestCount`, `Url4xxCount`, `Url5xxCount`, and `UrlRequestLatency` for the URL. Lambda `Errors` counts function or runtime failures. Throttled invocations and handler-returned HTTP responses such as a HELLO conflict (409) or a table failure (503) have separate signals. Check table throttling and latency when the URL reports 5xx. These are aggregate metrics. Correlate them with boot times across profiles to distinguish shared saturation from a single runner's registration failure. [Lambda invocation metrics](https://docs.aws.amazon.com/lambda/latest/dg/monitoring-metrics-types.html) · [Function URL metrics](https://docs.aws.amazon.com/lambda/latest/dg/urls-monitoring.html)
+
+The offline fixtures exercise normal bursts, sustained role contention through both client retry limits, immutable replay and caller isolation. Role sharing remains supported. Use separate roles where admission failures in one group must be isolated from another group's startup load. Qualify actual quotas, throughput, and cold starts in the target account and Region. [Trust and availability boundaries](profile-bindings.md#secrets-and-role-separation)
 
 The broker takes the principal from AWS authentication, validates up to 1 KiB
 of HELLO input, and conditionally creates one item at
@@ -272,7 +271,7 @@ On throttling, transient HTTP failures, or a lost reply, bootstrap re-signs the
 request with the original HELLO body. Delay starts at 125–250 ms and grows to a jittered 2–4 s.
 The client allows up to seven sends in a single 25-second registration budget.
 Permanent rejections stop immediately. An exhausted budget leaves the registration
-unconfirmed and the runner stops before reading an OFFER. EC2 retains its spent
+unconfirmed and the runner stops before reading an OFFER. The sanitized runner outcome is `HelloRejected`. When bootstrap handoff instrumentation is collected, `reason=hello_unconfirmed` marks an ambiguous or exhausted registration and `reason=hello_rejected` marks a permanent rejection. Neither signal identifies a specific noisy peer. EC2 retains its spent
 marker through failure and restart. If bursts exceed the qualified budget,
 reduce the simultaneous startup demand and recover failed allocations through
 the existing retirement procedure.
