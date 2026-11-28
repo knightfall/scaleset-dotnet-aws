@@ -101,7 +101,7 @@ aws_read iam get-instance-profile --instance-profile-name "$instance_profile_nam
   --query 'InstanceProfile.{Arn:Arn,Roles:Roles[].Arn}' --output json
 aws_read iam get-role --role-name "$bootstrap_role_name" --query 'Role.{Arn:Arn,RoleId:RoleId}' --output json
 aws_read ecs describe-task-definition --task-definition "$task_definition_arn" \
-  --query 'taskDefinition.{Arn:taskDefinitionArn,Status:status,Compatibility:requiresCompatibilities,Network:networkMode,Platform:runtimePlatform,Cpu:cpu,TaskRole:taskRoleArn,ExecutionRole:executionRoleArn,Containers:containerDefinitions[].{Name:name,Image:image,User:user,Essential:essential,Privileged:privileged,ReadOnly:readonlyRootFilesystem}}' \
+  --query 'taskDefinition.{Arn:taskDefinitionArn,Status:status,Compatibility:requiresCompatibilities,Network:networkMode,Platform:runtimePlatform,Cpu:cpu,TaskRole:taskRoleArn,ExecutionRole:executionRoleArn,Containers:containerDefinitions[].{Name:name,Image:image,User:user,Capabilities:linuxParameters.capabilities,Essential:essential,Privileged:privileged,ReadOnly:readonlyRootFilesystem}}' \
   --output json
 aws_read ec2 describe-subnets --subnet-ids "$runner_subnet_a" "$runner_subnet_b" \
   --query 'Subnets[].{Id:SubnetId,Vpc:VpcId,Zone:AvailabilityZone,IPv4:AvailableIpAddressCount,State:State}' \

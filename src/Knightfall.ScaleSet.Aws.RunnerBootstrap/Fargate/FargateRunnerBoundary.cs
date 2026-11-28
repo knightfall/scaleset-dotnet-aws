@@ -28,7 +28,7 @@ internal sealed class FargateRunnerBoundary : ILinuxOneJobBoundary, IDisposable
         bool swapDisabled = swapLimit is not null && File.Exists(swapLimit) && File.ReadAllText(swapLimit).Trim() == "0";
         string runnerBin = Path.Combine(settings.RunnerDistribution, "bin");
         string runnerExternals = Path.Combine(settings.RunnerDistribution, "externals");
-        if (LinuxFiles.IsRoot() || !HasVerifiedMemoryMount(mounts, swapDisabled) ||
+        if (!LinuxFiles.HasFargateRunnerIdentity() || !HasVerifiedMemoryMount(mounts, swapDisabled) ||
             new DriveInfo(MemoryMount).TotalSize is < (8 * MiB) or > (128 * MiB) ||
             !HasWritableWorkMount(settings.WorkScratch, mounts) ||
             !IsReadOnlyAsset(settings.RunnerDistribution) || !IsReadOnlyAsset(settings.RunnerDotnet) ||

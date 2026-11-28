@@ -174,6 +174,7 @@ internal sealed class FargateNativeFixture : IDisposable
             Privileged = privileged,
             ReadonlyRootFilesystem = true,
             User = "1001:1001",
+            LinuxParameters = new LinuxParameters { Capabilities = new KernelCapabilities { Drop = ["ALL"] } },
             EntryPoint = [.. Approval.EntryPoint],
             Command = [.. Approval.Command],
         };
