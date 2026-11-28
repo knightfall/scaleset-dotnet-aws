@@ -8,6 +8,61 @@ namespace Knightfall.ScaleSet.Aws.Providers.Tests;
 public sealed class Ec2PreflightTests
 {
     [Theory]
+    [InlineData("", "<ebs><encrypted>false</encrypted></ebs>", false)]
+    [InlineData("", "<ebs/>", false)]
+    [InlineData("", "<ebs><encrypted>true</encrypted></ebs>", true)]
+    [InlineData("<ebs><encrypted>false</encrypted></ebs>", "", false)]
+    [InlineData("<ebs><encrypted>true</encrypted></ebs>", "<ebs><encrypted>false</encrypted></ebs>", true)]
+    [InlineData("<noDevice/>", "<ebs><encrypted>false</encrypted></ebs>", true)]
+    [InlineData("<noDevice/><ebs><encrypted>false</encrypted></ebs>", "<ebs><encrypted>false</encrypted></ebs>", false)]
+    [InlineData("<virtualName>ephemeral0</virtualName>", "<ebs><encrypted>false</encrypted></ebs>", false)]
+    [InlineData("<virtualName>ephemeral0</virtualName>", "", true)]
+    public async Task RequiresEncryptionForEveryEffectiveEbsVolume(string templateDevice, string imageDevice, bool ready)
+    {
+        static string Device(string mapping) => mapping.Length == 0 ? "" : $"<item><deviceName>/dev/sdf</deviceName>{mapping}</item>";
+        var token = TestContext.Current.CancellationToken;
+        var config = await ConfigurationAsync(token, "12");
+        using var cloud = new Ec2InspectionFixture
+        {
+            TemplateResponse = Template(extraMappings: Device(templateDevice)),
+            ImageResponse = Image(extraMappings: Device(imageDevice)),
+        };
+
+        var result = await cloud.Inspector.ResolvePreflightAsync(config, ProfileId, token);
+
+        Assert.Equal(ready ? Ec2PreflightStatus.Verified : Ec2PreflightStatus.VolumeEncryptionUnverified, result.Status);
+        Assert.Equal(ready, result.IsReady);
+    }
+
+    [Theory]
+    [InlineData("duplicate-template")]
+    [InlineData("duplicate-image")]
+    [InlineData("missing-image-mappings")]
+    public async Task AmbiguousMappingsHoldTheLaunch(string fault)
+    {
+        const string disk = "<item><deviceName>/dev/sdf</deviceName><ebs><encrypted>true</encrypted></ebs></item>";
+        var token = TestContext.Current.CancellationToken;
+        var config = await ConfigurationAsync(token, "12");
+        string image = Image(extraMappings: fault == "duplicate-image" ? disk + disk : "");
+        if (fault == "missing-image-mappings")
+        {
+            var response = System.Xml.Linq.XDocument.Parse(image);
+            response.Descendants(System.Xml.Linq.XName.Get("blockDeviceMapping", Namespace)).Single().Remove();
+            image = response.ToString();
+        }
+        using var cloud = new Ec2InspectionFixture
+        {
+            TemplateResponse = Template(extraMappings: fault == "duplicate-template" ? disk + disk : ""),
+            ImageResponse = image,
+        };
+
+        var result = await cloud.Inspector.ResolvePreflightAsync(config, ProfileId, token);
+
+        Assert.Equal(Ec2PreflightStatus.VolumeEncryptionUnverified, result.Status);
+        Assert.Null(result.Template);
+    }
+
+    [Theory]
     [InlineData(null, Ec2PreflightStatus.Verified)]
     [InlineData("alias/aws/ebs", Ec2PreflightStatus.Verified)]
     [InlineData("alias/custom-ebs", Ec2PreflightStatus.EbsKeyUnqualified)]
@@ -31,6 +86,9 @@ public sealed class Ec2PreflightTests
     [InlineData("imds-v1", Ec2PreflightStatus.ImdsV2Required)]
     [InlineData("no-imds-endpoint", Ec2PreflightStatus.ImdsV2Required)]
     [InlineData("disabled-imds-endpoint", Ec2PreflightStatus.ImdsV2Required)]
+    [InlineData("missing-hop-limit", Ec2PreflightStatus.ImdsV2Required)]
+    [InlineData("invalid-hop-limit", Ec2PreflightStatus.ImdsV2Required)]
+    [InlineData("container-hop-limit", Ec2PreflightStatus.ImdsV2Required)]
     [InlineData("no-instance-type", Ec2PreflightStatus.InstanceTypeIncompatible)]
     [InlineData("unencrypted-root", Ec2PreflightStatus.RootEncryptionUnverified)]
     [InlineData("wrong-device", Ec2PreflightStatus.RootEncryptionUnverified)]
@@ -52,6 +110,9 @@ public sealed class Ec2PreflightTests
                 "imds-v1" => Template(tokens: "optional"),
                 "no-imds-endpoint" => Template(endpoint: null),
                 "disabled-imds-endpoint" => Template(endpoint: "disabled"),
+                "missing-hop-limit" => Template(hopLimit: null),
+                "invalid-hop-limit" => Template(hopLimit: 0),
+                "container-hop-limit" => Template(hopLimit: 2),
                 "no-instance-type" => Template(instanceType: null),
                 "unencrypted-root" => Template(encrypted: false),
                 "wrong-device" => Template(rootDevice: "/dev/sdf"),

@@ -110,11 +110,12 @@ internal sealed class Ec2InspectionFixture : IDisposable
 
     internal static string Template(long version = 12, bool encrypted = true, string tokens = "required", string imageId = ImageId,
         string protocol = "v1", bool byName = false, string extra = "", string rootDevice = RootDevice,
-        string? endpoint = "enabled", string? instanceType = "m7i.large", string? ebsKey = null)
+        string? endpoint = "enabled", string? instanceType = "m7i.large", string? ebsKey = null, int? hopLimit = 1, string extraMappings = "")
     {
         string profile = byName ? $"<name>{RoleName}</name>" : $"<arn>{ProfileArn}</arn>";
         string endpointElement = endpoint is null ? string.Empty : $"<httpEndpoint>{endpoint}</httpEndpoint>";
         string instanceTypeElement = instanceType is null ? string.Empty : $"<instanceType>{instanceType}</instanceType>";
+        string hop = hopLimit.HasValue ? FormattableString.Invariant($"<httpPutResponseHopLimit>{hopLimit}</httpPutResponseHopLimit>") : "";
         string key = ebsKey is null ? string.Empty : $"<kmsKeyId>{ebsKey}</kmsKeyId>";
         return FormattableString.Invariant($"""
             <DescribeLaunchTemplateVersionsResponse xmlns="{Namespace}">
@@ -125,9 +126,9 @@ internal sealed class Ec2InspectionFixture : IDisposable
                 <launchTemplateData>
                   <imageId>{imageId}</imageId>{instanceTypeElement}
                   <iamInstanceProfile>{profile}</iamInstanceProfile>
-                  <metadataOptions>{endpointElement}<httpTokens>{tokens}</httpTokens></metadataOptions>
+                  <metadataOptions>{endpointElement}<httpTokens>{tokens}</httpTokens>{hop}</metadataOptions>
                   <blockDeviceMappingSet><item><deviceName>{rootDevice}</deviceName>
-                    <ebs><encrypted>{(encrypted ? "true" : "false")}</encrypted>{key}</ebs></item></blockDeviceMappingSet>
+                    <ebs><encrypted>{(encrypted ? "true" : "false")}</encrypted>{key}</ebs></item>{extraMappings}</blockDeviceMappingSet>
                   <tagSpecificationSet><item><resourceType>instance</resourceType><tagSet><item>
                     <key>scaleset-aws:bootstrap-protocol</key><value>{protocol}</value>
                   </item></tagSet></item></tagSpecificationSet>
@@ -138,11 +139,12 @@ internal sealed class Ec2InspectionFixture : IDisposable
             """);
     }
 
-    internal static string Image(string architecture = "x86_64", string platform = "") => $"""
+    internal static string Image(string architecture = "x86_64", string platform = "", string extraMappings = "") => $"""
         <DescribeImagesResponse xmlns="{Namespace}">
           <requestId>images-1</requestId><imagesSet><item>
             <imageId>{ImageId}</imageId><architecture>{architecture}</architecture>
             <rootDeviceName>{RootDevice}</rootDeviceName><rootDeviceType>ebs</rootDeviceType>
+            <blockDeviceMapping><item><deviceName>{RootDevice}</deviceName><ebs><encrypted>false</encrypted></ebs></item>{extraMappings}</blockDeviceMapping>
             <imageState>available</imageState><platformDetails>Linux/UNIX</platformDetails>{platform}
           </item></imagesSet>
         </DescribeImagesResponse>
