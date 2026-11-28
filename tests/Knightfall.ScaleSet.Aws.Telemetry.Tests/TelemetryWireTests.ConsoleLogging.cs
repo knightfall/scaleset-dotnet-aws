@@ -1,10 +1,18 @@
 using System.Diagnostics;
 using System.Globalization;
+using System.Net;
+using System.Security.Cryptography;
+using System.Text;
 using System.Text.Json;
+using Amazon;
+using Amazon.Runtime;
+using Amazon.SecretsManager;
+using Amazon.SecretsManager.Model;
 using Knightfall.ScaleSet.Aws.Controller.Lifecycle;
 using Knightfall.ScaleSet.Aws.Controller.Telemetry;
 using Knightfall.ScaleSet.Aws.Core.Configuration;
 using Knightfall.ScaleSet.Aws.Core.Telemetry;
+using Knightfall.ScaleSet.Aws.GitHub;
 using Microsoft.Extensions.Logging;
 using Xunit;
 
@@ -80,9 +88,112 @@ public sealed partial class TelemetryWireTests
         Assert.Equal("SourceContext", Assert.Single(unknown.RootElement.GetProperty("Properties").EnumerateObject()).Name);
     }
 
+    [Fact]
+    public async Task RejectedCredentialCandidateExportsOnlyItsBoundedClassificationAndProfile()
+    {
+        var token = TestContext.Current.CancellationToken;
+        var configuration = RuntimeConfigurationLoader.Load(await MixedRuntimeAsync(token));
+        var configured = configuration.Profiles[0];
+        var profile = Assert.IsType<TelemetryProfile>(TelemetryProfile.From(configured));
+        var connection = configuration.GitHub[configured.GitHub.Connection];
+        using var secrets = new RotatingSecrets();
+        var loader = new GitHubSecretLoader(secrets);
+        var clients = new GitHubScaleSetClientFactory();
+        using var current = clients.Create(Assert.IsType<GitHubSecretVersion>(
+            await loader.LoadAsync(configuration, configured.GitHub.Connection, token)));
+
+        await using var receiver = await OtlpLoopback.StartAsync(grpc: false, respond: null, token);
+        var settings = TelemetrySettings.Load(runtime: configuration, readEnvironment: name => name switch
+        {
+            "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT" => receiver.Url + "/v1/logs",
+            "OTEL_EXPORTER_OTLP_LOGS_PROTOCOL" => "http/protobuf",
+            _ => null,
+        });
+        var original = Console.Out;
+        await using var output = new StringWriter(CultureInfo.InvariantCulture);
+        try
+        {
+            Console.SetOut(output);
+            await using var pipeline = TelemetryPipeline.Start(settings, TextWriter.Null);
+            var logger = pipeline.Logging.CreateLogger<GitHubCredentialRotator>();
+            var rotator = new GitHubCredentialRotator(loader, clients, logger);
+            var routing = configured.GitHub;
+            var binding = new GitHubScaleSetBinding(connection.ScopeUrl, routing.RunnerGroup, 1, routing.ScaleSet,
+                routing.ScaleSetId ?? 1, routing.Labels);
+            using (TelemetryProfileScope.Enter(profile))
+            {
+                var result = await rotator.CheckAsync(configuration, routing, binding, current, token);
+                Assert.Equal(GitHubCredentialRotationStatus.CandidateRejected, result.Status);
+                Assert.Null(result.Candidate);
+                Assert.Equal(GitHubOperationError.CredentialUnavailable, result.Failure?.Error);
+            }
+            Assert.True(await pipeline.StopAsync().WaitAsync(token));
+        }
+        finally
+        {
+            Console.SetOut(original);
+        }
+
+        string rendered = output.ToString();
+        Assert.DoesNotContain(Secret, rendered, StringComparison.Ordinal);
+        Assert.DoesNotContain(connection.SecretArn, rendered, StringComparison.Ordinal);
+        Assert.DoesNotContain(connection.ScopeUrl, rendered, StringComparison.Ordinal);
+        using var console = JsonDocument.Parse(rendered);
+        var fields = console.RootElement.GetProperty("Properties");
+        var request = Assert.Single(receiver.Requests);
+        var record = new OtlpMessage(request.Payload()).Message(1).Message(2).Message(2);
+        var attributes = record.StringAttributes(6);
+        Assert.DoesNotContain(Secret, Encoding.UTF8.GetString(request.Payload()), StringComparison.Ordinal);
+        Assert.DoesNotContain(connection.SecretArn, Encoding.UTF8.GetString(request.Payload()), StringComparison.Ordinal);
+        Assert.DoesNotContain(connection.ScopeUrl, Encoding.UTF8.GetString(request.Payload()), StringComparison.Ordinal);
+        foreach (var (key, value) in new KeyValuePair<string, string>[]
+        {
+            new("SourceContext", "Knightfall.ScaleSet.Aws.GitHub"), new("operation", "credential-rotate"),
+            new("outcome", "rejected"), new("reason", "credential_unavailable"),
+            new("profile", profile.Id), new("provider", profile.Provider),
+        })
+        {
+            Assert.Equal(value, fields.GetProperty(key).GetString());
+            Assert.Equal(value, attributes[key]);
+        }
+        Assert.Equal(6, fields.EnumerateObject().Count());
+        Assert.Equal(6, attributes.Count);
+    }
+
     private static Task<byte[]> MixedRuntimeAsync(CancellationToken token) =>
         File.ReadAllBytesAsync(Path.Combine(AppContext.BaseDirectory, "mixed.json"), token);
 
     [LoggerMessage(2, LogLevel.Error, "Unexpected failure {payload}")]
     private static partial void WriteUnknownEvent(ILogger logger, string payload, Exception exception);
+
+    private sealed class RotatingSecrets()
+        : AmazonSecretsManagerClient(new BasicAWSCredentials("fixture", "fixture"), RegionEndpoint.APSoutheast2)
+    {
+        private int _reads;
+
+        public override Task<GetSecretValueResponse> GetSecretValueAsync(GetSecretValueRequest request, CancellationToken cancellationToken)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (_reads++ != 0)
+            {
+                return Task.FromException<GetSecretValueResponse>(
+                    new HttpRequestException($"{Secret} {request.SecretId}"));
+            }
+
+            using var key = RSA.Create(2048);
+            return Task.FromResult(new GetSecretValueResponse
+            {
+                HttpStatusCode = HttpStatusCode.OK,
+                ARN = request.SecretId,
+                VersionId = new string('a', 32),
+                VersionStages = ["AWSCURRENT"],
+                SecretString = JsonSerializer.Serialize(new
+                {
+                    clientId = Secret,
+                    installationId = 1,
+                    privateKey = key.ExportRSAPrivateKeyPem(),
+                }),
+            });
+        }
+    }
 }
