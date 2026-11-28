@@ -243,7 +243,11 @@ journal during recovery.
    dependency spans. Parent-based head sampling can leave a correlated log
    without a stored trace. Use the same fields and time window in the
    sanitized console logs, then verify the lifecycle row and provider
-   readback if the trace is unavailable.
+   readback if the trace is unavailable. Controller events on stdout use
+   one JSON object per line. In CloudWatch Logs Insights, use
+   `Properties.operation`, `Properties.outcome`, `Properties.reason`,
+   `Properties.profile`, `Properties.provider`, and `Properties.SourceContext`.
+   `TraceId` and `SpanId` are top-level fields when available.
 
 The controller rate-limits redacted export diagnostics to at most one write
 per five seconds. They can report rejection, malformed replies, an unavailable
