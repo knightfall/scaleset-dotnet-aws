@@ -162,6 +162,7 @@ internal sealed class DirectEc2Fixture(
         MetadataOptions = new LaunchTemplateInstanceMetadataOptionsRequest
         {
             HttpEndpoint = LaunchTemplateInstanceMetadataEndpointState.Enabled,
+            HttpPutResponseHopLimit = 1,
             HttpTokens = requireImdsV2 ? LaunchTemplateHttpTokensState.Required : LaunchTemplateHttpTokensState.Optional,
         },
         BlockDeviceMappings = [new LaunchTemplateBlockDeviceMappingRequest
