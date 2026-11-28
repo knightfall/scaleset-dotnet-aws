@@ -216,6 +216,7 @@ export function grantFargate(
   regionalReads(role, [
     "ecs:DescribeTaskDefinition",
     "ecs:ListAccountSettings",
+    "ec2:DescribeRouteTables",
     "ec2:DescribeSubnets",
     "ec2:DescribeSecurityGroups",
   ]);

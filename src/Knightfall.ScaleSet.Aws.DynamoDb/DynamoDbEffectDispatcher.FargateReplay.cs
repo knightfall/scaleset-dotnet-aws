@@ -86,8 +86,30 @@ public sealed partial class DynamoDbEffectDispatcher
             return telemetry.Complete(EffectDispatchStatus.AwaitingEvidence, "replay_window");
         }
 
+        // An ambiguous first attempt may never have reached ECS. Revalidate the immutable launch before granting a resend.
+        var checkedAfter = now;
+        var precondition = await CallBoundedAsync(ct => provider.CheckReplayAsync(envelope, catalog.Binding, ct),
+            deadline - sendWindow.UpperUtcNow, token).ConfigureAwait(false);
+        lease = await ReadCurrentLeaseAsync(lease, token).ConfigureAwait(false);
+        now = _clock.GetUtcNow();
+        if (lease is null || Window(lease, clockEvidence) is not { } currentWindow)
+        {
+            return telemetry.Complete(EffectDispatchStatus.OwnershipUnavailable, "ownership");
+        }
+        if (precondition is not { Eligible: true } || precondition.EnvelopeSha256 != envelope.Sha256 ||
+            precondition.Target != envelope.Target || !IsCurrentObservation(precondition.ObservedAt, checkedAfter, now))
+        {
+            return telemetry.Complete(EffectDispatchStatus.AwaitingEvidence, "launch_precondition");
+        }
+        lower = now - clockEvidence.MaximumAbsoluteSkew;
+        deadline = deadline < currentWindow.Deadline ? deadline : currentWindow.Deadline;
+        if (lower < previousDeadline || lower > currentWindow.UpperUtcNow || deadline <= currentWindow.UpperUtcNow)
+        {
+            return telemetry.Complete(EffectDispatchStatus.AwaitingEvidence, "replay_window");
+        }
+
         var guard = new EffectDispatchGuard(catalog, index!, allocation, null);
-        var begun = await _journal.BeginFargateReplayAsync(lease, previous, lower, sendWindow.UpperUtcNow, deadline,
+        var begun = await _journal.BeginFargateReplayAsync(lease, previous, lower, currentWindow.UpperUtcNow, deadline,
             _timing.WriteReserve, guard, token).ConfigureAwait(false);
         if (begun.Permission is { } permission)
         {

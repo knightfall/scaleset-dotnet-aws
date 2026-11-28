@@ -337,6 +337,32 @@ public sealed class Ec2PreflightTests
         Assert.Equal(2, cloud.Requests.Count(item => item["Action"] == "DescribeRouteTables"));
     }
 
+    [Theory]
+    [InlineData(true, Ec2PreflightStatus.NetworkIncompatible)]
+    [InlineData(false, Ec2PreflightStatus.Verified)]
+    public async Task RequiresCompleteRouteEvidenceWithinThePageLimit(bool hasMorePages, Ec2PreflightStatus expected)
+    {
+        var token = TestContext.Current.CancellationToken;
+        var config = await ConfigurationAsync(token);
+        int pages = 0;
+        using var cloud = new Ec2InspectionFixture
+        {
+            RouteTableResponse = _ =>
+            {
+                pages++;
+                Assert.InRange(pages, 1, 256);
+                string tables = pages == 1 ? RouteTable("rtb-0123456789abcdef0", main: true) : "";
+                string next = pages < 256 || hasMorePages ? $"<nextToken>page-{pages + 1}</nextToken>" : "";
+                return AwsWireTransport.Xml(RouteTables(tables, next));
+            },
+        };
+
+        var result = await cloud.Inspector.ResolvePreflightAsync(config, ProfileId, token);
+
+        Assert.Equal(expected, result.Status);
+        Assert.Equal(256, pages);
+    }
+
     [Fact]
     public async Task DryRunWithoutInspectionAndWrongRegionMakeNoAwsRequests()
     {

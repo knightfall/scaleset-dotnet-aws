@@ -135,6 +135,7 @@ public sealed class FargateEffectJournalTests
         Assert.Equal(EffectDispatchStatus.AwaitingEvidence, await DispatchAsync(fixture, launch, provider, token));
         var attempt = (await ReadAsync(fixture, launch, token)).Entry.Attempt;
         var binding = Bind(launch);
+        provider.ReplayEligible = false;
         provider.Positive = envelope => Evidence(fixture.Clock, envelope, binding, ExecutorResourceState.IrreversiblyTerminated);
         table.Wire.DropNextSuccessfulTransactionResponse();
 
@@ -177,6 +178,13 @@ public sealed class FargateEffectJournalTests
         Assert.Single(provider.Sends);
         Assert.Equal(first.TransitionId, (await ReadAsync(fixture, launch, token)).TransitionId);
         provider.Complete = true;
+        provider.ReplayEligible = false;
+        Assert.Equal(EffectDispatchStatus.AwaitingEvidence, await ReplayAsync(fixture, renewed, launch, provider, token));
+        Assert.Single(provider.Sends);
+        Assert.Equal(first.TransitionId, (await ReadAsync(fixture, launch, token)).TransitionId);
+        Assert.Single((await ReservationsAsync(fixture, token)).Reservations);
+
+        provider.ReplayEligible = true;
         var reconciled = await fixture.Dispatcher.ReconcilePassAsync(renewed, Proof(fixture.Clock), fixture.Profile, null, provider, null, token);
         Assert.Equal(LifecycleWriteOutcome.Committed, reconciled.Outcome);
         Assert.Equal(1, reconciled.Examined);
@@ -730,6 +738,7 @@ public sealed class FargateEffectJournalTests
         public List<(EffectEnvelope Envelope, EffectAttempt Attempt)> Sends { get; } = [];
         public List<EffectAttempt> Probes { get; } = [];
         public bool Complete { get; set; } = true;
+        public bool ReplayEligible { get; set; } = true;
         public Func<EffectEnvelope, EffectEvidence>? Positive { get; set; }
         public Func<EffectEnvelope, EffectEvidence>? OnSend { get; init; }
         public EffectEvidence? AlreadyApplied { get; init; }
@@ -745,6 +754,9 @@ public sealed class FargateEffectJournalTests
 
         public Task<EffectEvidence?> ObserveAsync(EffectEnvelope envelope, EffectAttempt attempt, CancellationToken cancellationToken) =>
             Task.FromResult(Positive?.Invoke(envelope));
+
+        public Task<EffectDispatchPrecondition?> CheckReplayAsync(EffectEnvelope envelope, CatalogBinding binding, CancellationToken cancellationToken) =>
+            Task.FromResult<EffectDispatchPrecondition?>(new(envelope.Sha256, envelope.Target, clock.Now, ReplayEligible));
 
         public Task<FargateReplayObservation?> ObserveForReplayAsync(EffectEnvelope envelope, EffectAttempt attempt, CancellationToken cancellationToken)
         {

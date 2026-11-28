@@ -1,4 +1,3 @@
-using System.Buffers;
 using System.Collections.Immutable;
 using System.Globalization;
 using Amazon.EC2;
@@ -17,8 +16,6 @@ namespace Knightfall.ScaleSet.Aws.Providers.Ec2;
 /// <summary>Reads EC2, IAM, and STS evidence for one configured EC2 runner profile.</summary>
 public sealed partial class Ec2ProfileInspector : IDisposable
 {
-    private static readonly SearchValues<char> LowercaseHex = SearchValues.Create("0123456789abcdef");
-
     private readonly AmazonEC2Client _ec2;
     private readonly AmazonIdentityManagementServiceClient _iam;
     private readonly AmazonSecurityTokenServiceClient _sts;
@@ -175,7 +172,7 @@ public sealed partial class Ec2ProfileInspector : IDisposable
                 return Failed(Ec2PreflightStatus.StatusQualificationMismatch, observedVersion);
             }
             var subnets = await ReadNetworkAsync(target.Network, cancellationToken).ConfigureAwait(false);
-            if (subnets.IsDefault || !await HasPrivateRoutesAsync(target, cancellationToken).ConfigureAwait(false))
+            if (subnets.IsDefault || !await Ec2NetworkEvidence.HasPrivateRoutesAsync(_ec2, target.Network, target.Aws.Account, cancellationToken).ConfigureAwait(false))
             {
                 return Failed(Ec2PreflightStatus.NetworkIncompatible, observedVersion);
             }
@@ -461,9 +458,7 @@ public sealed partial class Ec2ProfileInspector : IDisposable
         parsed > 0 && value == parsed.ToString(CultureInfo.InvariantCulture);
 
     internal static bool IsResourceId(string? value, string prefix) =>
-        value?.StartsWith(prefix, StringComparison.Ordinal) == true &&
-        value.Length - prefix.Length is 8 or 17 &&
-        value.AsSpan(prefix.Length).IndexOfAnyExcept(LowercaseHex) == -1;
+        Ec2NetworkEvidence.IsResourceId(value, prefix);
 
     private static string ArnName(string arn) => arn[(arn.LastIndexOf('/') + 1)..];
 
