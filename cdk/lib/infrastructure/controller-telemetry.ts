@@ -1,8 +1,9 @@
-import { readFileSync } from "node:fs";
+import { closeSync, constants, fstatSync, openSync } from "node:fs";
 import { isIPv4 } from "node:net";
 import { awsPartition } from "../config/semantics.ts";
 import type { RunnerControllerRuntime } from "../config/types.ts";
 import { parseYaml } from "../config/yaml.ts";
+import { readDeploymentDocument } from "./deployment-document.ts";
 
 export interface ControllerTelemetrySettings {
   readonly sdkDisabled?: boolean;
@@ -292,9 +293,31 @@ export function readControllerTelemetry(
   aws: AwsScope,
 ): ControllerTelemetrySettings | undefined {
   if (path === undefined) return undefined;
+  let bytes: Buffer | undefined;
+  try {
+    const fd = openSync(path, constants.O_RDONLY | constants.O_NONBLOCK);
+    try {
+      if (!fstatSync(fd).isFile()) return invalid("document");
+      bytes = readDeploymentDocument(fd);
+    } finally {
+      closeSync(fd);
+    }
+  } catch {
+    return invalid("document");
+  }
+  if (bytes === undefined) {
+    throw new Error("Controller telemetry input exceeds 64 KiB.");
+  }
+  let source: string;
+  try {
+    source = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(
+      bytes,
+    );
+  } catch {
+    throw new Error("Controller telemetry input must be valid UTF-8.");
+  }
   let value: unknown;
   try {
-    const source = readFileSync(path, "utf8");
     value = JSON.parse(source);
     parseYaml(source); // Also reject duplicate JSON members.
   } catch {
