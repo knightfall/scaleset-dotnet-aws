@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import {
   mkdtempSync,
   readFileSync,
@@ -18,6 +19,10 @@ import {
   deploymentIdentity,
   trackingTableName,
 } from "../lib/infrastructure/deployment-input.ts";
+import {
+  readAttempt,
+  readDecision,
+} from "../lib/infrastructure/deployment-recovery.ts";
 
 const prior = compileConfig(
   readFileSync(
@@ -50,7 +55,7 @@ function deployController(
   run: Parameters<typeof deploy>[1],
   directory = testState,
 ) {
-  deploy(target, run, directory);
+  return deploy(target, run, directory);
 }
 
 function ok(value: object = {}): CommandResult {
@@ -100,6 +105,8 @@ function fixture({
   let executionToken: string | undefined;
   let prepareAttempts = 0;
   let tableChecks = 0;
+  let currentStackId = stackId;
+  let generation = "2";
   const changeSetNames: string[] = [];
   const run = (program: string, args: string[]): CommandResult => {
     if (program === "dotnet") {
@@ -124,7 +131,7 @@ function fixture({
       assert.equal(option(args, "--current-sha256"), deployed.sha256);
       assert.equal(option(args, "--sha256"), proposed.sha256);
       assert.equal(option(args, "--current-generation"), "1");
-      assert.equal(option(args, "--generation"), "2");
+      assert.equal(option(args, "--generation"), generation);
       count++;
       return (count === 1 && deniedBefore) || (count === 2 && deniedAfter)
         ? failure("deployment preflight refused the binding")
@@ -147,7 +154,7 @@ function fixture({
         readFileSync(`${assembly}/Controller.template.json`, "utf8"),
       );
       assert.equal(compiled.Outputs.RuntimeConfigSha256.Value, proposed.sha256);
-      assert.equal(compiled.Outputs.DeploymentGeneration.Value, "2");
+      assert.equal(compiled.Outputs.DeploymentGeneration.Value, generation);
       const task = Object.values(compiled.Resources).find(
         (resource) =>
           (resource as { Type: string }).Type === "AWS::ECS::TaskDefinition",
@@ -189,6 +196,9 @@ function fixture({
     }
     if (args.includes("describe-stacks")) {
       steps.push("stack");
+      assert.ok(
+        [stackName, currentStackId].includes(option(args, "--stack-name")),
+      );
       if (unknownStack) return failure("AccessDenied");
       if (stackMissing && !reviewExists) {
         const message = `An error occurred (ValidationError) when calling the DescribeStacks operation: Stack with id ${stackName} does not exist`;
@@ -199,7 +209,7 @@ function fixture({
           Stacks: [
             {
               StackName: stackName,
-              StackId: stackId,
+              StackId: currentStackId,
               StackStatus: "REVIEW_IN_PROGRESS",
             },
           ],
@@ -212,7 +222,7 @@ function fixture({
         RuntimeConfigUri: `s3://prior-assets/runtime/${deployedResult.sha256}.json`,
         RuntimeConfigVersionId: version,
         RuntimeConfigSha256: deployedResult.sha256,
-        DeploymentGeneration: complete && !keepRollback ? "2" : "1",
+        DeploymentGeneration: complete && !keepRollback ? generation : "1",
       };
       return ok({
         Stacks: [
@@ -221,7 +231,7 @@ function fixture({
             StackId:
               replacedBeforeCleanup && count >= 2
                 ? `${scope}:stack/${stackName}/other-stack`
-                : stackId,
+                : currentStackId,
             StackStatus:
               complete && !keepRollback
                 ? stackMissing
@@ -240,6 +250,21 @@ function fixture({
           },
         ],
       });
+    }
+    if (
+      args.includes("list-stack-resources") ||
+      args.includes("list-change-sets")
+    ) {
+      assert.equal(option(args, "--stack-name"), currentStackId);
+      assert.equal(args.includes("--no-paginate"), false);
+      assert.equal(args.includes("--max-items"), false);
+      assert.equal(reviewExists && !executed, true);
+      if (args.includes("list-stack-resources")) {
+        steps.push("resources");
+        return ok({ StackResourceSummaries: [], NextToken: null });
+      }
+      steps.push("change-sets");
+      return ok({ Summaries: prepared ? [{ ChangeSetId: prepared.id }] : [] });
     }
     if (args.includes("describe-table")) {
       steps.push("table");
@@ -276,7 +301,7 @@ function fixture({
     }
     if (args.includes("describe-change-set")) {
       steps.push("change-set");
-      assert.equal(option(args, "--stack-name"), stackId);
+      assert.equal(option(args, "--stack-name"), currentStackId);
       const requested = option(args, "--change-set-name");
       if (
         !prepared ||
@@ -289,14 +314,14 @@ function fixture({
       return ok({
         Status: "CREATE_COMPLETE",
         ExecutionStatus: executed ? "EXECUTE_IN_PROGRESS" : "AVAILABLE",
-        StackId: stackId,
+        StackId: currentStackId,
         StackName: stackName,
         ChangeSetId: prepared.id,
       });
     }
     if (args.includes("get-template")) {
       steps.push("template");
-      assert.equal(option(args, "--stack-name"), stackId);
+      assert.equal(option(args, "--stack-name"), currentStackId);
       assert.equal(option(args, "--template-stage"), "Original");
       assert.ok(prepared);
       if (args.includes("--change-set-name")) {
@@ -311,7 +336,7 @@ function fixture({
     if (args.includes("delete-change-set")) {
       steps.push("delete-exact-change-set");
       assert.ok(prepared);
-      assert.equal(option(args, "--stack-name"), stackId);
+      assert.equal(option(args, "--stack-name"), currentStackId);
       assert.equal(option(args, "--change-set-name"), prepared.id);
       assert.equal(executed, false);
       prepared = undefined;
@@ -323,7 +348,7 @@ function fixture({
         option(args, "--change-set-name"),
         /:changeSet\/scaleset-[a-f0-9-]+\/exact-id$/u,
       );
-      assert.equal(option(args, "--stack-name"), stackId);
+      assert.equal(option(args, "--stack-name"), currentStackId);
       const token = option(args, "--client-request-token");
       assert.equal(token, prepared?.name);
       executionToken = token;
@@ -337,14 +362,21 @@ function fixture({
           stackMissing ? "stack-create-complete" : "stack-update-complete",
         ),
       );
-      assert.equal(option(args, "--stack-name"), stackId);
+      assert.equal(option(args, "--stack-name"), currentStackId);
       assert.ok(executionToken);
       complete = true;
       return ok();
     }
     throw new Error(`Unexpected operation ${args.join(" ")}`);
   };
-  return { run, steps, changeSetNames };
+  function operatorRemovesEmptyReview(id: string, correctedGeneration: string) {
+    assert.equal(id, currentStackId);
+    assert.ok(reviewExists && !executed && prepared === undefined);
+    reviewExists = false;
+    currentStackId = `${scope}:stack/${stackName}/replacement-stack`;
+    generation = correctedGeneration;
+  }
+  return { run, steps, changeSetNames, operatorRemovesEmptyReview };
 }
 
 test("checks exact current and candidate bytes before preparation and again before exact execution", () => {
@@ -696,6 +728,194 @@ test("a denied fresh apply discards only its change set and reuses its exact rev
   );
 });
 
+test("inspect-review attributes an empty placeholder without mutation and permits a corrected first deploy after operator removal", () => {
+  const cloud = fixture({ stackMissing: true, tableAppearsAfterPrepare: true });
+  const recovery = newRecoveryDirectory();
+  const original = { compiled: candidate, generation: "2" };
+  assert.throws(
+    () => deployController(original, cloud.run, recovery),
+    /tracking table is present/u,
+  );
+  const journal = recoveryRecord(recovery);
+  const corrected = { ...original, generation: "3" };
+  assert.throws(
+    () => deployController(corrected, cloud.run, recovery),
+    /unstable or belongs to another deployment attempt/u,
+  );
+  assert.throws(
+    () =>
+      deployController({ ...corrected, resume: journal }, cloud.run, recovery),
+    /does not match the exact reviewed deployment inputs/u,
+  );
+  const before = cloud.steps.length;
+  const verified = deployController(
+    { ...original, inspectReview: journal },
+    cloud.run,
+    recovery,
+  );
+  assert.equal(verified, stackId);
+  assert.deepEqual(cloud.steps.slice(before), [
+    "identity",
+    "stack",
+    "resources",
+    "change-sets",
+    "stack",
+  ]);
+
+  cloud.operatorRemovesEmptyReview(verified, corrected.generation);
+  deployController(corrected, cloud.run, recovery);
+  assert.equal(cloud.changeSetNames.length, 2);
+  assert.equal(cloud.steps.filter((step) => step === "execute").length, 1);
+  assert.equal(recoveryRecord(recovery), journal);
+  assert.equal(readDecision(journal, readAttempt(journal).name), "discard");
+});
+
+test("inspect-review holds an unattributed, competed, nonempty, or executing stack", () => {
+  const cloud = fixture({ stackMissing: true, tableAppearsAfterPrepare: true });
+  const recovery = newRecoveryDirectory();
+  const original = { compiled: candidate, generation: "2" };
+  assert.throws(
+    () => deployController(original, cloud.run, recovery),
+    /tracking table is present/u,
+  );
+  const journal = recoveryRecord(recovery);
+  const attempt = readAttempt(journal);
+  const inspect = { ...original, inspectReview: journal };
+  const overrideStack = (changes: Record<string, unknown>) =>
+    ok({
+      Stacks: [
+        {
+          StackName: stackName,
+          StackId: stackId,
+          StackStatus: "REVIEW_IN_PROGRESS",
+          ...changes,
+        },
+      ],
+    });
+  for (const [operation, reply, expected] of [
+    [
+      "describe-stacks",
+      overrideStack({ StackId: `${scope}:stack/${stackName}/other` }),
+      /journal does not identify/u,
+    ],
+    [
+      "describe-stacks",
+      overrideStack({
+        Outputs: [{ OutputKey: "fixture", OutputValue: "present" }],
+      }),
+      /journal does not identify/u,
+    ],
+    [
+      "describe-stacks",
+      overrideStack({ StackStatus: "CREATE_IN_PROGRESS" }),
+      /journal does not identify/u,
+    ],
+    [
+      "describe-stacks",
+      overrideStack({ ParentId: "nested" }),
+      /journal does not identify/u,
+    ],
+    [
+      "list-stack-resources",
+      ok({ StackResourceSummaries: [{ LogicalResourceId: "resource" }] }),
+      /present or unverified/u,
+    ],
+    [
+      "list-change-sets",
+      ok({ Summaries: [{ ChangeSetId: "competing" }] }),
+      /present or unverified/u,
+    ],
+    [
+      "list-change-sets",
+      ok({ Summaries: [], NextToken: "next" }),
+      /present or unverified/u,
+    ],
+    [
+      "list-change-sets",
+      { ...ok(), stdout: "private fixture response" },
+      /^Error: Deployment received a malformed AWS response\. Recovery record:/u,
+    ],
+  ] as const) {
+    const before = cloud.steps.length;
+    assert.throws(
+      () =>
+        deployController(
+          inspect,
+          (program, args) => {
+            assert.equal(program, "aws");
+            if (args.includes(operation)) return reply;
+            return cloud.run(program, args);
+          },
+          recovery,
+        ),
+      expected,
+    );
+    assert.ok(
+      cloud.steps
+        .slice(before)
+        .every((step) =>
+          ["identity", "stack", "resources", "change-sets"].includes(step),
+        ),
+    );
+  }
+  const before = cloud.steps.length;
+  assert.throws(
+    () =>
+      deployController(
+        inspect,
+        (program, args) =>
+          args.includes("describe-stacks") &&
+          option(args, "--stack-name") === stackId
+            ? overrideStack({ StackStatus: "CREATE_IN_PROGRESS" })
+            : cloud.run(program, args),
+        recovery,
+      ),
+    /changed during inspection/u,
+  );
+  assert.deepEqual(cloud.steps.slice(before), [
+    "identity",
+    "stack",
+    "resources",
+    "change-sets",
+  ]);
+
+  const decision = `${journal}.${attempt.name}.decision`;
+  writeFileSync(decision, '"execute"');
+  assert.throws(
+    () => deployController(inspect, cloud.run, recovery),
+    /journal does not identify/u,
+  );
+  rmSync(decision);
+  assert.throws(
+    () => deployController(inspect, cloud.run, recovery),
+    /journal does not identify/u,
+  );
+  writeFileSync(decision, '"discard"', { mode: 0o600 });
+  assert.throws(
+    () =>
+      deployController(
+        inspect,
+        (program, args) => {
+          const response = cloud.run(program, args);
+          if (args.includes("list-change-sets")) rmSync(decision);
+          return response;
+        },
+        recovery,
+      ),
+    /recovery evidence changed during inspection/u,
+  );
+
+  writeFileSync(decision, '"discard"', { mode: 0o600 });
+  writeFileSync(
+    journal,
+    JSON.stringify({ ...attempt, stackId: null, changeSetId: null }),
+  );
+  assert.throws(
+    () => deployController(inspect, cloud.run, recovery),
+    /journal does not identify/u,
+  );
+});
+
 test("cleanup holds a prepared change set if the authoritative stack identity is replaced", () => {
   const cloud = fixture({ deniedAfter: true, replacedBeforeCleanup: true });
   const recovery = newRecoveryDirectory();
@@ -747,6 +967,73 @@ test("a fresh imported table is checked before preparation and execution without
     /already holds state/u,
   );
   assert.deepEqual(occupied.steps, ["identity", "stack", "table", "catalog"]);
+});
+
+test("deployment redacts malformed AWS response text and holds execution", () => {
+  const imported = compileConfig(
+    JSON.stringify({
+      ...candidate.runtime,
+      kind: "RunnerController",
+      spec: {
+        ...candidate.runtime.spec,
+        tracking: { table: { type: "import", name: table } },
+      },
+    }),
+  );
+  const privateText = "private fixture response";
+  const invalid = { ...ok(), stdout: privateText };
+  for (const [operation, reply, proposed] of [
+    ["describe-change-set", invalid, candidate],
+    ["get-template", ok({ TemplateBody: privateText }), candidate],
+    ["describe-table", invalid, imported],
+  ] as const) {
+    const cloud = fixture({ stackMissing: true, proposed });
+    let reached = false;
+    assert.throws(
+      () =>
+        deployController(
+          { compiled: proposed, generation: "2" },
+          (program, args) => {
+            const result = cloud.run(program, args);
+            if (!args.includes(operation)) return result;
+            reached = true;
+            return reply;
+          },
+          newRecoveryDirectory(),
+        ),
+      (error: Error) => {
+        assert.match(
+          error.message,
+          /^Deployment received a malformed AWS response\./u,
+        );
+        assert.ok(!error.message.includes(privateText));
+        return true;
+      },
+    );
+    assert.ok(reached, operation);
+    assert.ok(!cloud.steps.includes("execute"));
+    assert.ok(!cloud.steps.includes("delete-exact-change-set"));
+  }
+});
+
+test("deployment redacts malformed prior runtime JSON even when its digest matches", () => {
+  const priorJson = "private fixture runtime";
+  const deployed = {
+    ...prior,
+    json: priorJson,
+    sha256: createHash("sha256").update(priorJson).digest("hex"),
+  };
+  const cloud = fixture({ deployed });
+  assert.throws(
+    () =>
+      deployController(
+        { compiled: candidate, generation: "2" },
+        cloud.run,
+        newRecoveryDirectory(),
+      ),
+    { message: "Deployment received a malformed AWS response." },
+  );
+  assert.deepEqual(cloud.steps, ["identity", "stack", "source"]);
 });
 
 test("an authoritative change set with different template bytes is held for recovery", () => {

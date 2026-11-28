@@ -51,6 +51,7 @@ interface DeploymentTarget extends ControllerDeploymentEnvironment {
   readonly compiled: Compiled;
   readonly generation: string;
   readonly resume?: string;
+  readonly inspectReview?: string;
 }
 
 const cdkCli = fileURLToPath(
@@ -77,6 +78,16 @@ function object(value: unknown): ObjectProperties {
     throw new Error("Deployment received a malformed AWS response.");
   }
   return value as ObjectProperties;
+}
+
+function parseAwsObject(value: string): ObjectProperties {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(value);
+  } catch {
+    throw new Error("Deployment received a malformed AWS response.");
+  }
+  return object(parsed);
 }
 
 function field(source: ObjectProperties, key: string): string {
@@ -164,11 +175,26 @@ function reviewPlaceholder(stack: ObjectProperties): boolean {
   );
 }
 
+function isExactReviewStack(
+  stack: ObjectProperties | undefined,
+  stackId: string,
+): boolean {
+  return (
+    stack?.StackId === stackId &&
+    stack.ParentId === undefined &&
+    stack.RootId === undefined &&
+    reviewPlaceholder(stack)
+  );
+}
+
 export function deployController(
   target: DeploymentTarget,
   run: RunCommand,
   recoveryDirectory?: string,
-): void {
+): string | undefined {
+  if (target.resume !== undefined && target.inspectReview !== undefined) {
+    throw new Error("Choose either --resume or --inspect-review.");
+  }
   const { compiled, generation } = target;
   const runtime = compiled.runtime;
   const { account, region } = runtime.spec.aws;
@@ -196,19 +222,19 @@ export function deployController(
       ...args,
     ]);
   function awsObject(description: string, ...args: string[]) {
-    return object(JSON.parse(commandResult(aws(...args), description)));
+    return parseAwsObject(commandResult(aws(...args), description));
   }
-  function describeStack(): ObjectProperties | undefined {
+  function describeStack(stack = name): ObjectProperties | undefined {
     const result = aws(
       "cloudformation",
       "describe-stacks",
       "--stack-name",
-      name,
+      stack,
     );
     if (result.status !== 0) {
       if (
         serviceError(result, "ValidationError", "DescribeStacks") ===
-        `Stack with id ${name} does not exist`
+        `Stack with id ${stack} does not exist`
       ) {
         return undefined;
       }
@@ -216,7 +242,7 @@ export function deployController(
         "Could not establish whether the deployment stack already exists.",
       );
     }
-    const stacks = rows(object(JSON.parse(result.stdout)).Stacks);
+    const stacks = rows(parseAwsObject(result.stdout).Stacks);
     if (
       stacks.length !== 1 ||
       stacks[0].StackName !== name ||
@@ -253,16 +279,14 @@ export function deployController(
     ) {
       return undefined;
     }
-    const change = object(
-      JSON.parse(commandResult(result, "Prepared change set verification")),
+    const change = parseAwsObject(
+      commandResult(result, "Prepared change set verification"),
     );
     const changeSetId = field(change, "ChangeSetId");
-    const prefix = `arn:${awsPartition(region)}:cloudformation:${region}:${account}:changeSet/${attempt.name}/`;
     if (
       change.StackId !== stackId ||
       change.StackName !== name ||
-      !changeSetId.startsWith(prefix) ||
-      !/^[a-zA-Z0-9-]+$/u.test(changeSetId.slice(prefix.length)) ||
+      !changeSetScope(changeSetId, attempt.name) ||
       (attempt.changeSetId !== null && attempt.changeSetId !== changeSetId)
     ) {
       throw new Error(
@@ -270,6 +294,14 @@ export function deployController(
       );
     }
     return change;
+  }
+
+  function changeSetScope(changeSetId: string, changeSetName: string): boolean {
+    const prefix = `arn:${awsPartition(region)}:cloudformation:${region}:${account}:changeSet/${changeSetName}/`;
+    return (
+      changeSetId.startsWith(prefix) &&
+      /^[a-zA-Z0-9-]+$/u.test(changeSetId.slice(prefix.length))
+    );
   }
 
   function isApplied(
@@ -311,7 +343,9 @@ export function deployController(
   }
 
   const workspace = mkdtempSync(join(tmpdir(), "scaleset-deployment-"));
-  let journalPath = target.resume ? resolve(target.resume) : undefined;
+  const recoveryPath = target.resume ?? target.inspectReview;
+  let journalPath =
+    recoveryPath === undefined ? undefined : resolve(recoveryPath);
   try {
     const candidateFile = join(workspace, "candidate.json");
     writeFileSync(candidateFile, compiled.json, {
@@ -324,6 +358,64 @@ export function deployController(
       attempt && journalPath
         ? readDecision(journalPath, attempt.name)
         : undefined;
+    if (
+      attempt &&
+      (attempt.identity !== identity ||
+        attempt.generation !== generation ||
+        attempt.runtimeSha256 !== compiled.sha256)
+    ) {
+      throw new Error(
+        "The recovery record does not match the exact reviewed deployment inputs.",
+      );
+    }
+    if (target.inspectReview !== undefined) {
+      const stackId = attempt?.stackId;
+      if (
+        !journalPath ||
+        !stackId ||
+        !attempt?.changeSetId ||
+        !changeSetScope(attempt.changeSetId, attempt.name) ||
+        attempt.base !== null ||
+        decision !== "discard" ||
+        !isExactReviewStack(prior, stackId)
+      ) {
+        throw new Error(
+          "The journal does not identify a discarded first-deploy review stack.",
+        );
+      }
+      // The CLI collects every page by default. A continuation token means
+      // the inspection does not prove that the list is empty.
+      for (const [operation, key] of [
+        ["list-stack-resources", "StackResourceSummaries"],
+        ["list-change-sets", "Summaries"],
+      ]) {
+        const result = awsObject(
+          "CloudFormation review stack inspection",
+          "cloudformation",
+          operation,
+          "--stack-name",
+          stackId,
+        );
+        if (
+          (result.NextToken !== undefined && result.NextToken !== null) ||
+          rows(result[key]).length !== 0
+        ) {
+          throw new Error(
+            "CloudFormation review stack resources or change sets are present or unverified.",
+          );
+        }
+      }
+      if (!isExactReviewStack(describeStack(stackId), stackId)) {
+        throw new Error("The review stack changed during inspection.");
+      }
+      if (
+        !isDeepStrictEqual(readAttempt(journalPath), attempt) ||
+        readDecision(journalPath, attempt.name) !== "discard"
+      ) {
+        throw new Error("The recovery evidence changed during inspection.");
+      }
+      return stackId;
+    }
     const assembly = join(workspace, "assembly");
     const artifact = synthesizeController(compiled, generation, assembly, {
       fargatePreflight: fargatePreflight?.environment,
@@ -354,20 +446,14 @@ export function deployController(
         ...(changeSetId ? ["--change-set-name", changeSetId] : []),
       ).TemplateBody;
       return isDeepStrictEqual(
-        typeof template === "string" ? JSON.parse(template) : template,
+        typeof template === "string" ? parseAwsObject(template) : template,
         artifact.template,
       );
     }
     const templateSha256 = createHash("sha256")
       .update(readFileSync(artifact.templateFullPath))
       .digest("hex");
-    if (
-      attempt &&
-      (attempt.identity !== identity ||
-        attempt.generation !== generation ||
-        attempt.runtimeSha256 !== compiled.sha256 ||
-        attempt.templateSha256 !== templateSha256)
-    ) {
+    if (attempt && attempt.templateSha256 !== templateSha256) {
       throw new Error(
         "The recovery record does not match the exact reviewed deployment inputs.",
       );
@@ -508,7 +594,7 @@ export function deployController(
         );
       }
       const current = validateRuntime(
-        JSON.parse(decodeConfiguration(currentBytes)),
+        parseAwsObject(decodeConfiguration(currentBytes)),
       );
       if (
         deploymentIdentity(current) !== identity ||
@@ -573,10 +659,8 @@ export function deployController(
         }
       } else {
         const existing = object(
-          object(
-            JSON.parse(
-              commandResult(described, "Imported tracking table verification"),
-            ),
+          parseAwsObject(
+            commandResult(described, "Imported tracking table verification"),
           ).Table,
         );
         const arn = field(existing, "TableArn");
