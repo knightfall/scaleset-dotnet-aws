@@ -77,7 +77,7 @@ internal static class FargateBootstrapCommand
             Console.Error.WriteLine("Fargate bootstrap stopped.");
             return 1;
         }
-        catch (Exception error) when (error is IOException or HttpRequestException or ArgumentException or JsonException or Win32Exception or
+        catch (Exception error) when (error is InvalidDataException or IOException or HttpRequestException or ArgumentException or JsonException or Win32Exception or
                                       AmazonClientException or AmazonServiceException or InvalidOperationException or UnauthorizedAccessException or
                                       OperationCanceledException)
         {

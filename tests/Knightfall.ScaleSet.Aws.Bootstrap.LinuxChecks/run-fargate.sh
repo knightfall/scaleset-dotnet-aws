@@ -13,6 +13,7 @@ dotnet build "$project" --configuration Release --no-restore
 context=$(mktemp -d)
 trap 'rm -rf "$context"' EXIT HUP INT TERM
 cp "$repo/src/Knightfall.ScaleSet.Aws.RunnerBootstrap/Fargate/runner-child.sh" "$context/runner-child"
+cp "$fixture/fargate-bootstrap.json" "$context/fargate-bootstrap.json"
 cat > "$context/fixture-dotnet" <<'FIXTURE'
 #!/bin/sh
 set -eu
@@ -58,6 +59,7 @@ COPY --from=runtime /usr/share/dotnet/dotnet /opt/scaleset/runner-dotnet/dotnet
 COPY --from=runner /home/runner/bin/libhostfxr.so /opt/scaleset/runner-dotnet/host/fxr/8.0.0/libhostfxr.so
 COPY --from=runner --chown=0:0 /home/runner/bin /opt/scaleset/runner/bin
 COPY --from=runner --chown=0:0 /home/runner/externals /opt/scaleset/runner/externals
+COPY fargate-bootstrap.json /opt/scaleset/fargate-bootstrap.json
 COPY runner-child /opt/scaleset/runner-child
 COPY fixture-dotnet /opt/scaleset/fixture-dotnet
 COPY fixture-dotnet /opt/scaleset/fixture-dotnet-stop
@@ -80,6 +82,9 @@ if rejection=$(run_fixture --init "$image" /fixture/Knightfall.ScaleSet.Aws.Runn
     printf '%s\n' "$rejection" >&2
     exit 1
 fi
+
+rejection=$(run_fixture "$image" /fixture/Knightfall.ScaleSet.Aws.Bootstrap.LinuxChecks.dll fargate-production-metadata 2>&1)
+[ "$rejection" = "Fargate bootstrap failed." ]
 
 run_fixture --user 1001:0 "$image" /fixture/Knightfall.ScaleSet.Aws.Bootstrap.LinuxChecks.dll fargate-rejected-identity
 run_fixture --group-add 0 "$image" /fixture/Knightfall.ScaleSet.Aws.Bootstrap.LinuxChecks.dll fargate-rejected-identity

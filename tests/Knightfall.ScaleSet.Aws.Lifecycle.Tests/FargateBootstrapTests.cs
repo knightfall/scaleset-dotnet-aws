@@ -27,13 +27,14 @@ public sealed class FargateBootstrapTests
     private const string TaskArn = "arn:aws:ecs:" + Region + ":" + Account + ":task/fixture/" + TaskId;
     private const string Scope = "https://github.com/fixture/repository";
     private const string Sensitive = "fixture-jit-sentinel-9ab0d5d6";
-    private const string Metadata = "http://127.0.0.1:44123/v4/fixture-context";
+    private const string Metadata = "http://169.254.170.2/v4/fixture-context";
     private static readonly FargateBootstrapSettings Settings = new(Account, Region, Deployment, "fargate", Scope, "fixture-table", Cluster,
         "fixture-runner", "runner", $"arn:aws:iam::{Account}:role/path/{Role}", RoleId,
         "/opt/actions-runner", "/opt/runner-dotnet/dotnet", "/opt/runner-child", "/work", 99);
 
     [Theory]
     [InlineData(null)]
+    [InlineData("http://127.0.0.1:44123/v4/fixture-context")]
     [InlineData("http://localhost/v4/fixture")]
     [InlineData("http://127.1/v4/fixture")]
     [InlineData("http://169.254.169.254/v4/fixture")]
@@ -51,8 +52,16 @@ public sealed class FargateBootstrapTests
     [Theory]
     [InlineData("http://169.254.170.2/v4/fixture_context-01")]
     [InlineData(Metadata)]
-    public void MetadataUriAcceptsTheEcsAuthorityAndNumericLoopback(string value) =>
+    public void MetadataUriAcceptsTheEcsAuthority(string value) =>
         Assert.Equal(value, FargateBootstrapIdentity.ParseMetadataEndpoint(value).AbsoluteUri);
+
+    [Fact]
+    public void NumericLoopbackRequiresExplicitFixtureOptIn()
+    {
+        const string endpoint = "http://127.0.0.1:44123/v4/fixture-context";
+        Assert.Throws<InvalidDataException>(() => FargateBootstrapIdentity.ParseMetadataEndpoint(endpoint));
+        Assert.Equal(endpoint, FargateBootstrapIdentity.ParseMetadataEndpoint(endpoint, allowLoopback: true).AbsoluteUri);
+    }
 
     [Theory]
     [InlineData("/v2/credentials/f139cbbd-9696-4c04-89d3-34127db4a957", true)]
@@ -68,6 +77,7 @@ public sealed class FargateBootstrapTests
     [InlineData("cluster")]
     [InlineData("container")]
     [InlineData("mismatched-runtime-id")]
+    [InlineData("loopback-metadata")]
     [InlineData("sidecar")]
     [InlineData("internal-looking-container")]
     [InlineData("family")]
@@ -91,9 +101,11 @@ public sealed class FargateBootstrapTests
         var runner = new FixtureRunner();
         var app = new FargateBootstrapApplication(Settings, new FixtureClock());
 
-        var error = await Assert.ThrowsAsync<InvalidDataException>(() => app.RunAsync(Metadata, http, sts, ddb, runner,
+        string endpoint = defect == "loopback-metadata" ? "http://127.0.0.1:44123/v4/fixture-context" : Metadata;
+        var error = await Assert.ThrowsAsync<InvalidDataException>(() => app.RunAsync(endpoint, http, sts, ddb, runner,
             static (_, _) => throw new InvalidOperationException("Bootstrap registered with unverified identity."), token));
 
+        if (defect == "loopback-metadata") Assert.Empty(metadata.Paths);
         Assert.Empty(ddbWire.Requests);
         Assert.Equal(0, runner.Starts);
         Assert.DoesNotContain(Sensitive, error.ToString(), StringComparison.Ordinal);

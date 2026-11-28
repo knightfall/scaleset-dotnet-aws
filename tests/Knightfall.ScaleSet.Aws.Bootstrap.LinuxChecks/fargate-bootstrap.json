@@ -1,0 +1,18 @@
+{
+  "account": "111122223333",
+  "region": "ap-southeast-2",
+  "deployment": "111122223333:ap-southeast-2:fixture",
+  "profileId": "runner",
+  "gitHubScope": "https://github.com/fixture/repo",
+  "tableName": "fixture",
+  "clusterArn": "arn:aws:ecs:ap-southeast-2:111122223333:cluster/fixture",
+  "taskFamily": "fixture",
+  "containerName": "runner",
+  "taskRoleArn": "arn:aws:iam::111122223333:role/fixture",
+  "taskRoleId": "AROAFIXTURETASK000001",
+  "runnerDistribution": "/opt/scaleset/runner",
+  "runnerDotnet": "/opt/scaleset/runner-dotnet/dotnet",
+  "runnerChild": "/opt/scaleset/runner-child",
+  "workScratch": "/work",
+  "helloEndpoint": "https://fixture.lambda-url.ap-southeast-2.on.aws/"
+}
