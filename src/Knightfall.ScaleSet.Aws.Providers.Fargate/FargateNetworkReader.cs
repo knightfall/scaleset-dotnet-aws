@@ -19,7 +19,7 @@ public sealed class FargateNetworkReader
     internal string? Region => _client.Config.RegionEndpoint?.SystemName ?? _client.Config.AuthenticationRegion;
 
     internal async Task<(ImmutableArray<FargateSubnet> Subnets, DateTimeOffset SubnetSampleStartedAt)> ReadAsync(
-        NetworkConfiguration network, TimeProvider clock, CancellationToken cancellationToken)
+        NetworkConfiguration network, string account, TimeProvider clock, CancellationToken cancellationToken)
     {
         if (network.Subnets.Length is 0 or > 16 || network.SecurityGroupIds.Length is 0 or > 5)
         {
@@ -37,7 +37,7 @@ public sealed class FargateNetworkReader
         var byId = new Dictionary<string, Subnet>(StringComparer.Ordinal);
         foreach (var subnet in subnets.Subnets)
         {
-            if (subnet is not { State.Value: "available", SubnetId: not null } || subnet.VpcId != network.VpcId ||
+            if (subnet is not { State.Value: "available", SubnetId: not null, MapPublicIpOnLaunch: false } || subnet.VpcId != network.VpcId ||
                 subnet.AvailableIpAddressCount < 0 || !byId.TryAdd(subnet.SubnetId, subnet))
             {
                 return default;
@@ -68,6 +68,10 @@ public sealed class FargateNetworkReader
             {
                 return default;
             }
+        }
+        if (!await Ec2NetworkEvidence.HasPrivateRoutesAsync(_client, network, account, cancellationToken).ConfigureAwait(false))
+        {
+            return default;
         }
         return (verified.MoveToImmutable(), subnetSampleStartedAt);
     }

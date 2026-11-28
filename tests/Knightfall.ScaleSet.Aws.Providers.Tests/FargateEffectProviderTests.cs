@@ -67,6 +67,31 @@ public sealed class FargateEffectProviderTests
     }
 
     [Fact]
+    public async Task ReplayRechecksTheOriginalPrivateNetworkWithoutReadmittingReservedCapacity()
+    {
+        var token = TestContext.Current.CancellationToken;
+        using var aws = new FargateInspectionFixture();
+        var adapter = await AdapterAsync(aws, token);
+        var original = Launch();
+        var request = Assert.IsType<FargateLaunchEffectRequest>(original.Request);
+        aws.Ip1 = 0;
+        aws.Ip2 = 0;
+        Assert.False(Assert.IsType<EffectDispatchPrecondition>(await adapter.CheckAsync(original, Catalog, token)).Eligible);
+        Assert.True(await ReplayEligible(original));
+        Assert.False(await ReplayEligible(Rebind(request with { SubnetIds = ["subnet-0123456789abcdef9"] })));
+        Assert.False(await ReplayEligible(Rebind(request with { SecurityGroupIds = ["sg-0123456789abcdef9"] })));
+
+        aws.RouteTables = aws.RouteTables.Replace("<gatewayId>local", "<gatewayId>igw-0123456789abcdef0", StringComparison.Ordinal);
+        Assert.False(await ReplayEligible(original));
+        Assert.DoesNotContain(aws.Requests, request => Operation(request) == "RunTask");
+
+        async Task<bool> ReplayEligible(EffectEnvelope envelope) =>
+            Assert.IsType<EffectDispatchPrecondition>(await adapter.CheckReplayAsync(envelope, Catalog, token)).Eligible;
+        EffectEnvelope Rebind(FargateLaunchEffectRequest candidate) => EffectEnvelope.Create(Scope, original.IntentId,
+            1, candidate, original.EarliestPossibleFirstSend, original.ProviderReplayDeadline);
+    }
+
+    [Fact]
     public async Task ExactRunTaskWireUsesOnlyCanonicalPinnedInputsAndReadsBackTheTaskWithTags()
     {
         var token = TestContext.Current.CancellationToken;
