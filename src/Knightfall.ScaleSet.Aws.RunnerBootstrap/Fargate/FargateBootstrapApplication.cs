@@ -3,6 +3,7 @@ using Amazon.SecurityToken;
 using Knightfall.ScaleSet.Aws.Core.Configuration;
 using Knightfall.ScaleSet.Aws.Core.Lifecycle;
 using Knightfall.ScaleSet.Aws.DynamoDb;
+using Microsoft.Extensions.Logging;
 using Knightfall.ScaleSet.Aws.Handoff;
 
 namespace Knightfall.ScaleSet.Aws.RunnerBootstrap.Fargate;
@@ -61,7 +62,7 @@ internal sealed record FargateBootstrapSettings(
             segment.All(character => char.IsAsciiLetterOrDigit(character) || character is '-' or '_' or '.' or '+' or '=' or ',' or '@'));
 }
 
-internal sealed class FargateBootstrapApplication(FargateBootstrapSettings settings, TimeProvider clock)
+internal sealed class FargateBootstrapApplication(FargateBootstrapSettings settings, TimeProvider clock, ILogger? logger = null)
 {
     private int _spent;
 
@@ -76,7 +77,7 @@ internal sealed class FargateBootstrapApplication(FargateBootstrapSettings setti
         var offers = new DynamoDbBootstrapOfferClient(ddb, settings.TableName, principal.AwsUserId, principal.TaskArn, clock);
         var bootstrap = new RunnerBootstrap(offers, target, principal.TaskArn, principal.AwsUserId,
             () => Interlocked.Exchange(ref _spent, 1) == 0, runner, clock, TimeSpan.FromMinutes(2), TimeSpan.FromSeconds(1),
-            registerHello, validateProviderBinding: principal.MatchesOffer, telemetryProvider: RunnerProvisionerType.Fargate);
+            registerHello, observe: null, principal.MatchesOffer, RunnerProvisionerType.Fargate, logger);
         return await bootstrap.RunAsync(cancellationToken).ConfigureAwait(false);
     }
 }
