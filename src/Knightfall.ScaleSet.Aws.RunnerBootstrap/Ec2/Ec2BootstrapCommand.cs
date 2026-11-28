@@ -66,8 +66,9 @@ internal static class Ec2BootstrapCommand
             BootstrapLog.Write(logger, BootstrapLog.Ec2CleanupIncomplete);
             return 1;
         }
-        catch (Exception error) when (error is InvalidDataException or IOException or ArgumentException or JsonException or Win32Exception or
-                                      AmazonClientException or AmazonServiceException or InvalidOperationException or UnauthorizedAccessException)
+        catch (Exception error) when (error is InvalidDataException or IOException or HttpRequestException or ArgumentException or JsonException or Win32Exception or
+                                      AmazonClientException or AmazonServiceException or InvalidOperationException or UnauthorizedAccessException or
+                                      OperationCanceledException)
         {
             BootstrapLog.Write(logger, BootstrapLog.Ec2Failed);
             return 1;
