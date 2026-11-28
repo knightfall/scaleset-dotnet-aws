@@ -41,9 +41,10 @@ internal static class FargateBootstrapIdentity
         Guid.TryParseExact(value.AsSpan(CredentialsPrefix.Length), "D", out var id) && id != Guid.Empty;
 
     internal static async Task<FargateTaskIdentity> ReadAsync(string? metadataEndpoint, HttpClient metadata,
-        IAmazonSecurityTokenService sts, FargateIdentityExpectation expected, TimeProvider clock, CancellationToken cancellationToken)
+        IAmazonSecurityTokenService sts, FargateIdentityExpectation expected, TimeProvider clock, CancellationToken cancellationToken,
+        bool allowLoopback = false)
     {
-        var endpoint = ParseMetadataEndpoint(metadataEndpoint);
+        var endpoint = ParseMetadataEndpoint(metadataEndpoint, allowLoopback);
         using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(8), clock);
         using var linked = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, timeout.Token);
         var token = linked.Token;
@@ -89,14 +90,14 @@ internal static class FargateBootstrapIdentity
         return new FargateTaskIdentity(taskArn, definition, awsUserId);
     }
 
-    internal static Uri ParseMetadataEndpoint(string? value)
+    internal static Uri ParseMetadataEndpoint(string? value, bool allowLoopback = false)
     {
         // Only the ECS IPv4 authority and the explicit numeric loopback used by the integration fixture.
         if (value is not { Length: > 0 and <= 256 } || !value.StartsWith("http://", StringComparison.Ordinal) ||
             value.Contains('%') || value.Contains('\\') || value.Any(char.IsWhiteSpace) ||
             !Uri.TryCreate(value, UriKind.Absolute, out var endpoint) || endpoint.AbsoluteUri != value ||
             endpoint.UserInfo.Length != 0 || endpoint.Query.Length != 0 || endpoint.Fragment.Length != 0 ||
-            (endpoint.Host != "127.0.0.1" && (endpoint.Host != "169.254.170.2" || !endpoint.IsDefaultPort)) ||
+            !((endpoint.Host == "169.254.170.2" && endpoint.IsDefaultPort) || (allowLoopback && endpoint.Host == "127.0.0.1")) ||
             !endpoint.AbsolutePath.StartsWith(MetadataPrefix, StringComparison.Ordinal))
         {
             throw InvalidIdentity();
