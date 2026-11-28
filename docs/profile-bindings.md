@@ -53,7 +53,7 @@ The report should include `build-ec2` and `build-fargate`, no performed AWS insp
 
 ## Qualify imported encryption keys
 
-Keep the existing stack-owned S3 destination and tracking table defaults. Use the optional `--encryption` input on both `node bin/controller.ts` and `deploy:controller` when supplying customer-managed keys for imported resources. The JSON accepts only the applicable entries below. Each entry names a literal key ARN in the deployment account and Region. Keep the file with the reviewed deployment inputs. Key ARNs are nonsecret.
+Keep the existing stack-owned S3 destination and tracking table defaults. Use the optional `--encryption` input on both `node bin/controller.ts` and `deploy:controller` when supplying customer-managed keys for imported resources. Supply a regular UTF-8 JSON file of at most 64 KiB. A leading UTF-8 BOM is accepted. The JSON accepts only the applicable entries below. Each entry names a literal key ARN in the deployment account and Region. Keep the file with the reviewed deployment inputs. Key ARNs are nonsecret.
 
 ```json
 {
