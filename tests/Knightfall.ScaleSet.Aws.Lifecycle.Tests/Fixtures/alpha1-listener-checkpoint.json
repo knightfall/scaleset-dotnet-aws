@@ -1,0 +1,125 @@
+{
+    "Checkpoint": {
+        "SessionKey": {
+            "Scope": "github.com/owner/repository",
+            "ScaleSetId": 9007199254740993,
+            "SessionId": "51688c9f-f017-4a9a-b59f-77ed34074c1b"
+        },
+        "SchemaVersion": 1,
+        "Revision": 5,
+        "TransitionId": "46b2e442-d7cb-4099-ac83-5a80f15d621e",
+        "InitialStatisticsCompleted": true,
+        "LastAcknowledgedMessageId": null,
+        "Pending": {
+            "Delivery": {
+                "SessionKey": {
+                    "Scope": "github.com/owner/repository",
+                    "ScaleSetId": 9007199254740993,
+                    "SessionId": "51688c9f-f017-4a9a-b59f-77ed34074c1b"
+                },
+                "Kind": 1,
+                "ObservedAt": "2050-01-01T23:04:05.0012345-04:00",
+                "Message": {
+                    "MessageId": 17,
+                    "Statistics": {
+                        "totalAvailableJobs": 0,
+                        "totalAcquiredJobs": 0,
+                        "totalAssignedJobs": 0,
+                        "totalRunningJobs": 0,
+                        "totalRegisteredRunners": 0,
+                        "totalBusyRunners": 0,
+                        "totalIdleRunners": 5
+                    },
+                    "JobAvailableMessages": [
+                        {
+                            "MessageType": "JobAvailable",
+                            "acquireJobUrl": "",
+                            "messageType": "JobAvailable",
+                            "runnerRequestId": 9007199254740993,
+                            "repositoryName": "",
+                            "ownerName": "",
+                            "jobId": "",
+                            "jobWorkflowRef": "",
+                            "jobDisplayName": "",
+                            "workflowRunId": 0,
+                            "eventName": "",
+                            "requestLabels": [
+                                "\u03b1",
+                                "linux"
+                            ],
+                            "queueTime": "2050-01-01T23:04:05.0012345-04:00",
+                            "scaleSetAssignTime": "0001-01-01T00:00:00+00:00",
+                            "runnerAssignTime": "0001-01-01T00:00:00+00:00",
+                            "finishTime": "0001-01-01T00:00:00+00:00"
+                        }
+                    ],
+                    "JobAssignedMessages": [
+                        {
+                            "MessageType": "JobAssigned",
+                            "messageType": "JobAssigned",
+                            "runnerRequestId": 9007199254740994,
+                            "repositoryName": "",
+                            "ownerName": "",
+                            "jobId": "",
+                            "jobWorkflowRef": "",
+                            "jobDisplayName": "Compile",
+                            "workflowRunId": 0,
+                            "eventName": "",
+                            "requestLabels": null,
+                            "queueTime": "0001-01-01T00:00:00+00:00",
+                            "scaleSetAssignTime": "2050-01-01T23:04:05.0012345-04:00",
+                            "runnerAssignTime": "0001-01-01T00:00:00+00:00",
+                            "finishTime": "0001-01-01T00:00:00+00:00"
+                        }
+                    ],
+                    "JobStartedMessages": [
+                        {
+                            "MessageType": "JobStarted",
+                            "runnerId": 15,
+                            "runnerName": "runner",
+                            "messageType": "JobStarted",
+                            "runnerRequestId": 9007199254740995,
+                            "repositoryName": "",
+                            "ownerName": "",
+                            "jobId": "",
+                            "jobWorkflowRef": "",
+                            "jobDisplayName": "",
+                            "workflowRunId": 0,
+                            "eventName": "",
+                            "requestLabels": null,
+                            "queueTime": "0001-01-01T00:00:00+00:00",
+                            "scaleSetAssignTime": "0001-01-01T00:00:00+00:00",
+                            "runnerAssignTime": "2050-01-01T23:04:05.0012345-04:00",
+                            "finishTime": "0001-01-01T00:00:00+00:00"
+                        }
+                    ],
+                    "JobCompletedMessages": [
+                        {
+                            "MessageType": "JobCompleted",
+                            "result": "success",
+                            "runnerId": 16,
+                            "runnerName": "",
+                            "messageType": "JobCompleted",
+                            "runnerRequestId": 9007199254740996,
+                            "repositoryName": "",
+                            "ownerName": "",
+                            "jobId": "",
+                            "jobWorkflowRef": "",
+                            "jobDisplayName": "",
+                            "workflowRunId": 0,
+                            "eventName": "",
+                            "requestLabels": null,
+                            "queueTime": "0001-01-01T00:00:00+00:00",
+                            "scaleSetAssignTime": "0001-01-01T00:00:00+00:00",
+                            "runnerAssignTime": "0001-01-01T00:00:00+00:00",
+                            "finishTime": "2050-01-01T23:04:05.0012345-04:00"
+                        }
+                    ]
+                },
+                "InitialStatistics": null
+            },
+            "Phase": 2
+        }
+    },
+    "AcknowledgmentSha256": "f1f94fa28de8b6a9def97e40071344fd2b68230a835407b3ab664f7a1632112c"
+}

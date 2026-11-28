@@ -4,21 +4,21 @@
     "net10.0": {
       "Knightfall.ScaleSet.Client": {
         "type": "Direct",
-        "requested": "[0.1.0-alpha.1, 0.1.0-alpha.1]",
-        "resolved": "0.1.0-alpha.1",
-        "contentHash": "Uxbespe0X2hwS8A3QRCYQcjOMx8rSUI7DIdnaJEp0h1POFG90bmp1i+uhzEouW2qCWn7P3PypHXDnNr+j5OKvA==",
+        "requested": "[0.1.0-alpha.2, 0.1.0-alpha.2]",
+        "resolved": "0.1.0-alpha.2",
+        "contentHash": "T84fbEG2crAD1UAdme4usDXgmSqRVRfSeaN5/sVRmgZuwl1BzN1cupwfHLYfp6ZbSxNjWYo53DGwvWLZ+qb/Yg==",
         "dependencies": {
-          "Microsoft.Extensions.Logging.Abstractions": "11.0.0"
+          "Microsoft.Extensions.Logging.Abstractions": "10.0.15"
         }
       },
       "Knightfall.ScaleSet.Listener": {
         "type": "Direct",
-        "requested": "[0.1.0-alpha.1, 0.1.0-alpha.1]",
-        "resolved": "0.1.0-alpha.1",
-        "contentHash": "fBRrk2Oo4O5kqn4Oh8nSL2iMNbq49sSroVeXXdcSByte3mb+etCBmsCSun8mucjBRa6prrZljONbsNAEe4/I/g==",
+        "requested": "[0.1.0-alpha.2, 0.1.0-alpha.2]",
+        "resolved": "0.1.0-alpha.2",
+        "contentHash": "BtAHOaebb9x/So0NJZn9DJkd07aDFeuHCJgy3np5EaGAj1EcRiOz8YEL1ll1H+yu66hi//nP0JhLwl1NQjsm0A==",
         "dependencies": {
-          "Knightfall.ScaleSet.Client": "0.1.0-alpha.1",
-          "Microsoft.Extensions.Logging.Abstractions": "11.0.0"
+          "Knightfall.ScaleSet.Client": "0.1.0-alpha.2",
+          "Microsoft.Extensions.Logging.Abstractions": "10.0.15"
         }
       },
       "Roslynator.Analyzers": {
@@ -29,22 +29,16 @@
       },
       "Microsoft.Extensions.DependencyInjection.Abstractions": {
         "type": "Transitive",
-        "resolved": "11.0.0",
-        "contentHash": "a2c4Kp55miXT6G+DSb75pczXQJHgNMzPyZEyMxrrKxuQrgvctcDWJWD9fVe/uGbQdu4Z0c3B7AVKp1DXmD64nQ=="
-      },
-      "System.Diagnostics.DiagnosticSource": {
-        "type": "Transitive",
-        "resolved": "11.0.0",
-        "contentHash": "+boRR9uSKiIPtFeRLGwO5xylhDF80xpwM+dmk5jgIqqeUKLbujGkGICMTKqQrBzKO6fIp8BU8DV6YZkQukqo3A=="
+        "resolved": "10.0.15",
+        "contentHash": "KczR2nV7ooeimtZxAawPht/FJUHnX+uoWy7y4pba+iaRQBwUM2NwtiqZg+/FpZDHUf2RkkzveGkhMTWDNzmDUA=="
       },
       "Microsoft.Extensions.Logging.Abstractions": {
         "type": "CentralTransitive",
         "requested": "[11.0.0, 11.0.0]",
-        "resolved": "11.0.0",
-        "contentHash": "MTMO2V1eT9Dm5VIpJGLNwIjAjoBErUlfuB+DEaZ0tb8J+Nf/Xlj8he5AztK9p1iOJPIyuBeOrVy2u/CSdsfzPw==",
+        "resolved": "10.0.15",
+        "contentHash": "s5xzXGWqqlmmThMnQ1rnmL7QLwbluB2JqX9NaK8C9HPuHzN7kfmiddTRbwts5rQssATkh2B18RrofjeUD8g14A==",
         "dependencies": {
-          "Microsoft.Extensions.DependencyInjection.Abstractions": "11.0.0",
-          "System.Diagnostics.DiagnosticSource": "11.0.0"
+          "Microsoft.Extensions.DependencyInjection.Abstractions": "10.0.15"
         }
       }
     }

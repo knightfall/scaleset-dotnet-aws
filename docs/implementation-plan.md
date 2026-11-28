@@ -9,7 +9,7 @@ the [release process](releases/PUBLISHING.md) for distributing controller images
 
 ## 1. API and repository baseline
 
-`scaleset-dotnet-aws` targets `.NET 10` (`net10.0`) with [AGENTS.md](../AGENTS.md) as the repository contract. Pin the published `Knightfall.ScaleSet.Client` and `Knightfall.ScaleSet.Listener` packages to exact version `0.1.0-alpha.1` from `scaleset.NET` release `v0.1.0-alpha.1`, source commit `a0bc2060715767bff0f1a22a9f328689ed363493`. The [released dependency baseline](dependency-baseline.md) records artifact identities, verification instructions, supported APIs, and qualification limits. Consume the release from NuGet.org with Central Package Management (`Directory.Packages.props`) and committed lock files; the earlier candidate-feed/project-reference bootstrap is retired. The SDK wire baseline tracks `actions/scaleset` at `716908e5`.
+`scaleset-dotnet-aws` targets `.NET 10` (`net10.0`) with [AGENTS.md](../AGENTS.md) as the repository contract. Pin the published `Knightfall.ScaleSet.Client` and `Knightfall.ScaleSet.Listener` packages to the exact version recorded in the [released dependency baseline](dependency-baseline.md), along with its artifact identities, verification instructions, supported APIs, and qualification limits. Consume the release from NuGet.org with Central Package Management (`Directory.Packages.props`) and committed lock files. The SDK wire baseline tracks `actions/scaleset` at `716908e5`.
 
 | Concern | Inspected API and design implication |
 | --- | --- |

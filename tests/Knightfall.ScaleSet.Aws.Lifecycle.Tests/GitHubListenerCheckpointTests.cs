@@ -363,6 +363,41 @@ public sealed class GitHubListenerCheckpointTests
         await Assert.ThrowsAsync<InvalidDataException>(() => store.ReadAsync(store.SessionKey, cancellation));
     }
 
+    [Fact]
+    public async Task Alpha1AcknowledgingCheckpointRequiresRecoveryWithoutAnotherDelete()
+    {
+        var cancellation = TestContext.Current.CancellationToken;
+        using var table = await MiniStackTable.CreateAsync(cancellation);
+        var (store, fence) = await CreateCheckpointStoreAsync(table, cancellation);
+        var initial = InitialCheckpoint(store.SessionKey);
+        Assert.Equal(ScaleSetListenerCheckpointWriteResult.Committed,
+            await store.WriteAsync(store.SessionKey, null, initial, cancellation));
+
+        // Captured with the published alpha.1 packages after a simulated lost DELETE response.
+        var fixture = Path.Combine(AppContext.BaseDirectory, "Fixtures", "alpha1-listener-checkpoint.json");
+        var payload = await File.ReadAllTextAsync(fixture, cancellation);
+        using var document = JsonDocument.Parse(payload);
+        var checkpoint = document.RootElement.GetProperty("Checkpoint");
+        var row = await table.ReadAsync(LifecycleKey.Checkpoint(fence.Identity.Profile, SessionId), cancellation);
+        row["revision"].N = checkpoint.GetProperty("Revision").GetRawText();
+        row["transitionId"].S = checkpoint.GetProperty("TransitionId").GetGuid().ToString("D");
+        row["payload"].S = payload;
+        await table.Client.PutItemAsync(table.Name, row, cancellation);
+
+        var read = Assert.IsType<ScaleSetListenerCheckpoint>(await store.ReadAsync(store.SessionKey, cancellation));
+        Assert.True(JsonElement.DeepEquals(checkpoint, JsonSerializer.SerializeToElement(read)));
+        var queue = new QueueSession();
+        var pump = CreatePump(store, store.SessionKey, queue, new CheckpointClock(),
+            (_, _) => throw new InvalidOperationException("The stored delivery must not be handled again."));
+
+        table.Wire.Clear();
+        Assert.Equal(new(ScaleSetListenerStepStatus.RecoveryRequired, 17, ScaleSetListenerPendingPhase.Acknowledging),
+            await pump.StepAsync(cancellation));
+        Assert.Empty(queue.Polls);
+        Assert.Empty(queue.Deletes);
+        Assert.Empty(CheckpointWrites(table, fence));
+    }
+
     private static async Task<(GitHubListenerCheckpointStore Store, OwnedSessionFence Fence)> CreateCheckpointStoreAsync(
         MiniStackTable table, CancellationToken cancellation)
     {

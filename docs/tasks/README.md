@@ -47,11 +47,10 @@ The [OpenTelemetry integration plan](../opentelemetry-integration.md) expands T1
 
 ## Cross-repo `scaleset.NET` dependencies
 
-- **Released Client and Listener for T01/T02/T09**: Pin both packages to exact
-  `0.1.0-alpha.1` from the published `v0.1.0-alpha.1` release, source commit
-  `a0bc2060715767bff0f1a22a9f328689ed363493`. The
-  [dependency baseline](../dependency-baseline.md) records the manifest and
-  archive hashes, registry verification, extension contracts, and recovery scope.
+- **Released Client and Listener for T01/T02/T09** use the exact package versions
+  in the [dependency baseline](../dependency-baseline.md), which records the
+  manifest and archive hashes, registry verification, extension contracts, and
+  recovery scope.
   T02 verifies the public package boundary; T09 implements the DynamoDB
   checkpoint adapter, replay-safe handler, operation policy, and serialized
   supervisor lane around `ScaleSetListenerPump.StepAsync`.

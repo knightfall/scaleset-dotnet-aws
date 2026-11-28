@@ -13,11 +13,12 @@ internal sealed class GitHubWire(
     internal const string RegistrationToken = "synthetic-registration-token";
     internal const string AdminToken = "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJleHAiOjQwNzA5MDg4MDB9.test-signature";
     internal const string QueueToken = "synthetic-queue-token";
-    internal const string ServiceHost = "actions.example.test";
+    internal const string ServiceHost = "service-fixture.actions.githubusercontent.com";
     internal const string ServicePath = "/tenant";
-    internal const string QueueHost = "queue.example.test";
+    internal const string QueueHost = "queue-fixture.actions.githubusercontent.com";
     internal const string QueuePath = "/messages/synthetic-queue";
-    internal const string QueueUrl = "https://" + QueueHost + QueuePath + "?signature=synthetic-queue-signature";
+    private const string QueueQuery = "?signature=synthetic-queue-signature";
+    internal const string QueueUrl = "https://" + QueueHost + QueuePath + QueueQuery;
     internal const long SetId = 7_000_000_001;
     internal const long GroupId = 8_000_000_002;
     internal const long RunnerId = 9_000_000_003;
@@ -50,8 +51,9 @@ internal sealed class GitHubWire(
         }
         if (observation.Uri.AbsolutePath == "/actions/runner-registration")
         {
+            string host = ActionsHosts(observation.Uri.Host).Service;
             return Json(HttpStatusCode.OK, $$"""
-                {"url":"https://{{ServiceHost}}{{ServicePath}}","token":"{{AdminToken}}"}
+                {"url":"https://{{host}}{{ServicePath}}","token":"{{AdminToken}}"}
                 """);
         }
 
@@ -64,12 +66,28 @@ internal sealed class GitHubWire(
     internal static Task<HttpResponseMessage> Reply(HttpStatusCode status, string body) =>
         Task.FromResult(Json(status, body));
 
-    internal static string SessionJson(Guid? sessionId = null) =>
-        $$"""
-        {"sessionId":"{{sessionId ?? SessionId}}","ownerName":"owner",
-        "messageQueueUrl":"{{QueueUrl}}","messageQueueAccessToken":"{{QueueToken}}",
-        "statistics":{"totalAssignedJobs":3} }
-        """;
+    internal static string SessionJson(Guid? sessionId = null, GitHubTarget? target = null)
+    {
+        string queueUrl = target is null
+            ? QueueUrl
+            : $"https://{ActionsHosts(target.ApiBaseUri.Host).Queue}{QueuePath}{QueueQuery}";
+        return $$"""
+            {"sessionId":"{{sessionId ?? SessionId}}","ownerName":"owner",
+            "messageQueueUrl":"{{queueUrl}}","messageQueueAccessToken":"{{QueueToken}}",
+            "statistics":{"totalAssignedJobs":3} }
+            """;
+    }
+
+    private static (string Service, string Queue) ActionsHosts(string apiHost)
+    {
+        if (!apiHost.EndsWith(".ghe.com", StringComparison.OrdinalIgnoreCase))
+        {
+            return (ServiceHost, QueueHost);
+        }
+
+        string tenant = apiHost["api.".Length..];
+        return ($"service-fixture.actions.{tenant}", $"queue-fixture.actions.{tenant}");
+    }
 
     internal static ScaleSetClient Connect(HttpClient http, TimeProvider clock, ScaleSetClientOptions? options = null) =>
         new(GitHubTarget.Parse("https://github.com/owner/repository"), ScaleSetCredentials.FromPersonalAccessToken(Pat),
