@@ -4,6 +4,7 @@ using Serilog;
 using Serilog.Configuration;
 using Serilog.Core;
 using Serilog.Events;
+using Serilog.Formatting.Json;
 using Serilog.Parsing;
 
 namespace Knightfall.ScaleSet.Aws.Controller.Telemetry;
@@ -16,7 +17,8 @@ internal sealed class SafeTelemetryLogSink(TelemetryPrivacy privacy, TelemetryEx
     private static readonly MessageTemplate OperationTemplate = new MessageTemplateParser().Parse(TelemetryNames.EventTemplate);
     private static readonly MessageTemplate OtherTemplate = new MessageTemplateParser().Parse("Controller diagnostic event");
     private readonly ConsoleTelemetryQueue _console = new(console ??
-        LoggerSinkConfiguration.CreateSink(configuration => configuration.Console(formatProvider: CultureInfo.InvariantCulture)), deadline);
+        LoggerSinkConfiguration.CreateSink(configuration =>
+            configuration.Console(new JsonFormatter(renderMessage: true, formatProvider: CultureInfo.InvariantCulture))), deadline);
     private ILogEventSink? _remote;
     private int _pending;
     private int _stopped;
@@ -94,7 +96,7 @@ internal sealed class SafeTelemetryLogSink(TelemetryPrivacy privacy, TelemetryEx
             properties.Add(Property("profile", profile));
             properties.Add(Property("provider", provider!));
         }
-        return new LogEvent(log.Timestamp, log.Level, null, known ? OperationTemplate : OtherTemplate, properties,
+        return new LogEvent(log.Timestamp.ToUniversalTime(), log.Level, null, known ? OperationTemplate : OtherTemplate, properties,
             log.TraceId.GetValueOrDefault(), log.SpanId.GetValueOrDefault());
     }
 
