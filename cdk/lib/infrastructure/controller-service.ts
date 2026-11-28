@@ -93,7 +93,10 @@ export function createControllerService(
           : ecs.CpuArchitecture.X86_64,
     },
   });
-  const environment = { ...props.telemetry.environment };
+  const environment: Record<string, string> = {
+    ...props.telemetry.environment,
+    SCALESET_RUNTIME_BUCKET_OWNER: stack.account,
+  };
   if (props.fargatePreflight !== undefined) {
     environment[fargatePreflightEnvironmentName] = props.fargatePreflight;
   }
@@ -103,7 +106,7 @@ export function createControllerService(
       image.slice(digestSeparator + 1),
     ),
     command: [...props.command],
-    environment: Object.keys(environment).length > 0 ? environment : undefined,
+    environment,
     essential: true,
     readonlyRootFilesystem: true,
     stopTimeout: Duration.seconds(90),
@@ -130,12 +133,15 @@ export function createControllerService(
       "ContainerDefinitions.0.Secrets",
       headers.map(({ name, secretArn }) => ({
         Name: name,
-        ValueFrom: secretArn,
+        ValueFrom: `${secretArn}::AWSCURRENT:`,
       })),
     );
     executionRole.addToPolicy(
       new iam.PolicyStatement({
         actions: ["secretsmanager:GetSecretValue"],
+        conditions: {
+          StringEquals: { "secretsmanager:VersionStage": "AWSCURRENT" },
+        },
         resources: [
           ...new Set(headers.map(({ secretArn }) => secretArn)),
         ].sort(),

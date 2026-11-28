@@ -123,6 +123,40 @@ public sealed class RuntimeArtifactTests
         Assert.Equal(Version, HttpUtility.ParseQueryString(request.Uri.Query)["versionId"]);
     }
 
+    [Fact]
+    public async Task VersionedRuntimeReadRequiresConfiguredBucketOwner()
+    {
+        const string account = "111122223333";
+        byte[] bytes = ConfigurationFixtures.Runtime(ConfigurationFixtures.Mixed);
+        using var wire = new VersionedS3Wire(bytes, Version, account);
+        var token = TestContext.Current.CancellationToken;
+        var digest = ConfigurationFixtures.Sha256(bytes);
+        var artifact = RuntimeArtifact.FromS3(S3Uri, Version, digest, account);
+        Assert.Equal(digest, (await RuntimeArtifactLoader.LoadAsync(artifact, _ => wire.CreateClient(), token)).Sha256);
+        Assert.Equal(account, Assert.Single(wire.Requests).ExpectedBucketOwner);
+
+        var other = RuntimeArtifact.FromS3(S3Uri, Version, digest, "999900001111");
+        var denied = await Assert.ThrowsAsync<AmazonS3Exception>(() => RuntimeArtifactLoader.LoadAsync(other, _ => wire.CreateClient(), token));
+        Assert.Equal(HttpStatusCode.Forbidden, denied.StatusCode);
+        Assert.Throws<ArgumentException>(() => RuntimeArtifact.FromS3(S3Uri, Version, digest, "11112222333x"));
+    }
+
+    [Fact]
+    public async Task PinnedRuntimeBucketOwnerMustMatchTheValidatedDeploymentAccount()
+    {
+        const string other = "999900001111";
+        byte[] bytes = ConfigurationFixtures.Runtime(ConfigurationFixtures.Mixed);
+        using var wire = new VersionedS3Wire(bytes, Version, other);
+        var artifact = RuntimeArtifact.FromS3(S3Uri, Version, ConfigurationFixtures.Sha256(bytes), other);
+
+        var error = await Assert.ThrowsAsync<RuntimeConfigurationException>(() =>
+            RuntimeArtifactLoader.LoadAsync(artifact, _ => wire.CreateClient(), TestContext.Current.CancellationToken));
+
+        Assert.Equal("owner", error.Code);
+        Assert.Equal("/spec/aws/account", error.Path);
+        Assert.Equal(other, Assert.Single(wire.Requests).ExpectedBucketOwner);
+    }
+
     [Theory]
     [InlineData(null)]
     [InlineData("different-version")]

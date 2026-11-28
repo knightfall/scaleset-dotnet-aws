@@ -60,6 +60,9 @@ export class RuntimeArtifact extends Construct {
       new iam.PolicyStatement({
         actions: ["s3:GetObject"],
         resources: [sourceArn],
+        conditions: {
+          StringEquals: { "s3:ResourceAccount": Stack.of(this).account },
+        },
       }),
     );
     if (sourceKeyArn)
@@ -68,6 +71,9 @@ export class RuntimeArtifact extends Construct {
       new iam.PolicyStatement({
         actions: ["s3:PutObject"],
         resources: [this.objectArn],
+        conditions: {
+          StringEquals: { "s3:ResourceAccount": Stack.of(this).account },
+        },
       }),
     );
     const provider = new cr.Provider(this, "Provider", {

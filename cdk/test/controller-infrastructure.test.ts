@@ -286,14 +286,25 @@ test("explicit Fargate preflight changes only the controller task definition env
     ContainerDefinitions: Match.arrayWith([
       Match.objectLike({
         Name: "Controller",
-        Environment: [{ Name: "SCALESET_FARGATE_PREFLIGHT", Value: raw }],
+        Environment: [
+          {
+            Name: "SCALESET_RUNTIME_BUCKET_OWNER",
+            Value: config.runtime.spec.aws.account,
+          },
+          { Name: "SCALESET_FARGATE_PREFLIGHT", Value: raw },
+        ],
       }),
     ]),
   });
   defaultTemplate.hasResourceProperties("AWS::ECS::TaskDefinition", {
     ContainerDefinitions: Match.arrayWith([
       Match.objectLike({
-        Environment: Match.absent(),
+        Environment: [
+          {
+            Name: "SCALESET_RUNTIME_BUCKET_OWNER",
+            Value: config.runtime.spec.aws.account,
+          },
+        ],
       }),
     ]),
   });
@@ -304,7 +315,12 @@ test("explicit Fargate preflight changes only the controller task definition env
   ) as {
     Properties: { ContainerDefinitions: [{ Environment?: unknown }] };
   };
-  delete task.Properties.ContainerDefinitions[0].Environment;
+  task.Properties.ContainerDefinitions[0].Environment = [
+    {
+      Name: "SCALESET_RUNTIME_BUCKET_OWNER",
+      Value: config.runtime.spec.aws.account,
+    },
+  ];
   assert.deepEqual(wholeTemplate, defaultTemplate.toJSON());
 });
 
@@ -323,7 +339,13 @@ test("refreshable Fargate quota grants the controller only one same-account S3 o
     ContainerDefinitions: Match.arrayWith([
       Match.objectLike({
         Name: "Controller",
-        Environment: [{ Name: "SCALESET_FARGATE_PREFLIGHT", Value: raw }],
+        Environment: [
+          {
+            Name: "SCALESET_RUNTIME_BUCKET_OWNER",
+            Value: config.runtime.spec.aws.account,
+          },
+          { Name: "SCALESET_FARGATE_PREFLIGHT", Value: raw },
+        ],
       }),
     ]),
   });
@@ -388,6 +410,10 @@ test("Fargate preflight is available in inspection mode and refuses unrelated pr
       ContainerDefinitions: Match.arrayWith([
         Match.objectLike({
           Environment: [
+            {
+              Name: "SCALESET_RUNTIME_BUCKET_OWNER",
+              Value: mixed.runtime.spec.aws.account,
+            },
             { Name: "SCALESET_FARGATE_PREFLIGHT", Value: evidence },
           ],
         }),
@@ -584,7 +610,10 @@ test("the versioned artifact and retained tracking table match the runtime contr
     ({ Action }) => Action === "s3:GetObjectVersion",
   );
   assert.deepEqual(read?.Condition, {
-    StringEquals: { "s3:VersionId": version },
+    StringEquals: {
+      "s3:VersionId": version,
+      "s3:ResourceAccount": config.runtime.spec.aws.account,
+    },
   });
   const command = JSON.stringify(
     template.findOutputs("ControllerTaskArguments"),

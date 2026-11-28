@@ -228,6 +228,32 @@ public sealed class DryRunCommandTests
     }
 
     [Theory]
+    [InlineData(null, null, 0)]
+    [InlineData("111122223333", "111122223333", 0)]
+    [InlineData("444455556666", "111122223333", 1)]
+    [InlineData("444455556666", "444455556666", 1)]
+    public async Task PinnedRuntimeGetUsesTheConfiguredBucketOwner(string? expectedOwner, string? bucketOwner, int expectedExit)
+    {
+        byte[] config = ConfigurationFixtures.Runtime(ConfigurationFixtures.Mixed);
+        using var wire = new VersionedS3Wire(config, RuntimeArtifactTests.Version, bucketOwner);
+        await using var stdout = new StringWriter(CultureInfo.InvariantCulture);
+        await using var stderr = new StringWriter(CultureInfo.InvariantCulture);
+        int exit = await DryRunCommand.RunAsync(
+            ["reconcile", "--config-s3-uri", RuntimeArtifactTests.S3Uri, "--config-version-id", RuntimeArtifactTests.Version,
+             "--sha256", ConfigurationFixtures.Sha256(config), "--dry-run", "--once"],
+            stdout, stderr, _ => wire.CreateClient(), name => name == "SCALESET_RUNTIME_BUCKET_OWNER" ? expectedOwner : null,
+            inspectInventory: null, timeProvider: null, TestContext.Current.CancellationToken);
+
+        var request = Assert.Single(wire.Requests);
+        Assert.Equal(HttpMethod.Get, request.Method);
+        Assert.Equal(expectedOwner, request.ExpectedBucketOwner);
+        Assert.Equal(RuntimeArtifactTests.Version, HttpUtility.ParseQueryString(request.Uri.Query)["versionId"]);
+        Assert.Equal(expectedExit, exit);
+        Assert.Equal(exit == 0, stdout.ToString().Length > 0);
+        Assert.Equal(exit == 0, stderr.ToString().Length == 0);
+    }
+
+    [Theory]
     [InlineData(false)]
     [InlineData(true)]
     public async Task ActiveDocumentCanOnlyInvokeTheOptionalReadOnlyInventoryGraph(bool inspect)

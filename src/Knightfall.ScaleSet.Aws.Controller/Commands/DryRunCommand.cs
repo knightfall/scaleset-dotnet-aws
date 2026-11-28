@@ -56,9 +56,11 @@ public static class DryRunCommand
 
         try
         {
+            readEnvironment ??= Environment.GetEnvironmentVariable;
             var artifact = options.ConfigPath is { } path
                 ? RuntimeArtifact.FromLocal(path, options.ExpectedSha256)
-                : RuntimeArtifact.FromS3(options.S3Uri!, options.VersionId!, options.ExpectedSha256!);
+                : RuntimeArtifact.FromS3(options.S3Uri!, options.VersionId!, options.ExpectedSha256!,
+                    readEnvironment("SCALESET_RUNTIME_BUCKET_OWNER"));
             var (configuration, telemetry) = await RuntimeInput.LoadAsync(
                 artifact, null, createS3Client, readEnvironment, cancellationToken);
             await using var pipeline = TelemetryPipeline.Start(telemetry, stderr);

@@ -153,16 +153,26 @@ for (const mode of ["active", "dry-run"] as const) {
             "https://metrics.example.invalid/custom",
           OTEL_EXPORTER_OTLP_METRICS_TIMEOUT: "2500",
           OTEL_EXPORTER_OTLP_LOGS_PROTOCOL: "http/protobuf",
+          SCALESET_RUNTIME_BUCKET_OWNER: aws.account,
         }).map(([Name, Value]) => ({ Name, Value })),
       );
       assert.deepEqual(container.Secrets, [
-        { Name: "OTEL_EXPORTER_OTLP_HEADERS", ValueFrom: commonSecret },
-        { Name: "OTEL_EXPORTER_OTLP_TRACES_HEADERS", ValueFrom: tracesSecret },
+        {
+          Name: "OTEL_EXPORTER_OTLP_HEADERS",
+          ValueFrom: `${commonSecret}::AWSCURRENT:`,
+        },
+        {
+          Name: "OTEL_EXPORTER_OTLP_TRACES_HEADERS",
+          ValueFrom: `${tracesSecret}::AWSCURRENT:`,
+        },
         {
           Name: "OTEL_EXPORTER_OTLP_METRICS_HEADERS",
-          ValueFrom: metricsSecret,
+          ValueFrom: `${metricsSecret}::AWSCURRENT:`,
         },
-        { Name: "OTEL_EXPORTER_OTLP_LOGS_HEADERS", ValueFrom: logsSecret },
+        {
+          Name: "OTEL_EXPORTER_OTLP_LOGS_HEADERS",
+          ValueFrom: `${logsSecret}::AWSCURRENT:`,
+        },
       ]);
       const execution = statements(template, "ControllerExecutionRole");
       const extra = execution.filter(({ Action }) =>
@@ -178,6 +188,9 @@ for (const mode of ["active", "dry-run"] as const) {
           Action: "secretsmanager:GetSecretValue",
           Effect: "Allow",
           Resource: [commonSecret, logsSecret, metricsSecret, tracesSecret],
+          Condition: {
+            StringEquals: { "secretsmanager:VersionStage": "AWSCURRENT" },
+          },
         },
         ...[commonSecret, metricsSecret].map((secretArn) => ({
           Action: "kms:Decrypt",
@@ -212,7 +225,9 @@ for (const mode of ["active", "dry-run"] as const) {
           ),
         );
       assert.equal(taskContainer(baseline).Secrets, undefined);
-      assert.equal(taskContainer(baseline).Environment, undefined);
+      assert.deepEqual(taskContainer(baseline).Environment, [
+        { Name: "SCALESET_RUNTIME_BUCKET_OWNER", Value: aws.account },
+      ]);
       assert.deepEqual(template.toJSON().Outputs, baseline.toJSON().Outputs);
       const unaffectedResources = (source: Template) =>
         Object.fromEntries(
@@ -474,6 +489,7 @@ test("telemetry and explicit Fargate preflight coexist in the same controller co
     const container = taskContainer(template);
     assert.deepEqual(container.Environment, [
       { Name: "OTEL_SERVICE_NAME", Value: "coexisting-controller" },
+      { Name: "SCALESET_RUNTIME_BUCKET_OWNER", Value: aws.account },
       { Name: "SCALESET_FARGATE_PREFLIGHT", Value: fargatePreflight },
     ]);
     assert.equal(container.Secrets, undefined);
@@ -557,7 +573,9 @@ test("the protected deploy prepares a candidate with the same validated telemetr
               (taskContainer(template).Secrets as { ValueFrom: string }[]).map(
                 ({ ValueFrom }) => ValueFrom,
               ),
-              [commonSecret, tracesSecret, metricsSecret, logsSecret],
+              [commonSecret, tracesSecret, metricsSecret, logsSecret].map(
+                (arn) => `${arn}::AWSCURRENT:`,
+              ),
             );
             checkRuntimeAsset(assembly, compiled);
             return {

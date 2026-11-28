@@ -23,11 +23,18 @@ public sealed class RuntimeArtifact
         return new RuntimeArtifact(Path.GetFullPath(path), expectedSha256, null);
     }
 
-    public static RuntimeArtifact FromS3(string uri, string versionId, string expectedSha256)
+    public static RuntimeArtifact FromS3(string uri, string versionId, string expectedSha256) =>
+        FromS3(uri, versionId, expectedSha256, null);
+
+    public static RuntimeArtifact FromS3(string uri, string versionId, string expectedSha256, string? expectedBucketOwner)
     {
+        if (expectedBucketOwner is not null && (expectedBucketOwner.Length != 12 || !expectedBucketOwner.All(char.IsAsciiDigit)))
+        {
+            throw new ArgumentException("The runtime bucket owner must be a twelve-digit AWS account ID.", nameof(expectedBucketOwner));
+        }
         ArgumentException.ThrowIfNullOrWhiteSpace(expectedSha256);
         ValidateDigest(expectedSha256);
-        return new RuntimeArtifact(null, expectedSha256, VersionedS3Artifact.Parse(uri, versionId));
+        return new RuntimeArtifact(null, expectedSha256, VersionedS3Artifact.Parse(uri, versionId, expectedBucketOwner));
     }
 
     private static void ValidateDigest(string? sha256)
@@ -51,7 +58,7 @@ internal sealed record VersionedS3Artifact(string Bucket, string Key, string Ver
             snapshot.VersionId, account);
     }
 
-    internal static VersionedS3Artifact Parse(string uri, string versionId)
+    internal static VersionedS3Artifact Parse(string uri, string versionId, string? expectedBucketOwner)
     {
         ArgumentNullException.ThrowIfNull(uri);
         if (string.IsNullOrWhiteSpace(versionId) || versionId == "null" || versionId.Length > 1_024 ||
@@ -91,6 +98,6 @@ internal sealed record VersionedS3Artifact(string Bucket, string Key, string Ver
         {
             throw new ArgumentException("The S3 object key contains a control character.", nameof(uri));
         }
-        return new VersionedS3Artifact(bucket, key, versionId);
+        return new VersionedS3Artifact(bucket, key, versionId, expectedBucketOwner);
     }
 }
