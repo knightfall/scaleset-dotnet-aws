@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.Diagnostics.Metrics;
+using System.Globalization;
 using System.Net;
 using System.Net.Sockets;
 using System.Text;
@@ -13,8 +14,10 @@ using Knightfall.ScaleSet.Aws.DynamoDb;
 using Knightfall.ScaleSet.Aws.Handoff;
 using Knightfall.ScaleSet.Aws.RunnerBootstrap;
 using Knightfall.ScaleSet.Aws.RunnerBootstrap.Ec2;
+using Knightfall.ScaleSet.Aws.RunnerBootstrap.Fargate;
 using Knightfall.ScaleSet.Aws.RunnerBootstrap.Linux;
 using Knightfall.ScaleSet.Aws.SdkContract.Tests.Aws;
+using Microsoft.Extensions.Logging;
 using Xunit;
 using OneJobBootstrap = Knightfall.ScaleSet.Aws.RunnerBootstrap.RunnerBootstrap;
 
@@ -475,6 +478,355 @@ public sealed class Ec2BootstrapTests
             [".credentials_rsaparams"] = Convert.ToBase64String("fixture-private-bytes"u8),
         };
         return Encoding.ASCII.GetBytes(Convert.ToBase64String(JsonSerializer.SerializeToUtf8Bytes(members)));
+    }
+
+    [Theory]
+    [InlineData(true, false, 1001)]
+    [InlineData(false, false, 1002)]
+    [InlineData(false, true, 1002)]
+    public async Task StatusDiagnosticsPreserveRunnerOutcomeAndNeverExposeObservationData(bool timeout, bool failLogger, int eventId)
+    {
+        var token = TestContext.Current.CancellationToken;
+        var clock = new StatusClock();
+        using var plaintext = OpenFixtureOffer(clock, out var hello, out string offerId);
+        var logger = new StatusLogger(failLogger);
+        var observed = new List<bool>();
+        var pending = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var runner = new FixtureRunner();
+
+        var result = await OneJobBootstrap.RunOneJobAsync(runner, plaintext, hello, offerId, ObserveAsync,
+            clock, token, RunnerProvisionerType.Ec2, logger);
+        pending.TrySetResult();
+
+        Assert.Equal(new OneJobCompletion(17, 0), result);
+        Assert.Equal(1, runner.Starts);
+        Assert.Equal([false, true], observed);
+        var log = Assert.Single(logger.Events);
+        Assert.Equal(eventId, log.Id);
+        Assert.Equal(LogLevel.Warning, log.Level);
+        Assert.Equal(timeout ? "Bootstrap status timed out." : "Bootstrap status was unavailable.", log.Message);
+        Assert.DoesNotContain(PrivateSentinel, log.Message, StringComparison.Ordinal);
+        Assert.Null(log.Exception);
+
+        Task ObserveAsync(BootstrapRunnerObservation observation, CancellationToken _)
+        {
+            observed.Add(observation.Exited);
+            if (observation.Exited)
+            {
+                return Task.CompletedTask;
+            }
+            if (timeout)
+            {
+                clock.ExpireStatus();
+                return pending.Task;
+            }
+            return Task.FromException(new IOException(PrivateSentinel));
+        }
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task BlockedLoggerDoesNotHoldExitStatusOrRunnerCompletion(bool blockInEnabledCheck)
+    {
+        var token = TestContext.Current.CancellationToken;
+        using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        using var test = CancellationTokenSource.CreateLinkedTokenSource(token, deadline.Token);
+        var clock = new StatusClock();
+        using var plaintext = OpenFixtureOffer(clock, out var hello, out string offerId);
+        using var logger = new BlockedStatusLogger(blockInEnabledCheck);
+        var exitStatus = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var work = OneJobBootstrap.RunOneJobAsync(new FixtureRunner(), plaintext, hello, offerId, ObserveAsync,
+            clock, test.Token, RunnerProvisionerType.Ec2, logger);
+        try
+        {
+            await logger.Entered.Task.WaitAsync(test.Token);
+            await exitStatus.Task.WaitAsync(test.Token);
+            await clock.LogDrainStarted.Task.WaitAsync(test.Token);
+            Assert.False(work.IsCompleted);
+
+            clock.ExpireLogDrain();
+            Assert.Equal(new OneJobCompletion(17, 0), await work.WaitAsync(test.Token));
+            Assert.False(logger.Exited.Task.IsCompleted);
+        }
+        finally
+        {
+            logger.Release.Set();
+            if (logger.Entered.Task.IsCompletedSuccessfully)
+            {
+                await logger.Exited.Task.WaitAsync(token);
+            }
+        }
+
+        Task ObserveAsync(BootstrapRunnerObservation observation, CancellationToken _)
+        {
+            if (!observation.Exited)
+            {
+                return Task.FromException(new IOException("The fixture readiness write failed."));
+            }
+            exitStatus.TrySetResult();
+            return Task.CompletedTask;
+        }
+    }
+
+    [Fact]
+    public async Task BootstrapConsoleRoutesFixedDiagnosticsWithoutTouchingProcessStreams()
+    {
+        await using var output = new StringWriter(CultureInfo.InvariantCulture);
+        await using var errors = new StringWriter(CultureInfo.InvariantCulture);
+        await using (var logger = Assert.IsType<BootstrapLogQueue>(
+            BootstrapLogQueue.Start(new BootstrapConsoleLogger(output, errors), new StatusClock())))
+        {
+            BootstrapLog.RunnerConnected(logger);
+            BootstrapLog.RunnerExited(logger);
+            BootstrapLog.StatusUnconfirmed(logger);
+            BootstrapLog.Outcome(logger, RunnerBootstrapOutcome.Completed);
+        }
+
+        Assert.Equal(["One-job runner connected.", "One-job runner exited.", "Completed"],
+            output.ToString().Split(Environment.NewLine, StringSplitOptions.RemoveEmptyEntries));
+        Assert.Equal("Bootstrap status was not confirmed." + Environment.NewLine, errors.ToString());
+    }
+
+    [Theory]
+    [InlineData("ec2-data", "EC2 bootstrap failed.", 1)]
+    [InlineData("ec2-http", "EC2 bootstrap failed.", 1)]
+    [InlineData("ec2-timeout", "EC2 bootstrap failed.", 1)]
+    [InlineData("ec2-stopped", "EC2 bootstrap stopped.", 1)]
+    [InlineData("ec2-teardown", "EC2 supervisor STATUS requires a current boot proof of job process teardown.", 1)]
+    [InlineData("ec2-cleanup", "EC2 runner cleanup was incomplete. Retain the instance for operator recovery.", 1)]
+    [InlineData("fargate-data", "Fargate bootstrap failed.", 1)]
+    [InlineData("fargate-stopped", "Fargate bootstrap stopped.", 1)]
+    [InlineData("fargate-pid", "Fargate bootstrap must run as PID 1.", 1)]
+    [InlineData("usage", "Run RunnerBootstrap on Linux with ec2 or fargate and an absolute settings path.", 2)]
+    public async Task BootstrapCommandFailuresKeepTheFixedStderrMessageAndExitCode(string failure, string message, int exitCode)
+    {
+        await using var output = new StringWriter(CultureInfo.InvariantCulture);
+        await using var errors = new StringWriter(CultureInfo.InvariantCulture);
+
+        Assert.Equal(exitCode, await InvokeFailedCommandAsync(failure, output, errors, new StatusClock())
+            .WaitAsync(TestContext.Current.CancellationToken));
+        Assert.Empty(output.ToString());
+        Assert.Equal(message + Environment.NewLine, errors.ToString());
+    }
+
+    [Theory]
+    [InlineData("ec2-data", "EC2 bootstrap failed.", 1)]
+    [InlineData("fargate-data", "Fargate bootstrap failed.", 1)]
+    [InlineData("fargate-pid", "Fargate bootstrap must run as PID 1.", 1)]
+    [InlineData("usage", "Run RunnerBootstrap on Linux with ec2 or fargate and an absolute settings path.", 2)]
+    public async Task BootstrapCommandFailureReturnsAfterDrainBudgetWithStderrStillBlocked(string failure, string message, int exitCode)
+    {
+        using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        var token = TestContext.Current.CancellationToken;
+        using var test = CancellationTokenSource.CreateLinkedTokenSource(token, deadline.Token);
+        var clock = new StatusClock();
+        await using var errors = new BlockedErrorWriter();
+        var command = InvokeFailedCommandAsync(failure, TextWriter.Null, errors, clock);
+        try
+        {
+            Assert.Equal(message, await errors.Entered.Task.WaitAsync(test.Token));
+            await clock.LogDrainStarted.Task.WaitAsync(test.Token);
+            Assert.False(command.IsCompleted);
+            clock.ExpireLogDrain();
+            Assert.Equal(exitCode, await command.WaitAsync(test.Token));
+            Assert.False(errors.Exited.Task.IsCompleted);
+        }
+        finally
+        {
+            errors.Release.Set();
+            if (errors.Entered.Task.IsCompletedSuccessfully)
+            {
+                await errors.Exited.Task.WaitAsync(token);
+            }
+        }
+    }
+
+    [Theory]
+    [InlineData(false, RunnerBootstrapOutcome.Completed, 0)]
+    [InlineData(false, RunnerBootstrapOutcome.AlreadySpent, 0)]
+    [InlineData(false, RunnerBootstrapOutcome.RunnerFailed, 1)]
+    [InlineData(true, RunnerBootstrapOutcome.Completed, 0)]
+    [InlineData(true, RunnerBootstrapOutcome.AlreadySpent, 1)]
+    public async Task BootstrapCommandOutcomesRemainOnStdout(bool fargate, RunnerBootstrapOutcome outcome, int exitCode)
+    {
+        await using var output = new StringWriter(CultureInfo.InvariantCulture);
+        await using var errors = new StringWriter(CultureInfo.InvariantCulture);
+        var clock = new StatusClock();
+        Func<ILogger?, CancellationToken, Task<RunnerBootstrapOutcome>> run = (_, _) => Task.FromResult(outcome);
+        var command = fargate
+            ? FargateBootstrapCommand.RunWithDiagnosticsAsync(true, run, output, errors, clock, CancellationToken.None)
+            : Ec2BootstrapCommand.RunWithDiagnosticsAsync(run, output, errors, clock, CancellationToken.None);
+
+        Assert.Equal(exitCode, await command.WaitAsync(TestContext.Current.CancellationToken));
+        Assert.Equal(outcome + Environment.NewLine, output.ToString());
+        Assert.Empty(errors.ToString());
+    }
+
+    private static Task<int> InvokeFailedCommandAsync(string failure, TextWriter output, TextWriter errors, TimeProvider clock)
+    {
+        if (failure == "usage")
+        {
+            return BootstrapLog.ReportUsageAsync(errors, clock);
+        }
+
+        var (fargate, isPidOne, error) = failure switch
+        {
+            "ec2-data" => (false, true, (Exception)new InvalidDataException(PrivateSentinel)),
+            "ec2-http" => (false, true, new HttpRequestException(HttpRequestError.SecureConnectionError, PrivateSentinel)),
+            "ec2-timeout" => (false, true, new TaskCanceledException(PrivateSentinel)),
+            "ec2-stopped" => (false, true, new OperationCanceledException(PrivateSentinel)),
+            "ec2-teardown" => (false, true, new RunnerTeardownQualificationException()),
+            "ec2-cleanup" => (false, true, new RunnerCleanupIncompleteException()),
+            "fargate-data" => (true, true, new InvalidDataException(PrivateSentinel)),
+            "fargate-stopped" => (true, true, new OperationCanceledException(PrivateSentinel)),
+            "fargate-pid" => (true, false, new InvalidOperationException("The invalid PID must prevent startup.")),
+            _ => throw new ArgumentOutOfRangeException(nameof(failure)),
+        };
+        var stopping = new CancellationToken(failure is "ec2-stopped" or "fargate-stopped");
+        Func<ILogger?, CancellationToken, Task<RunnerBootstrapOutcome>> run = (_, _) => Task.FromException<RunnerBootstrapOutcome>(error);
+        return fargate
+            ? FargateBootstrapCommand.RunWithDiagnosticsAsync(isPidOne, run, output, errors, clock, stopping)
+            : Ec2BootstrapCommand.RunWithDiagnosticsAsync(run, output, errors, clock, stopping);
+    }
+
+    private sealed class BlockedErrorWriter() : StringWriter(CultureInfo.InvariantCulture)
+    {
+        internal TaskCompletionSource<string?> Entered { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        internal TaskCompletionSource Exited { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        internal ManualResetEventSlim Release { get; } = new(false);
+
+        public override void WriteLine(string? value)
+        {
+            Entered.TrySetResult(value);
+            Release.Wait();
+            Exited.TrySetResult();
+        }
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing)
+            {
+                Release.Dispose();
+            }
+            base.Dispose(disposing);
+        }
+    }
+
+    private static JitPlaintext OpenFixtureOffer(TimeProvider clock, out JitHello hello, out string offerId)
+    {
+        var identity = new JitHandoffIdentity(Target.Deployment, Target.ProfileId, Target.ScopeIdentity, Target.ScaleSetId!.Value,
+            Guid.NewGuid(), Arn, Guid.NewGuid(), Principal);
+        using var recipient = JitRecipientKey.Create();
+        hello = recipient.Hello;
+        var binding = JitOfferBinding.Create(identity, hello.BootNonce, clock.GetUtcNow().AddSeconds(20));
+        offerId = binding.OfferId;
+        var offer = JitOfferCryptography.Seal(binding, hello, FixtureJit("ss-" + offerId[..48]), clock);
+        return recipient.Open(offer, identity, clock);
+    }
+
+    private sealed class StatusLogger(bool fail) : ILogger
+    {
+        internal List<(int Id, LogLevel Level, string Message, Exception? Exception)> Events { get; } = [];
+
+        public bool IsEnabled(LogLevel logLevel) => true;
+
+        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+
+        public void Log<TState>(LogLevel logLevel, EventId eventId, TState state, Exception? exception,
+            Func<TState, Exception?, string> formatter)
+        {
+            Events.Add((eventId.Id, logLevel, formatter(state, exception), exception));
+            if (fail)
+            {
+                throw new IOException("Fixture logger failed.");
+            }
+        }
+    }
+
+    private sealed class StatusClock : TimeProvider
+    {
+        private Action? _expire;
+        private Action? _expireLogDrain;
+
+        internal TaskCompletionSource LogDrainStarted { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public override DateTimeOffset GetUtcNow() => MiniStackTable.Now;
+
+        public override ITimer CreateTimer(TimerCallback callback, object? state, TimeSpan dueTime, TimeSpan period)
+        {
+            Assert.Equal(Timeout.InfiniteTimeSpan, period);
+            if (dueTime == BootstrapLogQueue.DrainBudget)
+            {
+                _expireLogDrain = () => callback(state);
+                LogDrainStarted.TrySetResult();
+            }
+            else
+            {
+                Assert.Equal(TimeSpan.FromSeconds(30), dueTime);
+                _expire = () => callback(state);
+            }
+            return new StatusTimer();
+        }
+
+        internal void ExpireLogDrain()
+        {
+            var expire = Interlocked.Exchange(ref _expireLogDrain, null) ?? throw new InvalidOperationException("No log drain timer.");
+            expire();
+        }
+
+        internal void ExpireStatus()
+        {
+            var expire = Interlocked.Exchange(ref _expire, null) ?? throw new InvalidOperationException("No status timer.");
+            expire();
+        }
+
+        private sealed class StatusTimer : ITimer
+        {
+            public bool Change(TimeSpan dueTime, TimeSpan period) => true;
+
+            public void Dispose()
+            {
+            }
+
+            public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+        }
+    }
+
+    private sealed class BlockedStatusLogger(bool blockInEnabledCheck) : ILogger, IDisposable
+    {
+        internal TaskCompletionSource Entered { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        internal TaskCompletionSource Exited { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        internal ManualResetEventSlim Release { get; } = new(false);
+
+        public bool IsEnabled(LogLevel logLevel)
+        {
+            if (blockInEnabledCheck)
+            {
+                Block();
+            }
+            return true;
+        }
+
+        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+
+        public void Log<TState>(LogLevel logLevel, EventId eventId, TState state, Exception? exception,
+            Func<TState, Exception?, string> formatter)
+        {
+            if (!blockInEnabledCheck)
+            {
+                Block();
+            }
+        }
+
+        public void Dispose() => Release.Dispose();
+
+        private void Block()
+        {
+            Entered.TrySetResult();
+            Release.Wait();
+            Exited.TrySetResult();
+        }
     }
 
     private static async Task WaitForFirstConditionalDeleteAsync(MiniStackTable table, CancellationToken cancellationToken)

@@ -3,6 +3,7 @@ using Knightfall.ScaleSet.Aws.Core.Configuration;
 using Knightfall.ScaleSet.Aws.Core.Lifecycle;
 using Knightfall.ScaleSet.Aws.DynamoDb;
 using Knightfall.ScaleSet.Aws.Handoff;
+using Microsoft.Extensions.Logging;
 
 namespace Knightfall.ScaleSet.Aws.RunnerBootstrap;
 
@@ -45,10 +46,22 @@ public sealed class RunnerBootstrap(
     TimeSpan offerWait,
     TimeSpan pollDelay,
     Func<JitHello, CancellationToken, Task<LifecycleWriteOutcome>> registerHello,
-    Func<BootstrapRunnerObservation, CancellationToken, Task>? observe = null,
-    Func<JitHandoffIdentity, bool>? validateProviderBinding = null,
-    RunnerProvisionerType? telemetryProvider = null)
+    Func<BootstrapRunnerObservation, CancellationToken, Task>? observe,
+    Func<JitHandoffIdentity, bool>? validateProviderBinding,
+    RunnerProvisionerType? telemetryProvider,
+    ILogger? logger)
 {
+    public RunnerBootstrap(DynamoDbBootstrapOfferClient offers, RunnerBootstrapTarget target, string resourceArn,
+        string awsUserId, Func<bool> reserveSpent, IOneJobRunner runner, TimeProvider clock, TimeSpan offerWait,
+        TimeSpan pollDelay, Func<JitHello, CancellationToken, Task<LifecycleWriteOutcome>> registerHello,
+        Func<BootstrapRunnerObservation, CancellationToken, Task>? observe = null,
+        Func<JitHandoffIdentity, bool>? validateProviderBinding = null,
+        RunnerProvisionerType? telemetryProvider = null)
+        : this(offers, target, resourceArn, awsUserId, reserveSpent, runner, clock, offerWait, pollDelay, registerHello,
+            observe, validateProviderBinding, telemetryProvider, logger: null)
+    {
+    }
+
     public async Task<RunnerBootstrapOutcome> RunAsync(CancellationToken cancellationToken)
     {
         if (offerWait <= TimeSpan.Zero || pollDelay <= TimeSpan.Zero || pollDelay > offerWait)
@@ -101,15 +114,17 @@ public sealed class RunnerBootstrap(
         {
             diagnostics.Authenticated();
             var result = await RunOneJobAsync(runner, plaintext, hello, offer.Binding.OfferId, observe, clock, cancellationToken,
-                telemetryProvider).ConfigureAwait(false);
+                telemetryProvider, logger).ConfigureAwait(false);
             return result.ExitCode == 0 ? RunnerBootstrapOutcome.Completed : RunnerBootstrapOutcome.RunnerFailed;
         }
     }
 
     internal static async Task<OneJobCompletion> RunOneJobAsync(IOneJobRunner runner, JitPlaintext plaintext, JitHello hello,
         string offerId, Func<BootstrapRunnerObservation, CancellationToken, Task>? observe, TimeProvider clock,
-        CancellationToken cancellationToken, RunnerProvisionerType? telemetryProvider = null)
+        CancellationToken cancellationToken, RunnerProvisionerType? telemetryProvider = null, ILogger? logger = null)
     {
+        await using var logQueue = BootstrapLogQueue.Start(logger, clock);
+        var diagnosticsLogger = logQueue ?? logger;
         long startedAt = clock.GetTimestamp();
         var ready = new TaskCompletionSource<(long Id, long At)?>(TaskCreationOptions.RunContinuationsAsynchronously);
         using var runnerLifetime = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
@@ -183,13 +198,13 @@ public sealed class RunnerBootstrap(
                 }
                 if (budget.IsCancellationRequested)
                 {
-                    Console.Error.WriteLine("Bootstrap status timed out.");
+                    BootstrapLog.Write(diagnosticsLogger, BootstrapLog.StatusTimedOut);
                 }
             }
             catch (Exception)
             {
                 // Telemetry must never replace the outcome of the observed one-job process.
-                Console.Error.WriteLine("Bootstrap status was unavailable.");
+                BootstrapLog.Write(diagnosticsLogger, BootstrapLog.StatusUnavailable);
             }
         }
     }

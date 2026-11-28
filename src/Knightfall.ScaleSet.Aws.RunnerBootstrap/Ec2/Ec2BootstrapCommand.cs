@@ -4,12 +4,13 @@ using System.Runtime.Versioning;
 using System.Text.Json;
 using Amazon.Runtime;
 using Knightfall.ScaleSet.Aws.RunnerBootstrap.Linux;
+using Microsoft.Extensions.Logging;
 
 namespace Knightfall.ScaleSet.Aws.RunnerBootstrap.Ec2;
 
-[SupportedOSPlatform("linux")]
 internal static class Ec2BootstrapCommand
 {
+    [SupportedOSPlatform("linux")]
     internal static async Task<int> RunAsync(string configurationPath)
     {
         using var stopping = new CancellationTokenSource();
@@ -18,7 +19,10 @@ internal static class Ec2BootstrapCommand
             context.Cancel = true;
             stopping.Cancel();
         });
-        try
+        return await RunWithDiagnosticsAsync(RunBootstrapAsync, Console.Out, Console.Error, TimeProvider.System, stopping.Token)
+            .ConfigureAwait(false);
+
+        async Task<RunnerBootstrapOutcome> RunBootstrapAsync(ILogger? logger, CancellationToken token)
         {
             if (!LinuxFiles.IsRoot() || !LinuxFiles.IsTrustedFile(configurationPath, ownerOnly: true))
             {
@@ -33,29 +37,40 @@ internal static class Ec2BootstrapCommand
             }
             var settings = JsonSerializer.Deserialize<Ec2BootstrapSettings>(document, BootstrapJson.Options) ??
                 throw new IOException("The EC2 bootstrap settings file is empty.");
-            var outcome = await new Ec2BootstrapApplication(settings, TimeProvider.System).RunAsync(stopping.Token);
-            Console.WriteLine(outcome);
+            return await new Ec2BootstrapApplication(settings, TimeProvider.System, logger).RunAsync(token).ConfigureAwait(false);
+        }
+    }
+
+    internal static async Task<int> RunWithDiagnosticsAsync(Func<ILogger?, CancellationToken, Task<RunnerBootstrapOutcome>> run,
+        TextWriter output, TextWriter errors, TimeProvider clock, CancellationToken stopping)
+    {
+        await using var logger = BootstrapLogQueue.Start(new BootstrapConsoleLogger(output, errors), clock);
+        try
+        {
+            var outcome = await run(logger, stopping).ConfigureAwait(false);
+            BootstrapLog.Write(logger, target => BootstrapLog.Outcome(target, outcome));
             return outcome is RunnerBootstrapOutcome.Completed or RunnerBootstrapOutcome.AlreadySpent ? 0 : 1;
         }
         catch (OperationCanceledException) when (stopping.IsCancellationRequested)
         {
-            Console.Error.WriteLine("EC2 bootstrap stopped.");
+            BootstrapLog.Write(logger, BootstrapLog.Ec2Stopped);
             return 1;
         }
         catch (RunnerTeardownQualificationException)
         {
-            Console.Error.WriteLine("EC2 supervisor STATUS requires a current boot proof of job process teardown.");
+            BootstrapLog.Write(logger, BootstrapLog.Ec2TeardownUnqualified);
             return 1;
         }
         catch (RunnerCleanupIncompleteException)
         {
-            Console.Error.WriteLine("EC2 runner cleanup was incomplete. Retain the instance for operator recovery.");
+            BootstrapLog.Write(logger, BootstrapLog.Ec2CleanupIncomplete);
             return 1;
         }
-        catch (Exception error) when (error is IOException or ArgumentException or JsonException or Win32Exception or
-                                      AmazonClientException or AmazonServiceException or InvalidOperationException or UnauthorizedAccessException)
+        catch (Exception error) when (error is InvalidDataException or IOException or HttpRequestException or ArgumentException or JsonException or Win32Exception or
+                                      AmazonClientException or AmazonServiceException or InvalidOperationException or UnauthorizedAccessException or
+                                      OperationCanceledException)
         {
-            Console.Error.WriteLine("EC2 bootstrap failed.");
+            BootstrapLog.Write(logger, BootstrapLog.Ec2Failed);
             return 1;
         }
     }

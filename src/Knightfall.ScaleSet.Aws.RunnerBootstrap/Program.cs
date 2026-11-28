@@ -1,3 +1,4 @@
+using Knightfall.ScaleSet.Aws.RunnerBootstrap;
 using Knightfall.ScaleSet.Aws.RunnerBootstrap.Ec2;
 using Knightfall.ScaleSet.Aws.RunnerBootstrap.Fargate;
 
@@ -13,5 +14,4 @@ if (OperatingSystem.IsLinux() && args is [var mode, var configuration])
     }
 }
 
-Console.Error.WriteLine("Run RunnerBootstrap on Linux with ec2 or fargate and an absolute settings path.");
-return 2;
+return await BootstrapLog.ReportUsageAsync(Console.Error, TimeProvider.System);
