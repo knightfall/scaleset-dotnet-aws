@@ -1,4 +1,6 @@
 using System.Diagnostics;
+using System.Net;
+using System.Net.Sockets;
 using System.Runtime.Versioning;
 using System.Text;
 using System.Text.Json;
@@ -16,11 +18,25 @@ internal static class FargateLinuxCheck
     private const string User = "AROAFIXTURETASK000001:00112233445566778899aabbccddeeff";
     private const string Name = "ss-fixture";
     private const string Work = "/work";
-    private static readonly FargateBootstrapSettings Settings = new("111122223333", "ap-southeast-2",
-        "111122223333:ap-southeast-2:fixture", "runner", "https://github.com/fixture/repo", "fixture",
-        "arn:aws:ecs:ap-southeast-2:111122223333:cluster/fixture", "fixture", "runner",
-        "arn:aws:iam::111122223333:role/fixture", "AROAFIXTURETASK000001", "/opt/scaleset/runner",
-        "/opt/scaleset/runner-dotnet/dotnet", "/opt/scaleset/runner-child", Work);
+    private const string SettingsPath = "/opt/scaleset/fargate-bootstrap.json";
+    private static readonly FargateBootstrapSettings Settings =
+        JsonSerializer.Deserialize<FargateBootstrapSettings>(File.ReadAllText(SettingsPath), BootstrapJson.Options)!;
+
+    internal static async Task<int> VerifyProductionMetadataRejectionAsync()
+    {
+        if (!LinuxFiles.HasFargateRunnerIdentity() || !LinuxFiles.IsTrustedFile(SettingsPath, ownerOnly: false))
+            throw new InvalidOperationException("The fixture requires valid production bootstrap settings and identity.");
+        _ = Settings.Validate();
+        using var listener = new TcpListener(IPAddress.Loopback, 0);
+        listener.Start();
+        int port = ((IPEndPoint)listener.LocalEndpoint).Port;
+        Environment.SetEnvironmentVariable("ECS_CONTAINER_METADATA_URI_V4", $"http://127.0.0.1:{port}/v4/fixture");
+        Environment.SetEnvironmentVariable("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI", "/v2/credentials/" + Guid.NewGuid().ToString("D"));
+        int result = await FargateBootstrapCommand.RunAsync(SettingsPath);
+        if (result != 1 || listener.Pending())
+            throw new InvalidOperationException("The production command did not reject loopback before transport.");
+        return 0;
+    }
 
     internal static async Task<int> RunAsync()
     {

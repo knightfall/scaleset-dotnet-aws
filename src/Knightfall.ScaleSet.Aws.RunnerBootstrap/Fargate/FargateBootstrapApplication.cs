@@ -67,10 +67,11 @@ internal sealed class FargateBootstrapApplication(FargateBootstrapSettings setti
 
     internal async Task<RunnerBootstrapOutcome> RunAsync(string? metadataEndpoint, HttpClient metadata,
         IAmazonSecurityTokenService sts, IAmazonDynamoDB ddb, IOneJobRunner runner,
-        Func<JitHello, CancellationToken, Task<LifecycleWriteOutcome>> registerHello, CancellationToken cancellationToken)
+        Func<JitHello, CancellationToken, Task<LifecycleWriteOutcome>> registerHello, CancellationToken cancellationToken,
+        bool allowLoopback = false)
     {
         var target = settings.Validate();
-        var principal = await FargateBootstrapIdentity.ReadAsync(metadataEndpoint, metadata, sts, settings.Identity, clock, cancellationToken)
+        var principal = await FargateBootstrapIdentity.ReadAsync(metadataEndpoint, metadata, sts, settings.Identity, clock, cancellationToken, allowLoopback)
             .ConfigureAwait(false);
         var offers = new DynamoDbBootstrapOfferClient(ddb, settings.TableName, principal.AwsUserId, principal.TaskArn, clock);
         var bootstrap = new RunnerBootstrap(offers, target, principal.TaskArn, principal.AwsUserId,

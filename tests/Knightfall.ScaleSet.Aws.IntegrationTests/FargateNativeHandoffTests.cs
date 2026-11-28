@@ -227,7 +227,7 @@ public sealed class FargateNativeHandoffTests
         string secondMetadata = metadata.ForTask(second.Identity.ResourceArn).AbsoluteUri;
         await Assert.ThrowsAsync<InvalidDataException>(() => new FargateBootstrapApplication(settings, aws.Clock)
             .RunAsync(firstMetadata, metadataHttp, secondSts, secondDdb, first.Job,
-                static (_, _) => throw new InvalidOperationException("Bootstrap registered with unverified identity."), token));
+                static (_, _) => throw new InvalidOperationException("Bootstrap registered with unverified identity."), token, allowLoopback: true));
         Assert.DoesNotContain(aws.Wire.Requests, request => request.Operation is "PutItem" or "DeleteItem");
 
         var firstApp = new FargateBootstrapApplication(settings, aws.Clock);
@@ -235,10 +235,10 @@ public sealed class FargateNativeHandoffTests
         using var bootstrapCancellation = CancellationTokenSource.CreateLinkedTokenSource(token);
         var firstExit = firstApp.RunAsync(firstMetadata, metadataHttp, firstSts, firstDdb, first.Job,
             (hello, cancellation) => BrokerHelloFixture.RegisterAsync(aws.Table.Client, aws.Table.Name,
-                first.Identity.AwsUserId, hello, aws.Clock, cancellation), bootstrapCancellation.Token);
+                first.Identity.AwsUserId, hello, aws.Clock, cancellation), bootstrapCancellation.Token, allowLoopback: true);
         var secondExit = secondApp.RunAsync(secondMetadata, metadataHttp, secondSts, secondDdb, second.Job,
             (hello, cancellation) => BrokerHelloFixture.RegisterAsync(aws.Table.Client, aws.Table.Name,
-                second.Identity.AwsUserId, hello, aws.Clock, cancellation), bootstrapCancellation.Token);
+                second.Identity.AwsUserId, hello, aws.Clock, cancellation), bootstrapCancellation.Token, allowLoopback: true);
         try
         {
             await Task.WhenAll(WaitForHelloAsync(aws, first, firstExit, token), WaitForHelloAsync(aws, second, secondExit, token));
