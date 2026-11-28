@@ -1,14 +1,20 @@
 import { randomUUID } from "node:crypto";
 import {
+  closeSync,
+  constants,
+  fstatSync,
   lstatSync,
   mkdirSync,
-  readFileSync,
+  openSync,
   renameSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
+import type { Stats } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
+import { parseYaml } from "../config/yaml.ts";
+import { readDeploymentDocument } from "./deployment-document.ts";
 
 export interface DeploymentAttempt {
   readonly identity: string;
@@ -35,8 +41,7 @@ export function recoveryFile(directory?: string): string {
   return resolve(state, `${randomUUID()}.json`);
 }
 
-function readState(path: string): unknown {
-  const state = lstatSync(path);
+function requirePrivateState(state: Stats): void {
   if (
     !state.isFile() ||
     (state.mode & 0o077) !== 0 ||
@@ -46,7 +51,44 @@ function readState(path: string): unknown {
       "Deployment recovery evidence must be a private file owned by the current user.",
     );
   }
-  return JSON.parse(readFileSync(path, "utf8"));
+}
+
+function readState(path: string): unknown {
+  const state = lstatSync(path);
+  requirePrivateState(state);
+  const fd = openSync(
+    path,
+    constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
+  );
+  let bytes: Buffer | undefined;
+  try {
+    const opened = fstatSync(fd);
+    requirePrivateState(opened);
+    if (opened.dev !== state.dev || opened.ino !== state.ino) {
+      throw new Error("Deployment recovery evidence changed while opening it.");
+    }
+    bytes = readDeploymentDocument(fd);
+  } finally {
+    closeSync(fd);
+  }
+  if (bytes === undefined) {
+    throw new Error("Deployment recovery evidence exceeds 64 KiB.");
+  }
+  let source: string;
+  try {
+    source = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(
+      bytes,
+    );
+  } catch {
+    throw new Error("Deployment recovery evidence must be valid UTF-8.");
+  }
+  try {
+    const value: unknown = JSON.parse(source);
+    parseYaml(source); // Also reject duplicate JSON members.
+    return value;
+  } catch {
+    throw new Error("Deployment recovery evidence is malformed.");
+  }
 }
 
 export function readAttempt(path: string): DeploymentAttempt {

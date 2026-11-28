@@ -57,7 +57,8 @@ the backend separately to confirm usable data. [OTLP response semantics](https:/
 
 ### Configure ECS and header secrets
 
-Save the following as a strict JSON file such as `telemetry.json`. Use the
+Save the following as a strict UTF-8 JSON file such as `telemetry.json`. The
+file must be at most 64 KiB and contain unique object member names. Use the
 account, Region, receiver DNS name, and exact secret ARN for the deployment.
 This example uses gRPC. Test a TLS listener that supports HTTP/2.
 
