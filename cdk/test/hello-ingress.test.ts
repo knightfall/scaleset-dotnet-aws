@@ -198,9 +198,11 @@ test("invalid or disabled requests perform no write and disclose no payload", as
   });
 });
 
-test("concurrent principals replay lost responses without rewriting HELLO or expiry", async () => {
+test("EC2 and Fargate sharing a role replay lost responses without rewriting another principal’s HELLO or expiry", async () => {
   const burst = Array.from({ length: 8 }, (_, index) => {
-    const id = (index + 1).toString(16).padStart(32, "0");
+    const suffix = (index + 1).toString(16);
+    const id =
+      index < 4 ? `i-${suffix.padStart(17, "0")}` : suffix.padStart(32, "0");
     return {
       id,
       body: JSON.stringify(payload()),
@@ -229,6 +231,8 @@ test("concurrent principals replay lost responses without rewriting HELLO or exp
     burst.map(({ body, id }) => handle(event(body, id))),
   );
   assert.ok(retries.every(({ statusCode }) => statusCode === 204));
+  const crossed = await handle(event(burst[0]!.body, burst[4]!.id));
+  assert.equal(crossed.statusCode, 409);
   assert.deepEqual(rows, receipts);
   assert.equal(calls.putAttempts, burst.length);
   assert.equal(calls.writes, burst.length);
