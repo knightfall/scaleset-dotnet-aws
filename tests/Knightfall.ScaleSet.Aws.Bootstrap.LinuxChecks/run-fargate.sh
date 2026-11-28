@@ -81,6 +81,11 @@ if rejection=$(run_fixture --init "$image" /fixture/Knightfall.ScaleSet.Aws.Runn
     exit 1
 fi
 
+run_fixture --user 1001:0 "$image" /fixture/Knightfall.ScaleSet.Aws.Bootstrap.LinuxChecks.dll fargate-rejected-identity
+run_fixture --group-add 0 "$image" /fixture/Knightfall.ScaleSet.Aws.Bootstrap.LinuxChecks.dll fargate-rejected-identity
+run_fixture --group-add 999 "$image" /fixture/Knightfall.ScaleSet.Aws.Bootstrap.LinuxChecks.dll fargate-rejected-identity
+run_fixture --cap-add NET_BIND_SERVICE "$image" /fixture/Knightfall.ScaleSet.Aws.Bootstrap.LinuxChecks.dll fargate-rejected-identity
+
 case "$output" in
     *offline-fargate-jit-sentinel*|*offline-parent-credential-sentinel*|*offline-parent-jit-sentinel*) exit 1 ;;
 esac

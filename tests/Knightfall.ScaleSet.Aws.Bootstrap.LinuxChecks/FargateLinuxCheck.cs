@@ -24,11 +24,12 @@ internal static class FargateLinuxCheck
 
     internal static async Task<int> RunAsync()
     {
-        if (LinuxFiles.IsRoot() || Environment.ProcessId != 1)
+        if (!LinuxFiles.HasFargateRunnerIdentity() || Environment.ProcessId != 1)
         {
             throw new InvalidOperationException("The Fargate fixture must run as non-root PID 1.");
         }
         LinuxFiles.DisableCoreDumps();
+        VerifyRunnerIdentity();
         VerifyReadOnlyMountEvidence();
         VerifyReadOnlyCleanup();
         Environment.SetEnvironmentVariable("AWS_SESSION_TOKEN", "offline-parent-credential-sentinel");
@@ -47,6 +48,36 @@ internal static class FargateLinuxCheck
         }
         Console.WriteLine("Fargate offline PID 1, read-only mount evidence, RAM cleanup, pinned launcher, thread-hop privilege guard, one-job and SIGTERM checks passed.");
         return 0;
+    }
+
+    private static void VerifyRunnerIdentity()
+    {
+        const string user = "Uid: 1000 1000 1000 1000";
+        const string group = "Gid: 2147483647 2147483647 2147483647 2147483647";
+        string[] capabilities = ["CapInh:", "CapPrm:", "CapEff:", "CapBnd:", "CapAmb:"];
+        string[] dropped = [.. capabilities.Select(field => field + " 0000000000000000")];
+        if (!LinuxFiles.HasFargateRunnerIdentity([user, group, "Groups:", .. dropped]) ||
+            !LinuxFiles.HasFargateRunnerIdentity([user, group, "Groups: 1000 2147483647", .. dropped]) ||
+            LinuxFiles.HasFargateRunnerIdentity(["Uid: 1000 1000 1000 2147483648", group, "Groups:", .. dropped]) ||
+            LinuxFiles.HasFargateRunnerIdentity([user, "Gid: 0 1000 1000 1000", "Groups:", .. dropped]) ||
+            LinuxFiles.HasFargateRunnerIdentity([user, "Gid: 1000 999 1000 1000", "Groups:", .. dropped]) ||
+            LinuxFiles.HasFargateRunnerIdentity([user, group, "Groups: 1000 999", .. dropped]) ||
+            LinuxFiles.HasFargateRunnerIdentity([user, group, "Groups: 2147483648", .. dropped]) ||
+            LinuxFiles.HasFargateRunnerIdentity([user, group, .. dropped]))
+        {
+            throw new InvalidOperationException("The runtime identity check did not enforce the supported ID range.");
+        }
+        foreach (string field in capabilities)
+        {
+            string[] others = [.. dropped.Where(entry => !entry.StartsWith(field, StringComparison.Ordinal))];
+            if (LinuxFiles.HasFargateRunnerIdentity([user, group, "Groups:", .. others]) ||
+                LinuxFiles.HasFargateRunnerIdentity([user, group, "Groups:", .. others, field]) ||
+                LinuxFiles.HasFargateRunnerIdentity([user, group, "Groups:", .. others, field + " malformed"]) ||
+                LinuxFiles.HasFargateRunnerIdentity([user, group, "Groups:", .. others, field + " 0000000000000001"]))
+            {
+                throw new InvalidOperationException("The runtime identity check accepted missing, malformed, or retained capabilities.");
+            }
+        }
     }
 
     private static void VerifyReadOnlyMountEvidence()

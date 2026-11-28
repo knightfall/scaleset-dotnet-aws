@@ -194,7 +194,7 @@ public sealed class FargatePreflightTests
             case "image": runner["image"] = "docker.io/runner:latest"; break;
             case "nonessential": runner["essential"] = false; break;
             case "restart": runner["restartPolicy"] = new JsonObject { ["enabled"] = true }; break;
-            case "injected-init": runner["linuxParameters"] = new JsonObject { ["initProcessEnabled"] = true }; break;
+            case "injected-init": runner["linuxParameters"]!["initProcessEnabled"] = true; break;
             case "task-pid-mode": aws.TaskDefinition["pidMode"] = "task"; break;
             case "writable-root": runner["readonlyRootFilesystem"] = false; break;
             case "environment": runner["environment"] = JsonNode.Parse("""[{"name":"TOKEN","value":"fixture-plaintext-token"}]"""); break;
@@ -209,14 +209,57 @@ public sealed class FargatePreflightTests
         Assert.Equal(expectedOperations, aws.Requests.Select(Operation));
     }
 
+    [Theory]
+    [InlineData(null)]
+    [InlineData("root")]
+    [InlineData("0")]
+    [InlineData("00")]
+    [InlineData("+0")]
+    [InlineData("1001")]
+    [InlineData("1001:0")]
+    [InlineData("1001:root")]
+    [InlineData("999:1001")]
+    [InlineData("1001:999")]
+    [InlineData("01001:1001")]
+    [InlineData("1001:+1001")]
+    [InlineData("1001: 1001")]
+    [InlineData("1001:1001:1001")]
+    [InlineData("4294967295:1001")]
+    public async Task RequiresExplicitCanonicalRunnerUidAndGid(string? user)
+    {
+        var token = TestContext.Current.CancellationToken;
+        using var aws = new FargateInspectionFixture();
+        var runner = aws.TaskDefinition["containerDefinitions"]![0]!.AsObject();
+        if (user is null) runner.Remove("user");
+        else runner["user"] = user;
+        var result = await aws.Inspector.ResolvePreflightAsync(await ConfigurationAsync(token), Profile, Approval, token);
+        Assert.Equal(FargatePreflightStatus.ContainerUnapproved, result.Status);
+        Assert.Null(result.Task);
+    }
+
+    [Theory]
+    [InlineData(null)]
+    [InlineData("{}")]
+    [InlineData("{\"drop\":[\"NET_RAW\"]}")]
+    [InlineData("{\"drop\":[\"ALL\"],\"add\":[\"SYS_PTRACE\"]}")]
+    public async Task RequiresAllCapabilitiesDroppedWithoutAdditions(string? capabilities)
+    {
+        var token = TestContext.Current.CancellationToken;
+        using var aws = new FargateInspectionFixture();
+        aws.TaskDefinition["containerDefinitions"]![0]!["linuxParameters"]!["capabilities"] =
+            capabilities is null ? null : JsonNode.Parse(capabilities);
+        var result = await aws.Inspector.ResolvePreflightAsync(await ConfigurationAsync(token), Profile, Approval, token);
+        Assert.Equal(FargatePreflightStatus.ContainerUnapproved, result.Status);
+        Assert.Null(result.Task);
+    }
+
     [Fact]
     public async Task ExplicitlyDisabledInitRetainsPrivateContainerPidNamespace()
     {
         var token = TestContext.Current.CancellationToken;
         using var aws = new FargateInspectionFixture();
         var config = await ConfigurationAsync(token);
-        aws.TaskDefinition["containerDefinitions"]![0]!["linuxParameters"] =
-            new JsonObject { ["initProcessEnabled"] = false };
+        aws.TaskDefinition["containerDefinitions"]![0]!["linuxParameters"]!["initProcessEnabled"] = false;
 
         var result = await aws.Inspector.ResolvePreflightAsync(config, Profile, Approval, token);
 

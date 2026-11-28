@@ -4,7 +4,7 @@ Use one essential Linux runner container per task. Build the image with GitHub A
 
 ## Task definition
 
-Use a revision-pinned `FARGATE` task definition with `awsvpc`, the intended task and execution roles, and one essential container. Choose a non-root numeric user, enable `readonlyRootFilesystem`, leave restart disabled, and omit privileged mode, added capabilities, host devices, ECS Exec, and service attachment. Set `stopTimeout` to at least 30 seconds. The bootstrap uses up to 20 seconds to forward SIGTERM and drain the runner process before forced termination.
+Use a revision-pinned `FARGATE` task definition with `awsvpc`, the intended task and execution roles, and one essential container. Specify canonical decimal `uid:gid` values from 1000 through 2147483647, require `linuxParameters.capabilities.drop` to include `ALL`, enable `readonlyRootFilesystem`, leave restart disabled, and omit privileged mode, added capabilities, host devices, ECS Exec, and service attachment. Set `stopTimeout` to at least 30 seconds. The bootstrap uses up to 20 seconds to forward SIGTERM and drain the runner process before forced termination. [Container user and Linux capabilities](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/task_definition_parameters.html) · [Numeric container IDs](https://docs.docker.com/engine/containers/run/#user)
 
 Use the private container PID namespace by omitting `pidMode`. Omit `linuxParameters.initProcessEnabled` or set it to `false`. Set the entrypoint so that the bootstrap itself runs as PID 1 and receives SIGTERM directly. Preflight rejects shared PID namespaces and injected init, and the runtime check rejects a subprocess layout before contacting the HELLO broker. Register a new task definition revision and update the profile's approved revision if a previous deployment used either setting. [ECS task definition parameters](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/task_definition_parameters.html)
 
@@ -24,6 +24,7 @@ For example, set the following fields on the existing task definition. Populate 
       "name": "runner",
       "essential": true,
       "user": "1001:1001",
+      "linuxParameters": { "capabilities": { "drop": ["ALL"] } },
       "readonlyRootFilesystem": true,
       "stopTimeout": 30,
       "entryPoint": ["/opt/scaleset/RunnerBootstrap"],
@@ -35,6 +36,8 @@ For example, set the following fields on the existing task definition. Populate 
   ]
 }
 ```
+
+Before upgrading an active deployment, register the compliant task definition with the rebuilt bootstrap image. Stage it under a fresh profile binding and drain and retire the prior binding with its existing revision and grants. Protected deployment requires the old binding to reach its tombstone before its grants or task definition can be removed. [Profile retirement](operator-runbook.md#add-drain-and-retire-a-profile)
 
 The exact image, entrypoint, command, and scratch path must match the profile's Fargate preflight approval. Omit the task definition's runner `healthCheck` field because the approval covers the bootstrap command. T16 launches one task with no runtime overrides. ECS supplies the metadata and task credential endpoint variables. Do not set environment entries, environment files, or secrets on the runner container.
 
@@ -62,6 +65,8 @@ The binding file contains only nonsecret deployment settings. This example uses 
 }
 ```
 
+Before HELLO, the bootstrap reads its Linux thread credentials. All real, effective, saved, and filesystem UIDs and GIDs, and all supplementary GIDs, must be between 1000 and 2147483647, inclusive. The inheritable, permitted, effective, bounding, and ambient capability sets must all be empty. When staging a replacement revision, remove low-numbered supplementary groups from the runner image and verify the deployed credentials. [Linux process status](https://man7.org/linux/man-pages/man5/proc_pid_status.5.html)
+
 The bootstrap reads the container and task metadata locally, compares both container identities, and checks the exact task ID and role against the caller identity obtained with ECS task credentials. It gets the assigned revision from the task metadata and verifies it through the incarnation in the controller's offer. The task definition can therefore use the same command after registering a new revision. Replacing an IAM task role requires updating the expected role ID and registering the corresponding image/task revision. [Metadata v4](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/task-metadata-endpoint-v4-fargate-response.html), [ECS task role credentials](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/task-iam-roles.html)
 
 Set `helloEndpoint` to the stack output for the configured task role. The bootstrap signs its registration to the role's AWS IAM Function URL. The broker validates the request and stores one conditional HELLO with a server-set expiry. The task role consumes its own `OFFER#${aws:userid}` using conditional `DeleteItem` with `ALL_OLD`. Give the task role zero direct HELLO or `STATUS#` writes, lifecycle-row access, Secrets Manager access, or GitHub administrative credentials. Workflow code may be able to use the same task identity. The controller gets resource death from verified ECS observations and job state from GitHub. See the [HELLO cutover](operator-runbook.md#cut-over-runner-hello-registration) for existing deployments.
@@ -86,7 +91,7 @@ Run the local Fargate Linux fixture with the pinned Linux ARM64 runner and .NET 
 tests/Knightfall.ScaleSet.Aws.Bootstrap.LinuxChecks/run-fargate.sh
 ```
 
-The offline fixture starts the actual pinned listener, worker, and plugin host under the no-execute RAM layout. It tests injected init rejection, effective read-only mount evidence including equal-path fixture records, and RAM cleanup with nested permission changes, symlinks, and repeated disposal. Synthetic one-job and SIGTERM fixtures exercise the launcher, file placement, and cleanup. The SDK fixtures exercise metadata, STS identity, conditional single offer consumption, and the absence of Fargate status writes. T21 verifies synthesized IAM. T24 exercises the Fargate bootstrap application against local ECS and GitHub emulation using fixture AWS clients. The deployed command uses the configured Region and ECS credential endpoint.
+The offline fixture starts the actual pinned listener, worker, and plugin host under the no-execute RAM layout. It tests injected init, out-of-range group IDs, retained capability masks, effective read-only mount evidence including equal-path fixture records, and RAM cleanup with nested permission changes, symlinks, and repeated disposal. Synthetic one-job and SIGTERM fixtures exercise the launcher, file placement, and cleanup. The SDK fixtures exercise metadata, STS identity, conditional single offer consumption, and the absence of Fargate status writes. T21 verifies synthesized IAM. T24 exercises the Fargate bootstrap application against local ECS and GitHub emulation using fixture AWS clients. The deployed command uses the configured Region and ECS credential endpoint.
 
 `make check-integration` exercises the Dockerless Fargate scenario. MiniStack stores the task definitions, clusters, task rows, IAM roles, STS sessions, handoff records, EventBridge rules, and SQS messages. The suite uses the released GitHub client and listener against the loopback TLS simulator. A test transport narrows the ECS emulation gaps in MiniStack 1.5.44. It maps the emulator's UUID spelling to the ECS short task ID, supplies the attached ENI fields for fixture tasks, and holds the native `RunTask` receipt under its exact client token and request bytes for replay. A loopback metadata endpoint serves the native task identity to each bootstrap. A subprocess executes each simulated job. After that process exits, the fixture advances its task to native `STOPPED` and routes an ECS-shaped event through EventBridge to SQS. The consumer reads the exact task back before committing its terminal observation and acknowledging the queue message.
 

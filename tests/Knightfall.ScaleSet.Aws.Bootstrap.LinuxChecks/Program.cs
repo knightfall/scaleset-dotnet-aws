@@ -7,6 +7,12 @@ using Knightfall.ScaleSet.Aws.Handoff;
 using Knightfall.ScaleSet.Aws.RunnerBootstrap;
 using Knightfall.ScaleSet.Aws.RunnerBootstrap.Linux;
 
+if (OperatingSystem.IsLinux() && args is ["fargate-rejected-identity"])
+{
+    if (LinuxFiles.HasFargateRunnerIdentity()) throw new InvalidOperationException("The runner accepted an unsupported runtime identity.");
+    return 0;
+}
+
 if (OperatingSystem.IsLinux() && args is ["fargate"])
 {
     return await FargateLinuxCheck.RunAsync();
