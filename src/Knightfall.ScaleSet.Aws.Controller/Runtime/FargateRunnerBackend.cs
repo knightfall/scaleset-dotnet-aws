@@ -1,12 +1,15 @@
 using System.Collections.Concurrent;
 using System.Collections.Immutable;
 using Knightfall.ScaleSet.Aws.Controller.Configuration;
+using Knightfall.ScaleSet.Aws.Controller.Telemetry;
 using Knightfall.ScaleSet.Aws.Core.Catalog;
 using Knightfall.ScaleSet.Aws.Core.Configuration;
 using Knightfall.ScaleSet.Aws.Core.Lifecycle;
 using Knightfall.ScaleSet.Aws.Core.Planning;
+using Knightfall.ScaleSet.Aws.Core.Telemetry;
 using Knightfall.ScaleSet.Aws.DynamoDb;
 using Knightfall.ScaleSet.Aws.Providers.Fargate;
+using Microsoft.Extensions.Logging;
 
 namespace Knightfall.ScaleSet.Aws.Controller.Runtime;
 
@@ -15,9 +18,10 @@ internal sealed class FargateRunnerBackend(
     FargateRuntimeEvidence evidence, FargateQuotaReader quota, IReadOnlyCollection<LifecycleProfile> deploymentProfiles,
     ConcurrentDictionary<string, FargateInventorySnapshot> deploymentInventory,
     DynamoDbLifecycleStore store, DynamoDbEffectJournal journal, DynamoDbEffectDispatcher dispatcher,
-    TimeProvider clock, EffectDispatcherTiming timing) : IRunnerBackend
+    TimeProvider clock, EffectDispatcherTiming timing, ControllerRuntimeLog? log = null) : IRunnerBackend
 {
     private static readonly TimeSpan DemandFreshness = TimeSpan.FromMinutes(10);
+    private readonly TelemetryProfile? _telemetryProfile = TelemetryProfile.From(profile);
     private FargateResolvedTask? _launchTask;
 
     public IReconciliationEffectProvider Effects { get; } = evidence.ForProfile(profile.Id) is { } approval
@@ -55,6 +59,19 @@ internal sealed class FargateRunnerBackend(
                     deploymentInventory.Values.ToArray());
                 launchHeadroom = headroom.LaunchSlots;
                 _launchTask = approved;
+            }
+            else
+            {
+                var (outcome, reason) = preflight.Status switch
+                {
+                    FargatePreflightStatus.AwsUnavailable => ("unknown", "aws_unavailable"),
+                    FargatePreflightStatus.TaskDefinitionMismatch => ("held", "drift"),
+                    FargatePreflightStatus.NetworkIncompatible => ("held", "network_incompatible"),
+                    FargatePreflightStatus.RoleMismatch => ("held", "role_mismatch"),
+                    FargatePreflightStatus.ContainerUnapproved => ("held", "container_unapproved"),
+                    _ => ("held", "task_definition_incompatible"),
+                };
+                log?.Write(LogLevel.Warning, "task-preflight", outcome, reason, _telemetryProfile, throttle: true);
             }
         }
 
@@ -94,12 +111,13 @@ internal sealed class FargateRunnerBackend(
 
                 if (effect.Entry.State == EffectState.Planned)
                 {
-                    _ = await DispatchFirstLaunchAsync(authority, effect.Entry.Envelope, ownershipLost, cancellationToken).ConfigureAwait(false);
+                    await DispatchFirstLaunchAsync(authority, effect.Entry.Envelope, ownershipLost, cancellationToken).ConfigureAwait(false);
                 }
                 else
                 {
-                    _ = await dispatcher.ReplayFargateLaunchAsync(authority.Lease, authority.Clock, key, intentId,
+                    var dispatch = await dispatcher.ReplayFargateLaunchAsync(authority.Lease, authority.Clock, key, intentId,
                         replay, ownershipLost, cancellationToken).ConfigureAwait(false);
+                    ReportDispatchDecision("replay", dispatch);
                 }
                 return;
             }
@@ -123,14 +141,26 @@ internal sealed class FargateRunnerBackend(
             earliest, earliest.AddMinutes(50));
         if (await journal.PlanAsync(authority.Lease, envelope, Guid.NewGuid(), cancellationToken).ConfigureAwait(false) == LifecycleWriteOutcome.Committed)
         {
-            _ = await DispatchFirstLaunchAsync(authority, envelope, ownershipLost, cancellationToken).ConfigureAwait(false);
+            await DispatchFirstLaunchAsync(authority, envelope, ownershipLost, cancellationToken).ConfigureAwait(false);
         }
     }
 
-    private Task<EffectDispatchStatus> DispatchFirstLaunchAsync(ActiveControllerAuthority authority, EffectEnvelope envelope,
-        CancellationToken ownershipLost, CancellationToken cancellationToken) =>
-        dispatcher.DispatchFirstFargateLaunchAsync(authority.Lease, authority.Clock, key, envelope.IntentId, Effects,
-            token => ReadFirstLaunchEvidenceAsync(authority.Lease.Fence, envelope, token), ownershipLost, cancellationToken);
+    private async Task DispatchFirstLaunchAsync(ActiveControllerAuthority authority, EffectEnvelope envelope,
+        CancellationToken ownershipLost, CancellationToken cancellationToken)
+    {
+        var dispatch = await dispatcher.DispatchFirstFargateLaunchAsync(authority.Lease, authority.Clock, key, envelope.IntentId, Effects,
+            token => ReadFirstLaunchEvidenceAsync(authority.Lease.Fence, envelope, token), ownershipLost, cancellationToken)
+            .ConfigureAwait(false);
+        ReportDispatchDecision("run_task", dispatch);
+    }
+
+    private void ReportDispatchDecision(string operation, EffectDispatchStatus dispatch)
+    {
+        if (dispatch == EffectDispatchStatus.AwaitingEvidence)
+        {
+            log?.Write(LogLevel.Warning, operation, "unknown", "recovery_required", _telemetryProfile, throttle: true);
+        }
+    }
 
     private async Task<FargateFirstLaunchEvidence?> ReadFirstLaunchEvidenceAsync(
         DeploymentLeaseFence lease, EffectEnvelope envelope, CancellationToken cancellationToken)
@@ -233,8 +263,9 @@ internal sealed class FargateRunnerBackend(
         {
             return;
         }
-        _ = await dispatcher.DispatchPlannedAsync(authority.Lease, authority.Clock, key, intentId,
+        var dispatch = await dispatcher.DispatchPlannedAsync(authority.Lease, authority.Clock, key, intentId,
             Effects, ownershipLost, cancellationToken).ConfigureAwait(false);
+        ReportDispatchDecision("stop_task", dispatch);
     }
 
     private RunnerBackendResource? ProjectResource(FargateInventorySnapshot inventory, FargateTaskObservation task,

@@ -10,6 +10,7 @@ using Knightfall.ScaleSet.Aws.Core.Configuration;
 using Knightfall.ScaleSet.Aws.Core.DryRun;
 using Knightfall.ScaleSet.Aws.Core.Planning;
 using Microsoft.AspNetCore.Builder;
+using Microsoft.Extensions.Logging;
 
 namespace Knightfall.ScaleSet.Aws.Controller.Commands;
 
@@ -89,26 +90,35 @@ public static class RunCommand
             {
                 // Any terminal exception remains observed even after the process stops waiting for lifecycle work.
                 _ = ObserveAsync(work);
+                cleanup.LogFailure("shutdown_deadline");
                 return 1;
             }
             return 0;
         }
         catch (OperationCanceledException) when (lifetime.Stopping.IsCancellationRequested)
         {
-            return lifetime.ShutdownDeadline.IsCancellationRequested ? 1 : 0;
+            if (lifetime.ShutdownDeadline.IsCancellationRequested)
+            {
+                cleanup.LogFailure("shutdown_deadline");
+                return 1;
+            }
+            return 0;
         }
         catch (RuntimeConfigurationException error)
         {
+            cleanup.LogFailure("invalid");
             await cleanup.ReportAsync(() => ConfigVerifyCommand.WriteErrorAsync(error, stderr, lifetime.ExitDeadline));
             return 1;
         }
         catch (TelemetrySettingsException error)
         {
+            cleanup.LogFailure("invalid");
             await cleanup.ReportAsync(() => stderr.WriteLineAsync(error.Message.AsMemory(), lifetime.ExitDeadline));
             return 1;
         }
         catch (Exception error) when (IsRuntimeFailure(error))
         {
+            cleanup.LogFailure("runtime_failure");
             await cleanup.ReportAsync(() => stderr.WriteLineAsync(
                 "The controller could not start or continue safely.".AsMemory(), lifetime.ExitDeadline));
             return 1;
@@ -162,6 +172,15 @@ public static class RunCommand
     {
         internal TelemetryPipeline? Telemetry { get; set; }
         private Task<WebApplication>? _health;
+
+        internal void LogFailure(string reason)
+        {
+            if (Telemetry is { } pipeline)
+            {
+                var log = new ControllerRuntimeLog(pipeline.Logging.CreateLogger(typeof(RunCommand).FullName!), TimeProvider.System);
+                log.Write(LogLevel.Error, "run", "failed", reason);
+            }
+        }
 
         internal async Task StartHealthAsync(LoopbackHealthAddress address, Func<ControllerHealthSnapshot> read)
         {

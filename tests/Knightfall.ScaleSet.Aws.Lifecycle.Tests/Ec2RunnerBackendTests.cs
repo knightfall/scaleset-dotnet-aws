@@ -1,12 +1,16 @@
 using System.Globalization;
 using System.Net;
 using Knightfall.ScaleSet.Aws.Controller.Runtime;
+using Knightfall.ScaleSet.Aws.Controller.Telemetry;
 using Knightfall.ScaleSet.Aws.Core.Catalog;
 using Knightfall.ScaleSet.Aws.Core.Configuration;
 using Knightfall.ScaleSet.Aws.Core.Lifecycle;
 using Knightfall.ScaleSet.Aws.DynamoDb;
 using Knightfall.ScaleSet.Aws.Providers.Tests;
 using Knightfall.ScaleSet.Aws.SdkContract.Tests.Aws;
+using Microsoft.Extensions.Logging;
+using Serilog.Core;
+using Serilog.Events;
 using Xunit;
 using static Knightfall.ScaleSet.Aws.Providers.Tests.Ec2InspectionFixture;
 
@@ -68,6 +72,41 @@ public sealed class Ec2RunnerBackendTests
         var mismatchedProfile = Assert.Single((await backend.ReadAsync(rig.Authority.Lease, token)).Resources);
         Assert.Equal(binding, mismatchedProfile.Binding);
         Assert.Null(mismatchedProfile.BootstrapCredentialArn);
+    }
+
+    [Fact]
+    public async Task ObsoletePreparedLaunchReportsDurableCancellationWithoutInferringItsCause()
+    {
+        var token = TestContext.Current.CancellationToken;
+        using var table = await MiniStackTable.CreateAsync(token);
+        var rig = await RuntimeRig.CreateAsync(table, token);
+        using var wire = new Ec2InspectionFixture(clock: rig.Clock);
+        using var provider = wire.CreateProvider(rig.Configuration);
+        var capture = new LaunchLogSink();
+        var settings = TelemetrySettings.Load(runtime: rig.Configuration, readEnvironment: static _ => null);
+        await using var telemetry = TelemetryPipeline.Start(settings, TextWriter.Null, capture);
+        var log = new ControllerRuntimeLog(telemetry.Logging.CreateLogger<Ec2RunnerBackend>(), rig.Clock);
+        var backend = new Ec2RunnerBackend(rig.Configuration, rig.Profile, rig.Catalog.Profile, wire.Inspector, provider,
+            rig.Store, rig.Journal, rig.Dispatcher, rig.Clock, Timing, log);
+        var allocation = Guid.NewGuid();
+        var planned = await rig.Dispatcher.AdvanceEc2LaunchAsync(rig.Authority.Lease, rig.Authority.Clock, rig.Catalog.Profile,
+            allocation, (ordinal, excluded, ct) => provider.CreateLaunchRequestAsync(allocation, ordinal, 0, excluded, null, ct),
+            provider, CancellationToken.None, token);
+        Assert.Equal(Ec2LaunchAdvanceStatus.Planned, planned.Status);
+
+        wire.TemplateResponse = Template(version: 13);
+        await backend.ReconcileLaunchesAsync(rig.Authority, rig.Catalog, allowPreparedLaunches: true, allowNewLaunch: false,
+            CancellationToken.None, token);
+        Assert.True(await telemetry.StopAsync().WaitAsync(token));
+
+        var settled = Assert.IsType<EffectJournalSnapshot>(await rig.Journal.ReadAsync(rig.Catalog.Profile, planned.IntentId!, token));
+        Assert.Equal(EffectResolutionKind.CanceledBeforeSend, settled.Entry.Resolution?.Kind);
+        Assert.DoesNotContain(wire.Requests, request => request["Action"] == "RunInstances");
+        var entry = Assert.Single(capture.Events);
+        Assert.Equal("launch", TelemetryPrivacy.Scalar(entry, "operation"));
+        Assert.Equal("cancelled", TelemetryPrivacy.Scalar(entry, "outcome"));
+        Assert.Equal("stale", TelemetryPrivacy.Scalar(entry, "reason"));
+        Assert.Equal(rig.Profile.Id, TelemetryPrivacy.Scalar(entry, "profile"));
     }
 
     [Fact]
@@ -190,5 +229,12 @@ public sealed class Ec2RunnerBackendTests
     private sealed class RuntimeClock : TimeProvider
     {
         public override DateTimeOffset GetUtcNow() => MiniStackTable.Now;
+    }
+
+    private sealed class LaunchLogSink : ILogEventSink
+    {
+        internal List<LogEvent> Events { get; } = [];
+
+        public void Emit(LogEvent logEvent) => Events.Add(logEvent);
     }
 }

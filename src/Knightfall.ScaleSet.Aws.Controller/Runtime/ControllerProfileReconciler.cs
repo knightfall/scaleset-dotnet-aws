@@ -24,12 +24,14 @@ internal sealed partial class ControllerProfileReconciler(
 
     internal LifecycleProfile Key { get; } = key;
 
+    internal TelemetryProfile? TelemetryIdentity { get; } = TelemetryProfile.From(profile);
+
     internal ControllerProfileSession Session { get; } = session;
 
     internal async Task<bool> ReconcileAsync(CancellationToken cancellationToken)
     {
-        using var scope = TelemetryProfileScope.Enter(TelemetryProfile.From(profile));
-        using var diagnostics = ReconciliationDiagnostics.Start(TelemetryProfile.From(profile), dryRun: false);
+        using var scope = TelemetryProfileScope.Enter(TelemetryIdentity);
+        using var diagnostics = ReconciliationDiagnostics.Start(TelemetryIdentity, dryRun: false);
         if (ownership.ReadAuthority() is not { } authority || await store.ReadCatalogProfileAsync(Key, cancellationToken).ConfigureAwait(false) is not
                 { } catalog || catalog.AppliedGeneration != generation)
         {

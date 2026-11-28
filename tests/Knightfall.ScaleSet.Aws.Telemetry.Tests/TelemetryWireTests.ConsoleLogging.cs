@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using System.Globalization;
 using System.Net;
+using System.Net.Sockets;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
@@ -8,6 +9,7 @@ using Amazon;
 using Amazon.Runtime;
 using Amazon.SecretsManager;
 using Amazon.SecretsManager.Model;
+using Knightfall.ScaleSet.Aws.Controller.Commands;
 using Knightfall.ScaleSet.Aws.Controller.Lifecycle;
 using Knightfall.ScaleSet.Aws.Controller.Telemetry;
 using Knightfall.ScaleSet.Aws.Core.Configuration;
@@ -160,11 +162,106 @@ public sealed partial class TelemetryWireTests
         Assert.Equal(6, attributes.Count);
     }
 
+    [Fact]
+    public async Task RunReportsFatalFailureToConsoleAndOtlpBeforeStoppingTelemetry()
+    {
+        var token = TestContext.Current.CancellationToken;
+        string path = Path.Combine(AppContext.BaseDirectory, "mixed.json");
+        string digest = Convert.ToHexStringLower(SHA256.HashData(await MixedRuntimeAsync(token)));
+        using var listener = new TcpListener(IPAddress.Loopback, 0);
+        listener.Start();
+        int port = ((IPEndPoint)listener.LocalEndpoint).Port;
+        listener.Stop();
+        await using var receiver = await OtlpLoopback.StartAsync(grpc: true, respond: null, token);
+        await using var output = new StringWriter(CultureInfo.InvariantCulture);
+        await using var errors = new StringWriter(CultureInfo.InvariantCulture);
+        var original = Console.Out;
+        try
+        {
+            Console.SetOut(output);
+            Assert.Equal(1, await RunCommand.RunAsync(
+                ["run", "--config", path, "--sha256", digest, "--generation", "7", "--health-addr",
+                    $"127.0.0.1:{port}", "--otlp-endpoint", receiver.Url],
+                TextWriter.Null, errors, _ => Task.FromException(new IOException(Secret)), token));
+        }
+        finally
+        {
+            Console.SetOut(original);
+        }
+
+        Assert.Contains("The controller could not start or continue safely.", errors.ToString(), StringComparison.Ordinal);
+        Assert.DoesNotContain(Secret, errors.ToString(), StringComparison.Ordinal);
+        Assert.DoesNotContain(Secret, output.ToString(), StringComparison.Ordinal);
+        using var console = JsonDocument.Parse(output.ToString());
+        Assert.Equal("Error", console.RootElement.GetProperty("Level").GetString());
+        var fields = console.RootElement.GetProperty("Properties");
+        Assert.Equal("run", fields.GetProperty("operation").GetString());
+        Assert.Equal("failed", fields.GetProperty("outcome").GetString());
+        Assert.Equal("runtime_failure", fields.GetProperty("reason").GetString());
+        var payload = Assert.Single(receiver.Requests, static request => IsSignal(request, "logs")).Payload();
+        Assert.DoesNotContain(Secret, Encoding.UTF8.GetString(payload), StringComparison.Ordinal);
+        var log = new OtlpMessage(payload).Message(1).Message(2).Message(2);
+        Assert.Equal("runtime_failure", log.StringAttributes(6)["reason"]);
+    }
+
+    [Fact]
+    public async Task RuntimeOutageLogsAreThrottledPerProfileAndKeepTheActiveTrace()
+    {
+        var token = TestContext.Current.CancellationToken;
+        var configuration = RuntimeConfigurationLoader.Load(await MixedRuntimeAsync(token));
+        var first = Assert.IsType<TelemetryProfile>(TelemetryProfile.From(configuration.Profiles[0]));
+        var second = Assert.IsType<TelemetryProfile>(TelemetryProfile.From(configuration.Profiles[1]));
+        await using var receiver = await OtlpLoopback.StartAsync(grpc: false, respond: null, token);
+        var settings = TelemetrySettings.Load(runtime: configuration, readEnvironment: name => name switch
+        {
+            "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT" => receiver.Url + "/v1/logs",
+            "OTEL_EXPORTER_OTLP_LOGS_PROTOCOL" => "http/protobuf",
+            _ => null,
+        });
+        var capture = new CapturingConsole();
+        await using var pipeline = TelemetryPipeline.Start(settings, TextWriter.Null, capture);
+        var clock = new RuntimeLogClock();
+        var runtime = new ControllerRuntimeLog(pipeline.Logging.CreateLogger(Controller), clock);
+        using var trace = new Activity("fixture").SetIdFormat(ActivityIdFormat.W3C).Start();
+        runtime.Write(LogLevel.Warning, "reconcile", "unavailable", "github_unavailable", first, throttle: true);
+        clock.Now = TimeSpan.FromSeconds(29);
+        runtime.Write(LogLevel.Warning, "reconcile", "unavailable", "github_unavailable", first, throttle: true);
+        runtime.Write(LogLevel.Warning, "reconcile", "unavailable", "github_unavailable", second, throttle: true);
+        clock.Now = TimeSpan.FromSeconds(30);
+        runtime.Write(LogLevel.Warning, "reconcile", "unavailable", "github_unavailable", first, throttle: true);
+        Assert.True(await pipeline.StopAsync().WaitAsync(token));
+
+        Assert.Equal(new[] { first.Id, second.Id, first.Id }, capture.Events.Select(log => TelemetryPrivacy.Scalar(log, "profile")));
+        Assert.All(capture.Events, log =>
+        {
+            Assert.Equal(trace.TraceId, log.TraceId);
+            Assert.Equal(trace.SpanId, log.SpanId);
+            Assert.Equal("github_unavailable", TelemetryPrivacy.Scalar(log, "reason"));
+        });
+        var records = receiver.Requests.SelectMany(request => new OtlpMessage(request.Payload()).Message(1).Message(2).Messages(2)).ToArray();
+        Assert.Equal(new[] { first.Id, second.Id, first.Id }, records.Select(record => record.StringAttributes(6)["profile"]));
+        Assert.All(records, record =>
+        {
+            Assert.Equal(trace.TraceId.ToHexString(), Convert.ToHexStringLower(record.Bytes(9)));
+            Assert.Equal(trace.SpanId.ToHexString(), Convert.ToHexStringLower(record.Bytes(10)));
+            Assert.Equal("github_unavailable", record.StringAttributes(6)["reason"]);
+        });
+    }
+
     private static Task<byte[]> MixedRuntimeAsync(CancellationToken token) =>
         File.ReadAllBytesAsync(Path.Combine(AppContext.BaseDirectory, "mixed.json"), token);
 
     [LoggerMessage(2, LogLevel.Error, "Unexpected failure {payload}")]
     private static partial void WriteUnknownEvent(ILogger logger, string payload, Exception exception);
+
+    private sealed class RuntimeLogClock : TimeProvider
+    {
+        public override long TimestampFrequency => TimeSpan.TicksPerSecond;
+
+        internal TimeSpan Now { get; set; }
+
+        public override long GetTimestamp() => Now.Ticks;
+    }
 
     private sealed class RotatingSecrets()
         : AmazonSecretsManagerClient(new BasicAWSCredentials("fixture", "fixture"), RegionEndpoint.APSoutheast2)
