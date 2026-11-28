@@ -11,6 +11,15 @@ if (OperatingSystem.IsLinux() && args is ["fargate-production-metadata"])
 {
     return await FargateLinuxCheck.VerifyProductionMetadataRejectionAsync();
 }
+if (OperatingSystem.IsLinux() && args is ["fargate-incomplete-cleanup"])
+{
+    return FargateLinuxCheck.VerifyIncompleteCleanupExit();
+}
+if (OperatingSystem.IsLinux() && args is ["fargate-cleanup"])
+{
+    FargateLinuxCheck.VerifyBoundedCleanup();
+    return 0;
+}
 if (OperatingSystem.IsLinux() && args is ["fargate-rejected-identity"])
 {
     if (LinuxFiles.HasFargateRunnerIdentity()) throw new InvalidOperationException("The runner accepted an unsupported runtime identity.");

@@ -1,3 +1,4 @@
+using System.Collections.Immutable;
 using System.Buffers;
 using System.Buffers.Text;
 using System.Security.Cryptography;
@@ -9,6 +10,8 @@ namespace Knightfall.ScaleSet.Aws.RunnerBootstrap.Linux;
 internal sealed class JitRunnerConfiguration : IDisposable
 {
     private static readonly string[] Names = [".runner", ".credentials", ".credentials_rsaparams"];
+    internal static ImmutableArray<string> CleanupNames { get; } =
+        [".runner", ".runner_migrated", ".credentials", ".credentials_migrated", ".credentials_rsaparams"];
     private readonly byte[][] _members = new byte[Names.Length][];
 
     internal long RunnerId { get; private set; }
