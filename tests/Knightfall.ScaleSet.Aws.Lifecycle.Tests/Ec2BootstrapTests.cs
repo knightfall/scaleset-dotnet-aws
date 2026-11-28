@@ -590,6 +590,8 @@ public sealed class Ec2BootstrapTests
 
     [Theory]
     [InlineData("ec2-data", "EC2 bootstrap failed.", 1)]
+    [InlineData("ec2-http", "EC2 bootstrap failed.", 1)]
+    [InlineData("ec2-timeout", "EC2 bootstrap failed.", 1)]
     [InlineData("ec2-stopped", "EC2 bootstrap stopped.", 1)]
     [InlineData("ec2-teardown", "EC2 supervisor STATUS requires a current boot proof of job process teardown.", 1)]
     [InlineData("ec2-cleanup", "EC2 runner cleanup was incomplete. Retain the instance for operator recovery.", 1)]
@@ -671,6 +673,8 @@ public sealed class Ec2BootstrapTests
         var (fargate, isPidOne, error) = failure switch
         {
             "ec2-data" => (false, true, (Exception)new InvalidDataException(PrivateSentinel)),
+            "ec2-http" => (false, true, new HttpRequestException(HttpRequestError.SecureConnectionError, PrivateSentinel)),
+            "ec2-timeout" => (false, true, new TaskCanceledException(PrivateSentinel)),
             "ec2-stopped" => (false, true, new OperationCanceledException(PrivateSentinel)),
             "ec2-teardown" => (false, true, new RunnerTeardownQualificationException()),
             "ec2-cleanup" => (false, true, new RunnerCleanupIncompleteException()),
@@ -679,7 +683,7 @@ public sealed class Ec2BootstrapTests
             "fargate-pid" => (true, false, new InvalidOperationException("The invalid PID must prevent startup.")),
             _ => throw new ArgumentOutOfRangeException(nameof(failure)),
         };
-        var stopping = new CancellationToken(error is OperationCanceledException);
+        var stopping = new CancellationToken(failure is "ec2-stopped" or "fargate-stopped");
         Func<ILogger?, CancellationToken, Task<RunnerBootstrapOutcome>> run = (_, _) => Task.FromException<RunnerBootstrapOutcome>(error);
         return fargate
             ? FargateBootstrapCommand.RunWithDiagnosticsAsync(isPidOne, run, output, errors, clock, stopping)
