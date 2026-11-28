@@ -93,11 +93,16 @@ public sealed class HelloEndpointRegistrationTests
         Assert.False(clock.HasPendingTimer);
     }
 
-    [Fact]
-    public async Task SevenAttemptsExhaustOneEc2ReservationWithoutReadingAnOfferOrRegisteringAgain()
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task SharedRoleOverloadExhaustsOneEc2ReservationWithoutReadingAnOfferOrRegisteringAgain(bool elapsedBudget)
     {
-        var token = TestContext.Current.CancellationToken;
-        using var wire = new SigningWire((_, _) => Respond(HttpStatusCode.ServiceUnavailable));
+        // The wall clock bounds fixture liveness. Only RetryClock advances the protocol.
+        using var watchdog = CancellationTokenSource.CreateLinkedTokenSource(TestContext.Current.CancellationToken);
+        watchdog.CancelAfter(TimeSpan.FromSeconds(30));
+        var token = watchdog.Token;
+        using var wire = new BurstWire(capacity: 16);
         using var http = new HttpClient(wire);
         using var dynamoWire = new AwsWireTransport(_ => throw new InvalidOperationException("Unconfirmed HELLO reached the offer store."));
         using var ddb = new AmazonDynamoDBClient(AwsWireTransport.Credentials, dynamoWire.Configure(new AmazonDynamoDBConfig()));
@@ -115,15 +120,38 @@ public sealed class HelloEndpointRegistrationTests
                 return Registration(http, clock).RegisterAsync(hello, cancellationToken);
             });
 
-        var registration = Bootstrap().RunAsync(token);
-        await clock.ExpectBudgetAsync(token);
-        foreach (int ceiling in new[] { 250, 500, 1_000, 2_000, 4_000, 4_000 })
+        using var peerKey = JitRecipientKey.Create();
+        Task<LifecycleWriteOutcome>[] peer = StartPeerOccupyingBroker(http, peerKey.Hello, token);
+        LifecycleWriteOutcome[] peerResults;
+        try
         {
-            await clock.ReleaseRetryAsync(ceiling, token);
+            await wire.AtCapacity.WaitAsync(token);
+            var registration = Bootstrap().RunAsync(token);
+            var deadline = await clock.ExpectBudgetAsync(token);
+            if (elapsedBudget)
+            {
+                var retry = await clock.TakeTimerAsync(token);
+                deadline.Fire();
+                Assert.Equal(RunnerBootstrapOutcome.HelloRejected, await registration.WaitAsync(token));
+                retry.Fire();
+            }
+            else
+            {
+                foreach (int ceiling in new[] { 250, 500, 1_000, 2_000, 4_000, 4_000 })
+                    await clock.ReleaseRetryAsync(ceiling, token);
+                Assert.Equal(RunnerBootstrapOutcome.HelloRejected, await registration.WaitAsync(token));
+            }
         }
-        Assert.Equal(RunnerBootstrapOutcome.HelloRejected, await registration);
-        Assert.Equal(RunnerBootstrapOutcome.AlreadySpent, await Bootstrap().RunAsync(token));
-        Assert.Equal(7, wire.Attempts);
+        finally
+        {
+            wire.ReleaseFirstSends();
+            peerResults = await Task.WhenAll(peer).WaitAsync(token);
+        }
+        Assert.All(peerResults, outcome => Assert.Equal(LifecycleWriteOutcome.Committed, outcome));
+        Assert.Single(wire.Accepted);
+        Assert.True(wire.Accepted.ContainsKey("peer-profile-session"));
+        Assert.Equal(RunnerBootstrapOutcome.AlreadySpent, await Bootstrap().RunAsync(token).WaitAsync(token));
+        Assert.Equal(elapsedBudget ? 1 : 7, wire.Throttles);
         Assert.False(clock.HasPendingTimer);
         Assert.Empty(dynamoWire.Requests);
     }
@@ -174,7 +202,7 @@ public sealed class HelloEndpointRegistrationTests
         var clocks = hellos.Select(_ => new RetryClock()).ToArray();
         using var wire = new BurstWire();
         using var http = new HttpClient(wire);
-        var tasks = hellos.Select((hello, index) => Registration(http, clocks[index]).RegisterAsync(hello, token)).ToArray();
+        var tasks = hellos.Select((hello, index) => Registration(http, clocks[index], "profile-session-" + index).RegisterAsync(hello, token)).ToArray();
 
         for (int index = 0; index < hellos.Length; index++)
         {
@@ -194,11 +222,56 @@ public sealed class HelloEndpointRegistrationTests
         Assert.Equal(2, wire.Throttles);
         Assert.Equal(4, wire.Accepted.Count);
         Assert.Equal(hellos.Select(hello => Convert.ToHexStringLower(SHA256.HashData(JsonSerializer.SerializeToUtf8Bytes(hello, BootstrapJson.Options))))
-            .Order(StringComparer.Ordinal), wire.Accepted.Keys.Order(StringComparer.Ordinal));
+            .Order(StringComparer.Ordinal), wire.Accepted.Values.Order(StringComparer.Ordinal));
     }
 
-    private static HelloEndpointRegistration Registration(HttpClient http, TimeProvider clock) =>
-        new(http, Endpoint, Region, new SessionAWSCredentials("fixture-key", "fixture-secret", "fixture-session"), clock);
+    [Fact]
+    public async Task PeerReplayOccupyingAllSixteenSlotsAllowsBootingProfileToRecoverWithinBudget()
+    {
+        // The wall clock bounds fixture liveness. Only RetryClock advances the protocol.
+        using var watchdog = CancellationTokenSource.CreateLinkedTokenSource(TestContext.Current.CancellationToken);
+        watchdog.CancelAfter(TimeSpan.FromSeconds(30));
+        var token = watchdog.Token;
+        using var peerKey = JitRecipientKey.Create();
+        using var bootKey = JitRecipientKey.Create();
+        using var wire = new BurstWire(capacity: 16);
+        using var http = new HttpClient(wire);
+        var peer = StartPeerOccupyingBroker(http, peerKey.Hello, token);
+        LifecycleWriteOutcome[] peerResults;
+        Task<LifecycleWriteOutcome> boot;
+        ScheduledTimer lastRetry;
+        try
+        {
+            await wire.AtCapacity.WaitAsync(token);
+            var bootClock = new RetryClock();
+            boot = Registration(http, bootClock, "boot-profile-session").RegisterAsync(bootKey.Hello, token);
+            await bootClock.ExpectBudgetAsync(token);
+            await bootClock.ReleaseRetryAsync(250, token);
+            await bootClock.ReleaseRetryAsync(500, token);
+            lastRetry = await bootClock.TakeTimerAsync(token);
+            Assert.Equal(3, wire.Throttles);
+            Assert.Empty(wire.Accepted);
+        }
+        finally
+        {
+            wire.ReleaseFirstSends();
+            peerResults = await Task.WhenAll(peer).WaitAsync(token);
+        }
+        Assert.All(peerResults, outcome => Assert.Equal(LifecycleWriteOutcome.Committed, outcome));
+        lastRetry.Fire();
+        Assert.Equal(LifecycleWriteOutcome.Committed, await boot.WaitAsync(token));
+        Assert.Equal(2, wire.Accepted.Count);
+        Assert.NotEqual(wire.Accepted["peer-profile-session"], wire.Accepted["boot-profile-session"]);
+        var changed = Registration(http, new RetryClock(), "peer-profile-session");
+        Assert.Equal(LifecycleWriteOutcome.Conflict, await changed.RegisterAsync(bootKey.Hello, token).WaitAsync(token));
+    }
+
+    private static Task<LifecycleWriteOutcome>[] StartPeerOccupyingBroker(HttpClient http, JitHello hello, CancellationToken token) =>
+        Enumerable.Range(0, 16).Select(_ => Registration(http, new RetryClock(), "peer-profile-session")
+            .RegisterAsync(hello, token)).ToArray();
+
+    private static HelloEndpointRegistration Registration(HttpClient http, TimeProvider clock, string session = "fixture-session") =>
+        new(http, Endpoint, Region, new SessionAWSCredentials("fixture-key", "fixture-secret", session), clock);
 
     private static Task<HttpResponseMessage> Respond(HttpStatusCode code) => Task.FromResult(new HttpResponseMessage(code));
 
@@ -234,15 +307,18 @@ public sealed class HelloEndpointRegistrationTests
         }
     }
 
-    private sealed class BurstWire : HttpMessageHandler
+    private sealed class BurstWire(int capacity = 2) : HttpMessageHandler
     {
-        private readonly SemaphoreSlim _slots = new(2, 2);
+        private readonly SemaphoreSlim _slots = new(capacity, capacity);
+        private readonly TaskCompletionSource _full = new(TaskCreationOptions.RunContinuationsAsynchronously);
         private readonly TaskCompletionSource _released = new(TaskCreationOptions.RunContinuationsAsynchronously);
         private int _throttles;
 
         internal int Throttles => Volatile.Read(ref _throttles);
 
-        internal ConcurrentDictionary<string, byte> Accepted { get; } = new(StringComparer.Ordinal);
+        internal Task AtCapacity => _full.Task;
+
+        internal ConcurrentDictionary<string, string> Accepted { get; } = new(StringComparer.Ordinal);
 
         internal void ReleaseFirstSends() => _released.SetResult();
 
@@ -255,10 +331,13 @@ public sealed class HelloEndpointRegistrationTests
             }
             try
             {
+                if (_slots.CurrentCount == 0) _full.TrySetResult();
                 await _released.Task.WaitAsync(cancellationToken);
                 byte[] body = await request.Content!.ReadAsByteArrayAsync(cancellationToken);
-                Assert.True(Accepted.TryAdd(Convert.ToHexStringLower(SHA256.HashData(body)), 0));
-                return new HttpResponseMessage(HttpStatusCode.NoContent);
+                string session = Assert.Single(request.Headers.GetValues("X-Amz-Security-Token"));
+                string digest = Convert.ToHexStringLower(SHA256.HashData(body));
+                return new HttpResponseMessage(Accepted.GetOrAdd(session, digest) == digest
+                    ? HttpStatusCode.NoContent : HttpStatusCode.Conflict);
             }
             finally
             {
