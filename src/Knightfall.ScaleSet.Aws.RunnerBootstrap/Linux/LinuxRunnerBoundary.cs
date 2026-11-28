@@ -14,8 +14,6 @@ internal sealed class LinuxRunnerBoundary : ILinuxOneJobBoundary
     private const string NamespaceInit = "/usr/bin/bash";
     private const string BootIdFile = "/proc/sys/kernel/random/boot_id";
     private const int MaximumProofBytes = 4096;
-    private static readonly string[] ConfigFiles =
-        [".runner", ".runner_migrated", ".credentials", ".credentials_migrated", ".credentials_rsaparams"];
 
     private readonly LinuxRunnerSettings _settings;
     private readonly string _listener;
@@ -177,7 +175,7 @@ internal sealed class LinuxRunnerBoundary : ILinuxOneJobBoundary
         }
 
         bool cleaned = true;
-        foreach (string name in ConfigFiles)
+        foreach (string name in JitRunnerConfiguration.CleanupNames)
         {
             cleaned &= RemoveConfigFile(Path.Combine(_settings.RuntimeRoot, name));
         }

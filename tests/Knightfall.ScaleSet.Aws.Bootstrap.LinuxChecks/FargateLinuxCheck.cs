@@ -45,7 +45,6 @@ internal static class FargateLinuxCheck
             throw new InvalidOperationException("The Fargate fixture must run as non-root PID 1.");
         }
         LinuxFiles.DisableCoreDumps();
-        VerifyRunnerIdentity();
         VerifyReadOnlyMountEvidence();
         VerifyReadOnlyCleanup();
         Environment.SetEnvironmentVariable("AWS_SESSION_TOKEN", "offline-parent-credential-sentinel");
@@ -66,8 +65,42 @@ internal static class FargateLinuxCheck
         return 0;
     }
 
-    private static void VerifyRunnerIdentity()
+    internal static void VerifyBoundedCleanup()
     {
+        VerifyRootCustody(replace: false);
+        VerifyRootCustody(replace: true);
+        VerifyCleanupLimit();
+        VerifyNonUtf8Entry();
+
+        using var boundary = FargateRunnerBoundary.Create(Settings);
+        string root = boundary.StartInfo().WorkingDirectory;
+        string current = root;
+        for (int level = 0; level < 160; level++)
+        {
+            current = Directory.CreateDirectory(Path.Combine(current, "d")).FullName;
+        }
+        File.WriteAllText(Path.Combine(current, "fixture"), "local");
+        boundary.Dispose();
+        if (Directory.Exists(root)) throw new InvalidOperationException("Deep cleanup did not finish.");
+
+        // The fixture mounts an empty read-only directory at /cleanup/.runner. Other credential
+        // names must disappear even when this directory cannot be changed or removed.
+        foreach (string name in JitRunnerConfiguration.CleanupNames)
+        {
+            if (name != ".runner") File.WriteAllText(Path.Combine("/cleanup", name), "local");
+        }
+        try
+        {
+            using var pinned = FargateRamCleanup.Open("/", "cleanup", create: false);
+            pinned.Remove();
+            throw new InvalidOperationException("Partial cleanup reported success.");
+        }
+        catch (IOException error) when (error.Message.Contains("errno ", StringComparison.Ordinal))
+        {
+            if (!Directory.EnumerateFileSystemEntries("/cleanup").SequenceEqual(["/cleanup/.runner"]))
+                throw new InvalidOperationException("Partial cleanup skipped a credential name.", error);
+        }
+
         const string user = "Uid: 1000 1000 1000 1000";
         const string group = "Gid: 2147483647 2147483647 2147483647 2147483647";
         string[] capabilities = ["CapInh:", "CapPrm:", "CapEff:", "CapBnd:", "CapAmb:"];
@@ -93,6 +126,93 @@ internal static class FargateLinuxCheck
             {
                 throw new InvalidOperationException("The runtime identity check accepted missing, malformed, or retained capabilities.");
             }
+        }
+    }
+
+    private static void VerifyRootCustody(bool replace)
+    {
+        using var boundary = FargateRunnerBoundary.Create(Settings);
+        string root = boundary.StartInfo().WorkingDirectory;
+        string moved = root + "-relocated";
+        boundary.WriteConfigFile(".credentials", "local"u8);
+        Directory.Move(root, moved);
+        if (replace)
+        {
+            Directory.CreateDirectory(root);
+            File.WriteAllText(Path.Combine(root, ".credentials"), "replacement");
+        }
+        CheckCleanupFailure(boundary.RemoveConfigFiles, replace ? "original identity" : "errno 2");
+        CheckCleanupFailure(boundary.RemoveConfigFiles, "previous Fargate RAM cleanup");
+        boundary.Dispose();
+        if (File.Exists(Path.Combine(moved, ".credentials")) ||
+            (replace && File.ReadAllText(Path.Combine(root, ".credentials")) != "replacement"))
+        {
+            throw new InvalidOperationException("Cleanup lost custody of its original RAM root.");
+        }
+    }
+
+    private static void VerifyNonUtf8Entry()
+    {
+        string name = "encoding-" + Guid.NewGuid().ToString("N");
+        string root = Path.Combine("/dev/shm", name);
+        using var pinned = FargateRamCleanup.Open("/dev/shm", name, create: true);
+        string credential = Path.Combine(root, ".credentials");
+        File.WriteAllText(credential, "local");
+
+        // The shell creates the empty byte-named file without converting its name to a managed string.
+        using var setup = Process.Start(new ProcessStartInfo("/bin/sh")
+        {
+            WorkingDirectory = root,
+            ArgumentList = { "-c", """: > "$(printf '\377')" """ },
+        }) ?? throw new InvalidOperationException("The encoding fixture could not start.");
+        setup.WaitForExit();
+        if (setup.ExitCode != 0) throw new InvalidOperationException("The encoding fixture failed.");
+
+        CheckCleanupFailure(pinned.Remove, "(errno 2).");
+        pinned.Dispose();
+        if (File.Exists(credential) || !Directory.Exists(root) || Directory.EnumerateFileSystemEntries(root).Count() != 1)
+            throw new InvalidOperationException("Cleanup of an unrepresentable name did not preserve the expected RAM state.");
+    }
+
+    private static void VerifyCleanupLimit()
+    {
+        string name = "limit-" + Guid.NewGuid().ToString("N");
+        string root = Directory.CreateDirectory(Path.Combine("/dev/shm", name)).FullName;
+        using var pinned = FargateRamCleanup.Open("/dev/shm", name, create: false, maximumEntries: 1);
+        File.WriteAllText(Path.Combine(root, ".credentials"), "local");
+        Directory.CreateDirectory(Path.Combine(root, "home", "nested"));
+        CheckCleanupFailure(pinned.Remove, "entry limit");
+        pinned.Dispose();
+        if (File.Exists(Path.Combine(root, ".credentials")) || !Directory.Exists(Path.Combine(root, "home", "nested")))
+            throw new InvalidOperationException("The traversal limit did not preserve the independent credential scrub.");
+    }
+
+    internal static int VerifyIncompleteCleanupExit()
+    {
+        using var boundary = FargateRunnerBoundary.Create(Settings);
+        string root = boundary.StartInfo().WorkingDirectory;
+        File.WriteAllText(Path.Combine(root, ".credentials"), "local");
+        string marker = Path.Combine(root, "kept-during-ambiguous-cleanup");
+        File.WriteAllText(marker, "local");
+        using var child = Process.Start("/bin/sleep", "60") ?? throw new InvalidOperationException("Fixture child did not start.");
+        CheckCleanupFailure(boundary.RemoveConfigFiles, "exclusive access");
+        if (child.HasExited || File.Exists(Path.Combine(root, ".credentials")) || !File.Exists(marker))
+            throw new InvalidOperationException("Cleanup traversed the job tree while a process was present.");
+        // Leave the child alive. The shell harness observes PID 1's failure exit and task termination.
+        Console.Error.WriteLine("Incomplete cleanup while another process was present.");
+        return 1;
+    }
+
+    private static void CheckCleanupFailure(Action cleanup, string reason)
+    {
+        try
+        {
+            cleanup();
+            throw new InvalidOperationException("Incomplete cleanup reported success.");
+        }
+        catch (IOException error) when (error.Message.Contains(reason, StringComparison.Ordinal))
+        {
+            // Require the specific failure mode and allow the caller to inspect the resulting tree.
         }
     }
 

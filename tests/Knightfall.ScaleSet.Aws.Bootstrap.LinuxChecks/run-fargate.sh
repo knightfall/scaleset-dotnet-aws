@@ -86,6 +86,17 @@ fi
 rejection=$(run_fixture "$image" /fixture/Knightfall.ScaleSet.Aws.Bootstrap.LinuxChecks.dll fargate-production-metadata 2>&1)
 [ "$rejection" = "Fargate bootstrap failed." ]
 
+mkdir "$context/locked"
+run_fixture --ulimit nofile=96:96 --tmpfs /cleanup:rw,uid=1001,gid=1001,mode=0700 \
+    --mount "type=bind,source=$context/locked,target=/cleanup/.runner,readonly" \
+    "$image" /fixture/Knightfall.ScaleSet.Aws.Bootstrap.LinuxChecks.dll fargate-cleanup
+# PID 1 must exit with an incomplete cleanup while its private task still contains the 60-second fixture child.
+started=$(date +%s)
+status=0
+incomplete=$(run_fixture "$image" /fixture/Knightfall.ScaleSet.Aws.Bootstrap.LinuxChecks.dll fargate-incomplete-cleanup 2>&1) || status=$?
+[ "$status" -eq 1 ]
+[ "$incomplete" = "Incomplete cleanup while another process was present." ]
+[ "$(( $(date +%s) - started ))" -lt 30 ]
 run_fixture --user 1001:0 "$image" /fixture/Knightfall.ScaleSet.Aws.Bootstrap.LinuxChecks.dll fargate-rejected-identity
 run_fixture --group-add 0 "$image" /fixture/Knightfall.ScaleSet.Aws.Bootstrap.LinuxChecks.dll fargate-rejected-identity
 run_fixture --group-add 999 "$image" /fixture/Knightfall.ScaleSet.Aws.Bootstrap.LinuxChecks.dll fargate-rejected-identity

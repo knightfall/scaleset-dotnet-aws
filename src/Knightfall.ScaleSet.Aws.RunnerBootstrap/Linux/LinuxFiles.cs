@@ -52,6 +52,22 @@ internal static partial class LinuxFiles
             ? stat.MountId : null;
     }
 
+    internal static (ulong Mount, ulong Inode) GetEntryIdentity(int directory, string name)
+    {
+        const int noFollow = 0x100;
+        const int emptyPath = 0x1000;
+        const uint inodeAndMount = 0x0100 | 0x1000;
+        if (Statx(directory, name, noFollow | emptyPath, inodeAndMount, out var stat) != 0)
+        {
+            throw new IOException(FormattableString.Invariant($"The RAM directory identity could not be read (errno {Marshal.GetLastPInvokeError()})."));
+        }
+        if ((stat.Mask & inodeAndMount) != inodeAndMount)
+        {
+            throw new IOException("The RAM directory identity is unavailable.");
+        }
+        return (stat.MountId, stat.Inode);
+    }
+
     internal static void DisableCoreDumps()
     {
         const int coreLimit = 4;
@@ -168,10 +184,11 @@ internal static partial class LinuxFiles
         [FieldOffset(20)] public uint User;
         [FieldOffset(24)] public uint Group;
         [FieldOffset(28)] public ushort Mode;
+        [FieldOffset(32)] public ulong Inode;
         [FieldOffset(144)] public ulong MountId;
     }
 
-    [LibraryImport("libc", EntryPoint = "statx", StringMarshalling = StringMarshalling.Utf8)]
+    [LibraryImport("libc", EntryPoint = "statx", SetLastError = true, StringMarshalling = StringMarshalling.Utf8)]
     private static partial int Statx(int directory, string path, int flags, uint mask, out LinuxStatx stat);
 
     [StructLayout(LayoutKind.Sequential)]
