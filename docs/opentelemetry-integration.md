@@ -106,7 +106,7 @@ For HTTP/protobuf, append `v1/traces`, `v1/metrics`, and `v1/logs` to a common b
 
 Use literal unreserved ASCII characters in endpoint paths and avoid `.` and `..` path segments. Encode square brackets in the path as `%5B` and `%5D`. Unicode path characters may be supplied directly or as percent-encoded UTF-8 with uppercase hexadecimal digits. IPv6 host literals still use brackets in the URL authority.
 
-ECS header secrets are explicit secret references injected by the **execution role**, never plaintext CDK context, task environment values, runtime JSON, synthesized outputs, or log messages. Any extra secret/KMS grants belong to the narrowly scoped execution role; the dry-run task role still has no Secrets Manager reads. Secret rotation takes effect on task replacement. V1 requires no custom collector trust/mTLS feature; do not conflate this standard OTLP transport with deferred GitHub transport changes.
+ECS header secrets are explicit secret references injected by the **execution role**, never plaintext CDK context, task environment values, runtime JSON, synthesized outputs, or log messages. Any extra secret/KMS grants belong to the narrowly scoped execution role; the dry-run task role still has no Secrets Manager reads. The ECS secret reference requests the `AWSCURRENT` staging label, and the execution-role grant requires that label. Secret rotation takes effect on task replacement. V1 requires no custom collector trust/mTLS feature; do not conflate this standard OTLP transport with deferred GitHub transport changes.
 
 Example target environment, to become executable with T19/T20 (not a command available in the current scaffold):
 

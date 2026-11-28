@@ -45,7 +45,8 @@ public static class RunCommand
             var address = LoopbackHealthAddress.Parse(options.HealthAddress);
             var artifact = options.ConfigPath is { } path
                 ? RuntimeArtifact.FromLocal(path, options.Sha256)
-                : RuntimeArtifact.FromS3(options.S3Uri!, options.VersionId!, options.Sha256);
+                : RuntimeArtifact.FromS3(options.S3Uri!, options.VersionId!, options.Sha256,
+                    Environment.GetEnvironmentVariable("SCALESET_RUNTIME_BUCKET_OWNER"));
             string? configuredEndpoint = Environment.GetEnvironmentVariable("AWS_ENDPOINT_URL");
             var endpoint = artifact.S3 is null ? null : ControllerAwsClientConfiguration.ReadLoopbackEndpoint(configuredEndpoint);
             IAmazonS3 CreateS3(string? region) => RuntimeArtifactLoader.CreateS3Client(region, endpoint);

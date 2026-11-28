@@ -88,6 +88,14 @@ test("only actual callers receive exact imported KMS decrypt rights", () => {
       Resource: unknown;
       Condition?: unknown;
     }[];
+    for (const action of ["s3:GetObject", "s3:PutObject"]) {
+      assert.deepEqual(
+        copyStatements.find(({ Action }) => Action === action)?.Condition,
+        {
+          StringEquals: { "s3:ResourceAccount": account },
+        },
+      );
+    }
     const source = copyStatements.find(
       ({ Action }) => Action === "s3:GetObject",
     )?.Resource;
