@@ -40,6 +40,10 @@ public sealed record FargateReplayObservation(string EnvelopeSha256, EffectTarge
 
 public interface IFargateReplayEffectProvider : IReconciliationEffectProvider
 {
+    /// <summary>Rechecks the immutable launch inputs before a possible resend of an existing reservation.</summary>
+    Task<EffectDispatchPrecondition?> CheckReplayAsync(EffectEnvelope envelope, CatalogBinding binding,
+        CancellationToken cancellationToken) => CheckAsync(envelope, binding, cancellationToken);
+
     Task<FargateReplayObservation?> ObserveForReplayAsync(EffectEnvelope envelope, EffectAttempt attempt,
         CancellationToken cancellationToken);
 }

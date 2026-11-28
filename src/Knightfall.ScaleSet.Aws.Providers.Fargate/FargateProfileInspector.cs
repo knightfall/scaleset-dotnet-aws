@@ -114,7 +114,7 @@ public sealed partial class FargateProfileInspector
             {
                 return Failed(FargatePreflightStatus.RoleMismatch);
             }
-            var (subnets, subnetSampleStartedAt) = await _network.ReadAsync(target.Network, _clock, cancellationToken)
+            var (subnets, subnetSampleStartedAt) = await _network.ReadAsync(target.Network, target.Scope.Account, _clock, cancellationToken)
                 .ConfigureAwait(false);
             return subnets.IsDefault ? Failed(FargatePreflightStatus.NetworkIncompatible)
                 : new FargatePreflightResult(FargatePreflightStatus.Verified, new FargateResolvedTask(target.Scope,

@@ -84,6 +84,9 @@ internal sealed class FargateInspectionFixture : IDisposable
     internal Func<JsonElement, string> ReceiveMessage { get; set; } = static _ => "{}";
     internal int? Ip1 { get; set; } = 3;
     internal int? Ip2 { get; set; } = 4;
+    internal string RouteTables { get; set; } = Ec2InspectionFixture.RouteTables();
+    internal string PublicIpv4 { get; set; } = "<mapPublicIpOnLaunch>false</mapPublicIpOnLaunch>";
+    internal bool AutoAssignIpv6 { get; set; }
     internal string SubnetVpc { get; set; } = Vpc;
     internal string GroupVpc { get; set; } = Vpc;
     internal bool WrongIamArn { get; set; }
@@ -183,6 +186,7 @@ internal sealed class FargateInspectionFixture : IDisposable
         "ReceiveMessage" => AwsWireTransport.Json(ReceiveMessage(Body(request))),
         "DeleteMessage" => AwsWireTransport.Json("{}"),
         "GetRole" => AwsWireTransport.Xml(Role(Query(request)["RoleName"]!)),
+        "DescribeRouteTables" => AwsWireTransport.Xml(RouteTables),
         "DescribeSubnets" => AwsWireTransport.Xml(Subnets()),
         "DescribeSecurityGroups" => AwsWireTransport.Xml(Groups()),
         var operation => throw new InvalidOperationException("Unexpected AWS wire operation: " + operation),
@@ -218,6 +222,7 @@ internal sealed class FargateInspectionFixture : IDisposable
 
     private string Subnet(string subnet, string az, int? count) => FormattableString.Invariant($$"""
         <item><subnetId>{{subnet}}</subnetId><state>available</state><vpcId>{{SubnetVpc}}</vpcId><availabilityZone>{{az}}</availabilityZone>
+        {{PublicIpv4}}<assignIpv6AddressOnCreation>{{(AutoAssignIpv6 ? "true" : "false")}}</assignIpv6AddressOnCreation>
         {{(count.HasValue ? FormattableString.Invariant($"<availableIpAddressCount>{count}</availableIpAddressCount>") : "")}}</item>
         """);
 

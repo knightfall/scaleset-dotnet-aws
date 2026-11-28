@@ -121,7 +121,13 @@ public sealed partial class FargateProfileInspector
     {
         private readonly TelemetryProfile? _telemetryProfile = TelemetryProfile.From(target.Profile);
 
-        public async Task<EffectDispatchPrecondition?> CheckAsync(EffectEnvelope envelope, CatalogBinding binding,
+        public Task<EffectDispatchPrecondition?> CheckAsync(EffectEnvelope envelope, CatalogBinding binding,
+            CancellationToken cancellationToken) => CheckAsync(envelope, binding, requireLaunchCapacity: true, cancellationToken);
+
+        public Task<EffectDispatchPrecondition?> CheckReplayAsync(EffectEnvelope envelope, CatalogBinding binding,
+            CancellationToken cancellationToken) => CheckAsync(envelope, binding, requireLaunchCapacity: false, cancellationToken);
+
+        private async Task<EffectDispatchPrecondition?> CheckAsync(EffectEnvelope envelope, CatalogBinding binding, bool requireLaunchCapacity,
             CancellationToken cancellationToken)
         {
             ArgumentNullException.ThrowIfNull(envelope);
@@ -137,7 +143,7 @@ public sealed partial class FargateProfileInspector
             EffectEvidence? alreadyApplied = null;
             if (envelope.Request is FargateLaunchEffectRequest launch && IsScopedLaunch(launch))
             {
-                eligible = await CheckLaunchAsync(launch, cancellationToken).ConfigureAwait(false);
+                eligible = await CheckLaunchAsync(launch, requireLaunchCapacity, cancellationToken).ConfigureAwait(false);
             }
             else if (envelope.Request is FargateStopEffectRequest stop && IsScopedStop(stop))
             {
@@ -246,7 +252,7 @@ public sealed partial class FargateProfileInspector
             request.ClusterArn == target.Scope.ClusterArn && request.TaskDefinitionArn == target.Scope.TaskDefinitionArn &&
             request.Incarnation.HasValue && IsTaskArn(target.Inventory, request.TaskArn);
 
-        private async Task<bool> CheckLaunchAsync(FargateLaunchEffectRequest request, CancellationToken cancellationToken)
+        private async Task<bool> CheckLaunchAsync(FargateLaunchEffectRequest request, bool requireLaunchCapacity, CancellationToken cancellationToken)
         {
             if (approval is null)
             {
@@ -255,7 +261,8 @@ public sealed partial class FargateProfileInspector
             var preflight = await inspector.ResolvePreflightAsync(configuration, profile.ProfileId, approval, cancellationToken).ConfigureAwait(false);
             return preflight is { IsReady: true, Task: { } verified } && verified.CpuUnits == request.CpuUnits &&
                 request.SecurityGroupIds.SequenceEqual(verified.SecurityGroupIds.Order(StringComparer.Ordinal)) &&
-                HasVerifiedSubnets(verified, request.SubnetIds);
+                (requireLaunchCapacity ? HasVerifiedSubnets(verified, request.SubnetIds) :
+                    request.SubnetIds.All(id => verified.Subnets.Any(subnet => subnet.SubnetId == id)));
         }
 
         private async Task<EffectEvidence?> SendLaunchAsync(EffectEnvelope envelope, FargateLaunchEffectRequest request,

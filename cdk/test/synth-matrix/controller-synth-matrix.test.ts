@@ -667,6 +667,7 @@ function verifyTaskRole(
       "ecs:DescribeTaskDefinition",
       "ecs:ListAccountSettings",
       "ecs:ListTasks",
+      "ec2:DescribeRouteTables",
       "ec2:DescribeSubnets",
       "ec2:DescribeSecurityGroups",
       "iam:GetRole",

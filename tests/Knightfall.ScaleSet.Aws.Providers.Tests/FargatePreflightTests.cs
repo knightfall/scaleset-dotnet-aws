@@ -8,6 +8,66 @@ namespace Knightfall.ScaleSet.Aws.Providers.Tests;
 public sealed class FargatePreflightTests
 {
     [Theory]
+    [InlineData("", false)]
+    [InlineData("<instanceOwnerId>111122223333</instanceOwnerId>", false)]
+    [InlineData("<gatewayId>unknown-target</gatewayId>", false)]
+    [InlineData("<gatewayId>vpce-0123456789abcdef0</gatewayId>", true)]
+    [InlineData("<gatewayId>vgw-0123456789abcdef0</gatewayId>", true)]
+    [InlineData("<transitGatewayId>tgw-0123456789abcdef0</transitGatewayId>", true)]
+    [InlineData("<ipAddress>10.0.1.2</ipAddress>", true)]
+    [InlineData("<carrierGatewayId>cagw-0123456789abcdef0</carrierGatewayId>", false)]
+    [InlineData("<carrierGatewayId>cagw-0123456789abcdef0</carrierGatewayId>", false, "blackhole")]
+    [InlineData("<gatewayId>igw-0123456789abcdef0</gatewayId>", false, "blackhole")]
+    [InlineData("<natGatewayId>nat-0123456789abcdef0</natGatewayId>", true, "blackhole")]
+    public async Task VerifiesRoutingTargetsEvenWhenAPublicGatewayIsUnavailable(string target, bool verified, string state = "active")
+    {
+        var token = TestContext.Current.CancellationToken;
+        var route = $"<item><destinationCidrBlock>10.1.0.0/16</destinationCidrBlock>{target}<state>{state}</state></item>";
+        using var aws = new FargateInspectionFixture
+        {
+            RouteTables = Ec2InspectionFixture.RouteTables(Ec2InspectionFixture.RouteTable("rtb-0123456789abcdef0",
+                main: true, extraRoutes: route)),
+        };
+        var result = await aws.Inspector.ResolvePreflightAsync(await ConfigurationAsync(token), Profile, Approval, token);
+        Assert.Equal(verified ? FargatePreflightStatus.Verified : FargatePreflightStatus.NetworkIncompatible, result.Status);
+    }
+
+    [Theory]
+    [InlineData("private", FargatePreflightStatus.Verified)]
+    [InlineData("public-main", FargatePreflightStatus.NetworkIncompatible)]
+    [InlineData("public-explicit", FargatePreflightStatus.NetworkIncompatible)]
+    [InlineData("public-ipv4", FargatePreflightStatus.NetworkIncompatible)]
+    [InlineData("unknown-ipv4", FargatePreflightStatus.NetworkIncompatible)]
+    [InlineData("missing-main", FargatePreflightStatus.NetworkIncompatible)]
+    public async Task VerifiesPrivateRoutingForDualStackSubnets(string variant, FargatePreflightStatus expected)
+    {
+        const string directInternet = "<item><destinationIpv6CidrBlock>::/0</destinationIpv6CidrBlock>" +
+            "<gatewayId>igw-0123456789abcdef0</gatewayId><state>active</state></item>";
+        string main = variant == "missing-main" ? "" : Ec2InspectionFixture.RouteTable("rtb-0123456789abcdef0", main: true,
+            extraRoutes: variant == "public-main" ? directInternet : "");
+        string second = Ec2InspectionFixture.RouteTable("rtb-0123456789abcdef1", subnet: Subnet2,
+            extraRoutes: variant == "public-explicit" ? directInternet : "");
+        var token = TestContext.Current.CancellationToken;
+        var config = await ConfigurationAsync(token);
+        using var cloud = new FargateInspectionFixture
+        {
+            AutoAssignIpv6 = true,
+            RouteTables = Ec2InspectionFixture.RouteTables(main + second),
+            PublicIpv4 = variant switch
+            {
+                "public-ipv4" => "<mapPublicIpOnLaunch>true</mapPublicIpOnLaunch>",
+                "unknown-ipv4" => "",
+                _ => "<mapPublicIpOnLaunch>false</mapPublicIpOnLaunch>",
+            },
+        };
+
+        var result = await cloud.Inspector.ResolvePreflightAsync(config, Profile, Approval, token);
+
+        Assert.Equal(expected, result.Status);
+        Assert.Equal(expected == FargatePreflightStatus.Verified, result.IsReady);
+    }
+
+    [Theory]
     [InlineData(false)]
     [InlineData(true)]
     public async Task VerifiesOnlyTheExactRunnerClusterDefinitionRolesAndNetwork(bool createRunnerCluster)
@@ -36,7 +96,7 @@ public sealed class FargatePreflightTests
 
         var requests = aws.Requests;
         string[] expectedOperations = ["DescribeClusters", "ListAccountSettings", "ListAccountSettings", "DescribeTaskDefinition", "GetRole",
-            "GetRole", "DescribeSubnets", "DescribeSecurityGroups"];
+            "GetRole", "DescribeSubnets", "DescribeSecurityGroups", "DescribeRouteTables"];
         Assert.Equal(expectedOperations, requests.Select(Operation));
         Assert.Equal(Cluster, Assert.Single(Body(requests[0]).GetProperty("clusters").EnumerateArray()).GetString());
         Assert.Equal("taskLongArnFormat", Body(requests[1]).GetProperty("name").GetString());
@@ -48,6 +108,8 @@ public sealed class FargatePreflightTests
         Assert.Equal(Subnet1, Query(requests[6])["SubnetId.1"]);
         Assert.Equal(Subnet2, Query(requests[6])["SubnetId.2"]);
         Assert.Equal(SecurityGroup, Query(requests[7])["GroupId.1"]);
+        Assert.Equal("vpc-id", Query(requests[8])["Filter.1.Name"]);
+        Assert.Equal(Vpc, Query(requests[8])["Filter.1.Value.1"]);
     }
 
     [Theory]
